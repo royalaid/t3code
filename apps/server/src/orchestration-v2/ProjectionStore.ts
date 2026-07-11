@@ -41,6 +41,11 @@ import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import {
+  goalSummaryFromDetail,
+  readGoalDetailByRootThread,
+  readGoalSummariesByRootThread,
+} from "./GoalProjectionStore.ts";
 
 export class ProjectionStoreApplyEventError extends Schema.TaggedErrorClass<ProjectionStoreApplyEventError>()(
   "ProjectionStoreApplyEventError",
@@ -155,6 +160,7 @@ export function emptyProjection(
     contextHandoffs: [],
     contextTransfers: [],
     visibleTurnItems: [],
+    goal: null,
     updatedAt: event.occurredAt,
   };
 }
@@ -281,6 +287,25 @@ export function applyToProjection(
         ...base,
         contextTransfers: upsertById(base.contextTransfers, event.payload),
       };
+    case "goal.created":
+    case "goal.updated":
+    case "goal.reopened":
+    case "goal.cancelled":
+    case "goal.completed":
+    case "goal.integration-updated":
+    case "goal.integration-conflicted":
+    case "goal.graph-version-activated":
+    case "goal.node-transitioned":
+    case "goal.node-cancellation-requested":
+    case "goal.attempt-created":
+    case "goal.attempt-transitioned":
+    case "goal.route-resolved":
+    case "goal.artifact-published":
+    case "goal.writer-commit-recorded":
+    case "goal.evidence-submitted":
+    case "goal.verdict-recorded":
+    case "goal.failure-recorded":
+      return base;
   }
 }
 
@@ -788,6 +813,10 @@ export function threadShellFromProjection(
     ),
     itemCount: activeLocalTurnItems(projection).length,
     visibleItemCount: projection.visibleTurnItems.length,
+    goalSummary:
+      projection.goal === undefined || projection.goal === null
+        ? null
+        : goalSummaryFromDetail(projection.goal),
     createdAt: projection.thread.createdAt,
     updatedAt: projection.updatedAt,
     archivedAt: projection.thread.archivedAt,
@@ -904,6 +933,7 @@ function visibleItemCountForShell(input: {
 function shellFromState(input: {
   readonly state: ShellThreadState;
   readonly visibleItemCount: number;
+  readonly goalSummary: Exclude<OrchestrationV2ThreadShell["goalSummary"], undefined>;
 }): OrchestrationV2ThreadShell {
   return {
     createdBy: input.state.thread.createdBy,
@@ -944,6 +974,7 @@ function shellFromState(input: {
     hasActionableProposedPlan: input.state.hasActionableProposedPlan,
     itemCount: input.state.itemCount,
     visibleItemCount: input.visibleItemCount,
+    goalSummary: input.goalSummary,
     createdAt: input.state.thread.createdAt,
     updatedAt: input.state.updatedAt,
     archivedAt: input.state.thread.archivedAt,
@@ -1725,6 +1756,25 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             `;
             break;
           }
+          case "goal.created":
+          case "goal.updated":
+          case "goal.reopened":
+          case "goal.cancelled":
+          case "goal.completed":
+          case "goal.integration-updated":
+          case "goal.integration-conflicted":
+          case "goal.graph-version-activated":
+          case "goal.node-transitioned":
+          case "goal.node-cancellation-requested":
+          case "goal.attempt-created":
+          case "goal.attempt-transitioned":
+          case "goal.route-resolved":
+          case "goal.artifact-published":
+          case "goal.writer-commit-recorded":
+          case "goal.evidence-submitted":
+          case "goal.verdict-recorded":
+          case "goal.failure-recorded":
+            break;
         }
 
         if (
@@ -1957,6 +2007,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           contextHandoffs,
           contextTransfers,
           visibleTurnItems: [],
+          goal: yield* readGoalDetailByRootThread(sql, threadId),
           updatedAt: thread.updatedAt,
         } satisfies OrchestrationV2ThreadProjection;
         return withLocalVisibleTurnItems(projection);
@@ -2168,10 +2219,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               }),
             );
             const statesByThreadId = new Map(states.map((state) => [state.thread.id, state]));
+            const goalSummariesByRootThread = yield* readGoalSummariesByRootThread(sql);
 
             const shells = states.map((state) =>
               shellFromState({
                 state,
+                goalSummary: goalSummariesByRootThread.get(state.thread.id) ?? null,
                 visibleItemCount: visibleItemCountForShell({
                   threadId: state.thread.id,
                   statesByThreadId,

@@ -1,6 +1,9 @@
 import { assert, it } from "@effect/vitest";
 import {
   EventId,
+  GoalGraphVersionId,
+  GoalId,
+  GoalNodeId,
   MessageId,
   type ModelSelection,
   NodeId,
@@ -24,9 +27,11 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import { ProjectionStoreV2, layer as projectionStoreLayer } from "./ProjectionStore.ts";
+import { GoalProjectionStore, layer as goalProjectionStoreLayer } from "./GoalProjectionStore.ts";
 
 const TestLayer = Layer.mergeAll(
   projectionStoreLayer.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
+  goalProjectionStoreLayer.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
   SqlitePersistenceMemory,
 );
 const modelSelection = {
@@ -37,7 +42,154 @@ const driver = ProviderDriverKind.make("codex");
 const providerInstanceId = modelSelection.instanceId;
 const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
+const goalPolicy = {
+  sandboxMode: "workspace-write" as const,
+  approvalPolicy: "on-request" as const,
+  writableRoots: ["/workspace"],
+  providerAllowlist: ["codex"],
+  toolAllowlist: ["shell"],
+};
+const goalNode = (id: string) => ({
+  id: GoalNodeId.make(id),
+  role: id,
+  persona: id,
+  objective: id,
+  successCriteria: ["done"],
+  contextPacket: {
+    schemaVersion: 1,
+    digest: null,
+    objective: id,
+    artifacts: [],
+    dependencyOutputs: [],
+    notes: [],
+  },
+  outputContract: { kind: "structured_result" as const, description: "report", requiredFields: [] },
+  requiredCapabilities: ["tools"],
+  workspaceMode: "read_only" as const,
+  routingRequest: {
+    type: "requirements" as const,
+    capabilities: ["tools"],
+    latencyClass: "standard" as const,
+    costClass: "standard" as const,
+  },
+  evidenceRequirements: [],
+  policy: goalPolicy,
+});
+
 it.layer(TestLayer)("ProjectionStoreV2", (it) => {
+  it.effect("overlays authoritative goal detail and shell summaries only on goal roots", () =>
+    Effect.gen(function* () {
+      const projectionStore = yield* ProjectionStoreV2;
+      const goalStore = yield* GoalProjectionStore;
+      const now = yield* DateTime.now;
+      const timestamp = DateTime.formatIso(now);
+      const projectId = ProjectId.make("project:goal-overlay");
+      const goalThreadId = ThreadId.make("thread:goal-overlay");
+      const ordinaryThreadId = ThreadId.make("thread:ordinary-overlay");
+      const additionalOrdinaryThreadIds = Array.from({ length: 32 }, (_, index) =>
+        ThreadId.make(`thread:ordinary-overlay:${index}`),
+      );
+      const makeThread = (id: ThreadId) => ({
+        createdBy: "user" as const,
+        creationSource: "web" as const,
+        id,
+        projectId,
+        title: String(id),
+        providerInstanceId,
+        modelSelection,
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+        branch: null,
+        worktreePath: null,
+        activeProviderThreadId: null,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: id },
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        deletedAt: null,
+      });
+      for (const id of [goalThreadId, ordinaryThreadId, ...additionalOrdinaryThreadIds]) {
+        yield* projectionStore.apply({
+          id: EventId.make(`event:${id}`),
+          type: "thread.created",
+          threadId: id,
+          occurredAt: now,
+          payload: makeThread(id),
+        });
+      }
+      const goalId = GoalId.make("goal:overlay");
+      yield* goalStore.create({
+        id: goalId,
+        objective: "overlay",
+        status: "running",
+        sourceThreadId: ordinaryThreadId,
+        rootThreadId: goalThreadId,
+        policy: goalPolicy,
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: "goal/overlay",
+        integrationWorktreePath: "/workspace-goal",
+        integrationSha: "sha:1",
+        verifiedSha: "sha:1",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+      const graph = {
+        id: GoalGraphVersionId.make("graph:overlay"),
+        goalId,
+        revision: 1,
+        publishedByNodeId: GoalNodeId.make("root-lead"),
+        nodes: [goalNode("node:ready"), goalNode("node:running"), goalNode("node:blocked")],
+        edges: [],
+        createdAt: timestamp,
+      } as const;
+      yield* goalStore.activateGraph({ goalId, expectedRevision: 0, graph });
+      for (const [node, status] of [
+        [graph.nodes[0]!, "ready"],
+        [graph.nodes[1]!, "running"],
+        [graph.nodes[2]!, "blocked"],
+      ] as const) {
+        yield* goalStore.apply({
+          type: "goal.node-transitioned",
+          payload: {
+            goalId,
+            graphVersionId: graph.id,
+            node,
+            status,
+            activeAttemptId: null,
+            blocker: status === "blocked" ? "needs input" : null,
+            updatedAt: timestamp,
+          },
+        });
+      }
+      const activatedGoal = (yield* goalStore.getDetail(goalId)).goal;
+      yield* goalStore.apply({
+        type: "goal.completed",
+        payload: {
+          ...activatedGoal,
+          status: "completed",
+          verifiedSha: "sha:1",
+          updatedAt: timestamp,
+        },
+      });
+      assert.isNull((yield* projectionStore.getThreadProjection(ordinaryThreadId)).goal ?? null);
+      const detail = (yield* projectionStore.getThreadProjection(goalThreadId)).goal;
+      assert.equal(detail?.goal.id, goalId);
+      const shells = yield* projectionStore.getShellSnapshot();
+      assert.equal(shells.threads.length, 34);
+      const ordinary = shells.threads.find((thread) => thread.id === ordinaryThreadId);
+      const root = shells.threads.find((thread) => thread.id === goalThreadId);
+      assert.isNull(ordinary?.goalSummary ?? null);
+      assert.deepInclude(root?.goalSummary, {
+        readyCount: 1,
+        runningCount: 1,
+        blockedCount: 1,
+        attentionRequired: true,
+        verified: true,
+      });
+    }),
+  );
   it.effect("projects one shared provider session into multiple thread bindings", () =>
     Effect.gen(function* () {
       const projectionStore = yield* ProjectionStoreV2;

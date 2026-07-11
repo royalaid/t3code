@@ -6,6 +6,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  type GoalWorkflowEvent,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -37,6 +38,7 @@ import {
   TurnItemPositionStoreV2,
   layer as turnItemPositionStoreLayer,
 } from "./TurnItemPositionStore.ts";
+import { GoalProjectionStore, layer as goalProjectionStoreLayer } from "./GoalProjectionStore.ts";
 
 /**
  * ERRORS
@@ -152,6 +154,7 @@ const baseLayer: Layer.Layer<
   | EffectOutboxV2
   | EventStoreV2
   | ProjectionStoreV2
+  | GoalProjectionStore
   | SqlClient.SqlClient
   | TurnItemPositionStoreV2
 > = Layer.effect(
@@ -162,6 +165,7 @@ const baseLayer: Layer.Layer<
     const effectOutbox = yield* EffectOutboxV2;
     const eventStore = yield* EventStoreV2;
     const projectionStore = yield* ProjectionStoreV2;
+    const goalProjectionStore = yield* GoalProjectionStore;
     const turnItemPositions = yield* TurnItemPositionStoreV2;
     const liveEvents = yield* PubSub.unbounded<OrchestrationV2StoredEvent>();
 
@@ -193,6 +197,11 @@ const baseLayer: Layer.Layer<
         yield* Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
           concurrency: 1,
         });
+        yield* Effect.forEach(
+          storedEvents.filter((stored) => stored.event.type.startsWith("goal.")),
+          (stored) => goalProjectionStore.apply(stored.event as GoalWorkflowEvent),
+          { concurrency: 1 },
+        );
         const sequence = storedEvents.at(-1)?.sequence;
         if (sequence !== undefined) {
           const now = DateTime.formatIso(yield* DateTime.now);
@@ -561,7 +570,7 @@ const baseLayer: Layer.Layer<
  * important because enqueue notifications are in-memory wakeups backed by the
  * durable SQL queue.
  */
-export const layerFromStores = baseLayer;
+export const layerFromStores = baseLayer.pipe(Layer.provide(goalProjectionStoreLayer));
 
 export const layer: Layer.Layer<
   EventSinkV2,
@@ -569,6 +578,11 @@ export const layer: Layer.Layer<
   EventStoreV2 | ProjectionStoreV2 | SqlClient.SqlClient
 > = baseLayer.pipe(
   Layer.provide(
-    Layer.mergeAll(commandReceiptStoreLayer, effectOutboxLayer, turnItemPositionStoreLayer),
+    Layer.mergeAll(
+      commandReceiptStoreLayer,
+      effectOutboxLayer,
+      turnItemPositionStoreLayer,
+      goalProjectionStoreLayer,
+    ),
   ),
 );

@@ -22,6 +22,7 @@ import { layerFromOrchestrationEventStore as eventStoreLayer } from "./EventStor
 import { layer as idAllocatorLayer } from "./IdAllocator.ts";
 import { layer as orchestratorLayer } from "./Orchestrator.ts";
 import { layer as projectionStoreLayer } from "./ProjectionStore.ts";
+import { layer as goalProjectionStoreLayer } from "./GoalProjectionStore.ts";
 import { layer as projectionMaintenanceLayer } from "./ProjectionMaintenance.ts";
 import { layerFromProviderInstanceRegistry as providerAdapterRegistryLayerFromProviderInstances } from "./ProviderAdapterRegistry.ts";
 import { layer as providerEventIngestorLayer } from "./ProviderEventIngestor.ts";
@@ -59,6 +60,7 @@ const storesLayer = Layer.mergeAll(
   OrchestrationEventInfrastructureLayerLive,
   eventStoreProvided,
   projectionStoreLayer,
+  goalProjectionStoreLayer,
   commandReceiptStoreProvided,
   effectOutboxLayer,
   turnItemPositionStoreLayer,

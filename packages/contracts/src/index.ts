@@ -23,6 +23,7 @@ export * from "./vcs.ts";
 export * from "./sourceControl.ts";
 export * from "./orchestrationProject.ts";
 export * from "./orchestrationV2.ts";
+export * from "./goalWorkflow.ts";
 export * from "./applicationEvent.ts";
 export * from "./orchestratorMcp.ts";
 export * from "./editor.ts";

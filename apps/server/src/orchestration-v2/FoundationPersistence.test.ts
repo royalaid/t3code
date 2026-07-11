@@ -6,6 +6,11 @@ import {
   CommandId,
   ContextTransferId,
   EventId,
+  GoalId,
+  GoalAttemptId,
+  GoalEdgeId,
+  GoalGraphVersionId,
+  GoalNodeId,
   MessageId,
   type ModelSelection,
   NodeId,
@@ -50,12 +55,21 @@ import {
   layer as projectionMaintenanceLayer,
 } from "./ProjectionMaintenance.ts";
 import { ProjectionStoreV2, layer as projectionStoreLayer } from "./ProjectionStore.ts";
+import { GoalProjectionStore, layer as goalProjectionStoreLayer } from "./GoalProjectionStore.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 
 const databaseLayer = SqlitePersistenceMemory;
 const eventStoreProvided = eventStoreLayer.pipe(Layer.provideMerge(databaseLayer));
 const projectionStoreProvided = projectionStoreLayer.pipe(Layer.provideMerge(databaseLayer));
-const storesProvided = Layer.mergeAll(databaseLayer, eventStoreProvided, projectionStoreProvided);
+const goalProjectionStoreProvided = goalProjectionStoreLayer.pipe(
+  Layer.provideMerge(databaseLayer),
+);
+const storesProvided = Layer.mergeAll(
+  databaseLayer,
+  eventStoreProvided,
+  projectionStoreProvided,
+  goalProjectionStoreProvided,
+);
 const eventSinkProvided = eventSinkLayer.pipe(Layer.provide(storesProvided));
 const effectOutboxProvided = effectOutboxLayer.pipe(Layer.provide(databaseLayer));
 const commandReceiptStoreProvided = commandReceiptStoreLayer.pipe(Layer.provide(databaseLayer));
@@ -121,6 +135,178 @@ function threadCreatedEvent(input: {
 }
 
 it.layer(TestLayer)("orchestration V2 foundation persistence", (it) => {
+  it.effect("rebuilds goal projections and detects unreadable goal state", () =>
+    Effect.gen(function* () {
+      const eventSink = yield* EventSinkV2;
+      const goalStore = yield* GoalProjectionStore;
+      const maintenance = yield* ProjectionMaintenanceV2;
+      const sql = yield* SqlClient.SqlClient;
+      const now = yield* DateTime.now;
+      const timestamp = DateTime.formatIso(now);
+      const threadId = ThreadId.make("thread:foundation-goal-rebuild");
+      const goalId = GoalId.make("goal:foundation-rebuild");
+      yield* eventSink.write({
+        events: [
+          threadCreatedEvent({
+            id: "event:foundation-goal-rebuild:thread",
+            thread: makeThread(threadId, now),
+            now,
+          }),
+          {
+            id: EventId.make("event:foundation-goal-rebuild:goal"),
+            type: "goal.created",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: goalId,
+              objective: "rebuild",
+              status: "waiting_for_source",
+              sourceThreadId: threadId,
+              rootThreadId: threadId,
+              policy: {
+                sandboxMode: "workspace-write",
+                approvalPolicy: "on-request",
+                writableRoots: ["/workspace"],
+                providerAllowlist: ["codex"],
+                toolAllowlist: ["shell"],
+              },
+              currentGraphVersionId: null,
+              currentRevision: 0,
+              integrationBranch: null,
+              integrationWorktreePath: null,
+              integrationSha: null,
+              verifiedSha: null,
+              createdAt: timestamp,
+              updatedAt: timestamp,
+            },
+          },
+        ],
+      });
+      assert.isTrue((yield* maintenance.verify).valid);
+      yield* sql`DELETE FROM goals WHERE goal_id=${goalId}`;
+      const broken = yield* maintenance.verify;
+      assert.isFalse(broken.valid);
+      assert.deepEqual(broken.missingGoalIds, [goalId]);
+      assert.isTrue((yield* maintenance.rebuild).valid);
+      assert.equal((yield* goalStore.getDetail(goalId)).goal.id, goalId);
+
+      const graphId = GoalGraphVersionId.make("graph:foundation-rebuild");
+      const makeGoalNode = (id: string) => ({
+        id: GoalNodeId.make(id),
+        role: id,
+        persona: id,
+        objective: id,
+        successCriteria: ["done"],
+        contextPacket: {
+          schemaVersion: 1,
+          digest: null,
+          objective: id,
+          artifacts: [],
+          dependencyOutputs: [],
+          notes: [],
+        },
+        outputContract: {
+          kind: "structured_result" as const,
+          description: "result",
+          requiredFields: [],
+        },
+        requiredCapabilities: ["tools"],
+        workspaceMode: "read_only" as const,
+        routingRequest: {
+          type: "requirements" as const,
+          capabilities: ["tools"],
+          latencyClass: "standard" as const,
+          costClass: "standard" as const,
+        },
+        evidenceRequirements: [],
+        policy: {
+          sandboxMode: "workspace-write" as const,
+          approvalPolicy: "on-request" as const,
+          writableRoots: ["/workspace"],
+          providerAllowlist: ["codex"],
+          toolAllowlist: ["shell"],
+        },
+      });
+      const firstNode = makeGoalNode("node:foundation-rebuild:first");
+      const secondNode = makeGoalNode("node:foundation-rebuild:second");
+      const edge = {
+        id: GoalEdgeId.make("edge:foundation-rebuild"),
+        fromNodeId: firstNode.id,
+        toNodeId: secondNode.id,
+      };
+      const attemptId = GoalAttemptId.make("attempt:foundation-rebuild");
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("event:foundation-goal-rebuild:graph"),
+            type: "goal.graph-version-activated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              goalId,
+              expectedRevision: 0,
+              graph: {
+                id: graphId,
+                goalId,
+                revision: 1,
+                publishedByNodeId: GoalNodeId.make("lead:foundation-rebuild"),
+                nodes: [firstNode, secondNode],
+                edges: [edge],
+                createdAt: timestamp,
+              },
+              activatedAt: timestamp,
+            },
+          },
+          {
+            id: EventId.make("event:foundation-goal-rebuild:attempt"),
+            type: "goal.attempt-created",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: attemptId,
+              goalId,
+              graphVersionId: graphId,
+              nodeId: firstNode.id,
+              ordinal: 1,
+              status: "running",
+              requestedRoute: firstNode.routingRequest,
+              resolvedRoute: null,
+              providerSessionId: null,
+              executionThreadId: null,
+              runId: null,
+              rootExecutionNodeId: null,
+              baseIntegrationSha: null,
+              workspacePath: null,
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              usage: {
+                inputTokens: null,
+                outputTokens: null,
+                cachedTokens: null,
+                costMicros: null,
+                nativeDescendantCount: 0,
+              },
+              failureReason: null,
+              createdAt: timestamp,
+              updatedAt: timestamp,
+            },
+          },
+        ],
+      });
+      assert.isTrue((yield* maintenance.verify).valid);
+      yield* sql`DELETE FROM goal_attempts WHERE attempt_id=${attemptId}`;
+      assert.deepEqual((yield* maintenance.verify).inconsistentGoalIds, [goalId]);
+      assert.isTrue((yield* maintenance.rebuild).valid);
+      yield* sql`DELETE FROM goal_edges WHERE edge_id=${edge.id}`;
+      assert.deepEqual((yield* maintenance.verify).inconsistentGoalIds, [goalId]);
+      assert.isTrue((yield* maintenance.rebuild).valid);
+      yield* sql`PRAGMA foreign_keys=OFF`;
+      yield* sql`DELETE FROM goal_nodes WHERE graph_version_id=${graphId} AND node_id=${secondNode.id}`;
+      yield* sql`PRAGMA foreign_keys=ON`;
+      assert.deepEqual((yield* maintenance.verify).inconsistentGoalIds, [goalId]);
+      assert.isTrue((yield* maintenance.rebuild).valid);
+    }),
+  );
   it.effect("paginates catch-up beyond the event-store read limit", () =>
     Effect.gen(function* () {
       const eventSink = yield* EventSinkV2;

@@ -1,4 +1,9 @@
-import { type OrchestrationV2StoredEvent, ThreadId } from "@t3tools/contracts";
+import {
+  type GoalWorkflowEvent,
+  GoalId,
+  type OrchestrationV2StoredEvent,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -12,6 +17,7 @@ import {
   ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
   ProjectionStoreV2,
 } from "./ProjectionStore.ts";
+import { GoalProjectionStore, layer as goalProjectionStoreLayer } from "./GoalProjectionStore.ts";
 
 export interface ProjectionVerificationV2 {
   readonly valid: boolean;
@@ -21,6 +27,10 @@ export interface ProjectionVerificationV2 {
   readonly unreadableThreadIds: ReadonlyArray<ThreadId>;
   readonly missingThreadIds: ReadonlyArray<ThreadId>;
   readonly unexpectedThreadIds: ReadonlyArray<ThreadId>;
+  readonly unreadableGoalIds: ReadonlyArray<GoalId>;
+  readonly inconsistentGoalIds: ReadonlyArray<GoalId>;
+  readonly missingGoalIds: ReadonlyArray<GoalId>;
+  readonly unexpectedGoalIds: ReadonlyArray<GoalId>;
 }
 
 export class ProjectionMaintenanceError extends Schema.TaggedErrorClass<ProjectionMaintenanceError>()(
@@ -46,16 +56,17 @@ type ProjectionMetadataRow = {
   readonly last_sequence: number;
 };
 
-export const layer: Layer.Layer<
+const baseLayer: Layer.Layer<
   ProjectionMaintenanceV2,
   never,
-  EventStoreV2 | ProjectionStoreV2 | SqlClient.SqlClient
+  EventStoreV2 | GoalProjectionStore | ProjectionStoreV2 | SqlClient.SqlClient
 > = Layer.effect(
   ProjectionMaintenanceV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const eventStore = yield* EventStoreV2;
     const projectionStore = yield* ProjectionStoreV2;
+    const goalProjectionStore = yield* GoalProjectionStore;
 
     const readAllEvents = Effect.gen(function* () {
       const events: Array<OrchestrationV2StoredEvent> = [];
@@ -111,6 +122,135 @@ export const layer: Layer.Layer<
           ),
         { concurrency: 8 },
       )).filter((threadId): threadId is ThreadId => threadId !== null);
+      const expectedGoalRows = yield* sql<{ readonly goal_id: string }>`
+        SELECT DISTINCT json_extract(payload_json, '$.id') AS goal_id
+        FROM orchestration_events
+        WHERE application_event_version=2 AND event_type='goal.created'
+        ORDER BY goal_id`;
+      const goalRows = yield* sql<{ readonly goal_id: string; readonly root_thread_id: string }>`
+        SELECT goal_id, root_thread_id FROM goals ORDER BY goal_id`;
+      const expectedGoalIds = expectedGoalRows.map((row) => GoalId.make(row.goal_id));
+      const actualGoalIds = goalRows.map((row) => GoalId.make(row.goal_id));
+      const expectedGoalSet = new Set(expectedGoalIds);
+      const actualGoalSet = new Set(actualGoalIds);
+      const missingGoalIds = expectedGoalIds.filter((goalId) => !actualGoalSet.has(goalId));
+      const unexpectedGoalIds = actualGoalIds.filter((goalId) => !expectedGoalSet.has(goalId));
+      const goalChecks = yield* Effect.forEach(goalRows, (row) =>
+        goalProjectionStore.getDetail(GoalId.make(row.goal_id)).pipe(
+          Effect.map((detail) => {
+            const current = detail.goal.currentGraphVersionId;
+            const consistent =
+              actualSet.has(ThreadId.make(row.root_thread_id)) &&
+              ((current === null && detail.goal.currentRevision === 0) ||
+                detail.graphVersions.some(
+                  (graph) => graph.id === current && graph.revision === detail.goal.currentRevision,
+                ));
+            return { goalId: detail.goal.id, readable: true, consistent } as const;
+          }),
+          Effect.orElseSucceed(
+            () =>
+              ({
+                goalId: GoalId.make(row.goal_id),
+                readable: false,
+                consistent: false,
+              }) as const,
+          ),
+        ),
+      );
+      const unreadableGoalIds = goalChecks.filter((row) => !row.readable).map((row) => row.goalId);
+      const inconsistentGoalIdSet = new Set(
+        goalChecks.filter((row) => row.readable && !row.consistent).map((row) => row.goalId),
+      );
+      const expectedNodeRows = yield* sql<{
+        readonly goal_id: string;
+        readonly record_key: string;
+      }>`
+        SELECT json_extract(events.payload_json, '$.goalId') AS goal_id,
+          json_extract(events.payload_json, '$.graph.id') || ':' || json_extract(nodes.value, '$.id') AS record_key
+        FROM orchestration_events events, json_each(events.payload_json, '$.graph.nodes') nodes
+        WHERE events.application_event_version=2 AND events.event_type='goal.graph-version-activated'`;
+      const actualNodeRows = yield* sql<{ readonly goal_id: string; readonly record_key: string }>`
+        SELECT goal_id, graph_version_id || ':' || node_id AS record_key FROM goal_nodes`;
+      const actualNodeKeys = new Set(actualNodeRows.map((row) => row.record_key));
+      const expectedNodeKeys = new Set(expectedNodeRows.map((row) => row.record_key));
+      for (const row of expectedNodeRows)
+        if (!actualNodeKeys.has(row.record_key))
+          inconsistentGoalIdSet.add(GoalId.make(row.goal_id));
+      for (const row of actualNodeRows)
+        if (!expectedNodeKeys.has(row.record_key))
+          inconsistentGoalIdSet.add(GoalId.make(row.goal_id));
+      const expectedGraphRows = yield* sql<{
+        readonly goal_id: string;
+        readonly record_key: string;
+      }>`
+        SELECT json_extract(payload_json, '$.goalId') AS goal_id,
+          json_extract(payload_json, '$.graph.id') AS record_key
+        FROM orchestration_events
+        WHERE application_event_version=2 AND event_type='goal.graph-version-activated'`;
+      const actualGraphRows = yield* sql<{ readonly goal_id: string; readonly record_key: string }>`
+        SELECT goal_id, graph_version_id AS record_key FROM goal_graph_versions`;
+      const actualGraphKeys = new Set(actualGraphRows.map((row) => row.record_key));
+      const expectedGraphKeys = new Set(expectedGraphRows.map((row) => row.record_key));
+      for (const row of expectedGraphRows)
+        if (!actualGraphKeys.has(row.record_key))
+          inconsistentGoalIdSet.add(GoalId.make(row.goal_id));
+      for (const row of actualGraphRows)
+        if (!expectedGraphKeys.has(row.record_key))
+          inconsistentGoalIdSet.add(GoalId.make(row.goal_id));
+      const expectedEdgeRows = yield* sql<{
+        readonly goal_id: string;
+        readonly record_key: string;
+      }>`
+        SELECT json_extract(events.payload_json, '$.goalId') AS goal_id,
+          json_extract(events.payload_json, '$.graph.id') || ':' || json_extract(edges.value, '$.id') AS record_key
+        FROM orchestration_events events, json_each(events.payload_json, '$.graph.edges') edges
+        WHERE events.application_event_version=2 AND events.event_type='goal.graph-version-activated'`;
+      const actualEdgeRows = yield* sql<{ readonly goal_id: string; readonly record_key: string }>`
+        SELECT versions.goal_id, edges.graph_version_id || ':' || edges.edge_id AS record_key
+        FROM goal_edges edges JOIN goal_graph_versions versions USING(graph_version_id)`;
+      const actualEdgeKeys = new Set(actualEdgeRows.map((row) => row.record_key));
+      const expectedEdgeKeys = new Set(expectedEdgeRows.map((row) => row.record_key));
+      for (const row of expectedEdgeRows)
+        if (!actualEdgeKeys.has(row.record_key))
+          inconsistentGoalIdSet.add(GoalId.make(row.goal_id));
+      for (const row of actualEdgeRows)
+        if (!expectedEdgeKeys.has(row.record_key))
+          inconsistentGoalIdSet.add(GoalId.make(row.goal_id));
+      const expectedRecordRows = yield* sql<{
+        readonly goal_id: string;
+        readonly record_key: string;
+      }>`
+        SELECT DISTINCT json_extract(payload_json, '$.goalId') AS goal_id,
+          event_type || ':' || json_extract(payload_json, '$.id') AS record_key
+        FROM orchestration_events
+        WHERE application_event_version=2 AND event_type IN (
+          'goal.attempt-created', 'goal.artifact-published', 'goal.evidence-submitted',
+          'goal.verdict-recorded', 'goal.writer-commit-recorded', 'goal.failure-recorded'
+        )`;
+      const actualRecordRows = yield* sql<{
+        readonly goal_id: string;
+        readonly record_key: string;
+      }>`
+        SELECT goal_id, 'goal.attempt-created:' || attempt_id AS record_key FROM goal_attempts
+        UNION ALL SELECT goal_id, 'goal.artifact-published:' || artifact_id FROM goal_artifacts
+        UNION ALL SELECT goal_id, 'goal.evidence-submitted:' || evidence_id FROM goal_evidence
+        UNION ALL SELECT goal_id, 'goal.writer-commit-recorded:' || writer_commit_id FROM goal_writer_commits
+        UNION ALL SELECT goal_id, 'goal.failure-recorded:' || failure_id FROM goal_failures`;
+      const normalizeRecordKey = (key: string) =>
+        key.replace("goal.verdict-recorded:", "goal.evidence-submitted:");
+      const actualRecordKeys = new Set(actualRecordRows.map((row) => row.record_key));
+      const expectedRecordKeys = new Set(
+        expectedRecordRows.map((row) => normalizeRecordKey(row.record_key)),
+      );
+      for (const row of expectedRecordRows)
+        if (!actualRecordKeys.has(normalizeRecordKey(row.record_key)))
+          inconsistentGoalIdSet.add(GoalId.make(row.goal_id));
+      for (const row of actualRecordRows)
+        if (!expectedRecordKeys.has(row.record_key))
+          inconsistentGoalIdSet.add(GoalId.make(row.goal_id));
+      const inconsistentGoalIds = Array.from(inconsistentGoalIdSet).sort((a, b) =>
+        String(a).localeCompare(String(b)),
+      );
       const metadata = yield* sql<ProjectionMetadataRow>`
         SELECT schema_version, last_sequence
         FROM orchestration_v2_projection_metadata
@@ -126,13 +266,21 @@ export const layer: Layer.Layer<
           projectionSequence === expectedSequence &&
           missingThreadIds.length === 0 &&
           unexpectedThreadIds.length === 0 &&
-          unreadableThreadIds.length === 0,
+          unreadableThreadIds.length === 0 &&
+          unreadableGoalIds.length === 0 &&
+          inconsistentGoalIds.length === 0 &&
+          missingGoalIds.length === 0 &&
+          unexpectedGoalIds.length === 0,
         schemaVersion,
         expectedSequence,
         projectionSequence,
         unreadableThreadIds,
         missingThreadIds,
         unexpectedThreadIds,
+        unreadableGoalIds,
+        inconsistentGoalIds,
+        missingGoalIds,
+        unexpectedGoalIds,
       } satisfies ProjectionVerificationV2;
     });
 
@@ -140,6 +288,15 @@ export const layer: Layer.Layer<
       const events = yield* readAllEvents;
       yield* sql.withTransaction(
         Effect.gen(function* () {
+          yield* sql`DELETE FROM goal_evidence`;
+          yield* sql`DELETE FROM goal_failures`;
+          yield* sql`DELETE FROM goal_writer_commits`;
+          yield* sql`DELETE FROM goal_artifacts`;
+          yield* sql`DELETE FROM goal_attempts`;
+          yield* sql`DELETE FROM goal_edges`;
+          yield* sql`DELETE FROM goal_nodes`;
+          yield* sql`DELETE FROM goal_graph_versions`;
+          yield* sql`DELETE FROM goals`;
           yield* sql`DELETE FROM orchestration_v2_projection_context_transfers`;
           yield* sql`DELETE FROM orchestration_v2_projection_context_handoffs`;
           yield* sql`DELETE FROM orchestration_v2_projection_checkpoints`;
@@ -161,6 +318,9 @@ export const layer: Layer.Layer<
 
           for (const stored of events) {
             yield* projectionStore.apply(stored.event);
+            if (stored.event.type.startsWith("goal.")) {
+              yield* goalProjectionStore.apply(stored.event as GoalWorkflowEvent);
+            }
             if (stored.event.type === "turn-item.updated") {
               yield* sql`
                 INSERT INTO orchestration_v2_turn_item_positions (
@@ -216,3 +376,9 @@ export const layer: Layer.Layer<
     });
   }),
 );
+
+export const layer: Layer.Layer<
+  ProjectionMaintenanceV2,
+  never,
+  EventStoreV2 | ProjectionStoreV2 | SqlClient.SqlClient
+> = baseLayer.pipe(Layer.provide(goalProjectionStoreLayer));

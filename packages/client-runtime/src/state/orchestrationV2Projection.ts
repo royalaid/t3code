@@ -164,5 +164,24 @@ export function applyOrchestrationV2ProjectionEvent(
     case "context-transfer.created":
     case "context-transfer.updated":
       return { ...base, contextTransfers: upsertEntity(base.contextTransfers, event.payload) };
+    case "goal.created":
+    case "goal.updated":
+    case "goal.reopened":
+    case "goal.cancelled":
+    case "goal.completed":
+    case "goal.integration-updated":
+    case "goal.integration-conflicted":
+    case "goal.graph-version-activated":
+    case "goal.node-transitioned":
+    case "goal.node-cancellation-requested":
+    case "goal.attempt-created":
+    case "goal.attempt-transitioned":
+    case "goal.route-resolved":
+    case "goal.artifact-published":
+    case "goal.writer-commit-recorded":
+    case "goal.evidence-submitted":
+    case "goal.verdict-recorded":
+    case "goal.failure-recorded":
+      return base;
   }
 }

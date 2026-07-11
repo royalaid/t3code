@@ -42,6 +42,19 @@ import {
 } from "./providerPolicy.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import { OrchestrationProjectShell } from "./orchestrationProject.ts";
+import {
+  Goal,
+  GoalArtifact,
+  GoalAttempt,
+  GoalDetail,
+  GoalEvidence,
+  GoalFailureRecordedPayload,
+  GoalGraphActivatedPayload,
+  GoalNodeProjection,
+  GoalSummary,
+  GoalWriterCommit,
+  GoalWorkflowCommand,
+} from "./goalWorkflow.ts";
 
 export const OrchestrationV2Actor = Schema.Literals(["user", "agent", "system"]);
 export type OrchestrationV2Actor = typeof OrchestrationV2Actor.Type;
@@ -1088,6 +1101,58 @@ export const OrchestrationV2DomainEvent = Schema.Union([
     type: Schema.Literal("context-transfer.updated"),
     payload: OrchestrationV2ContextTransfer,
   }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
+    type: Schema.Literals([
+      "goal.created",
+      "goal.updated",
+      "goal.reopened",
+      "goal.cancelled",
+      "goal.completed",
+      "goal.integration-updated",
+      "goal.integration-conflicted",
+    ]),
+    payload: Goal,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
+    type: Schema.Literal("goal.graph-version-activated"),
+    payload: GoalGraphActivatedPayload,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
+    type: Schema.Literals(["goal.node-transitioned", "goal.node-cancellation-requested"]),
+    payload: GoalNodeProjection,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
+    type: Schema.Literals([
+      "goal.attempt-created",
+      "goal.attempt-transitioned",
+      "goal.route-resolved",
+    ]),
+    payload: GoalAttempt,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
+    type: Schema.Literal("goal.artifact-published"),
+    payload: GoalArtifact,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
+    type: Schema.Literal("goal.writer-commit-recorded"),
+    payload: GoalWriterCommit,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
+    type: Schema.Literals(["goal.evidence-submitted", "goal.verdict-recorded"]),
+    payload: GoalEvidence,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
+    type: Schema.Literal("goal.failure-recorded"),
+    payload: GoalFailureRecordedPayload,
+  }),
 ]);
 export type OrchestrationV2DomainEvent = typeof OrchestrationV2DomainEvent.Type;
 
@@ -1109,6 +1174,7 @@ export const OrchestrationV2ThreadProjection = Schema.Struct({
   contextHandoffs: Schema.Array(OrchestrationV2ContextHandoff),
   contextTransfers: Schema.Array(OrchestrationV2ContextTransfer),
   visibleTurnItems: Schema.Array(OrchestrationV2ProjectedTurnItem),
+  goal: Schema.optionalKey(Schema.NullOr(GoalDetail)),
   updatedAt: Schema.DateTimeUtc,
 });
 export type OrchestrationV2ThreadProjection = typeof OrchestrationV2ThreadProjection.Type;
@@ -1159,6 +1225,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   hasActionableProposedPlan: Schema.Boolean,
   itemCount: NonNegativeInt,
   visibleItemCount: NonNegativeInt,
+  goalSummary: Schema.optionalKey(Schema.NullOr(GoalSummary)),
   createdAt: Schema.DateTimeUtc,
   updatedAt: Schema.DateTimeUtc,
   archivedAt: Schema.NullOr(Schema.DateTimeUtc),
@@ -1660,6 +1727,58 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
     type: Schema.Literal("context-transfer.updated"),
     payload: OrchestrationV2ContextTransferJson,
   }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literals([
+      "goal.created",
+      "goal.updated",
+      "goal.reopened",
+      "goal.cancelled",
+      "goal.completed",
+      "goal.integration-updated",
+      "goal.integration-conflicted",
+    ]),
+    payload: Goal,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literal("goal.graph-version-activated"),
+    payload: GoalGraphActivatedPayload,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literals(["goal.node-transitioned", "goal.node-cancellation-requested"]),
+    payload: GoalNodeProjection,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literals([
+      "goal.attempt-created",
+      "goal.attempt-transitioned",
+      "goal.route-resolved",
+    ]),
+    payload: GoalAttempt,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literal("goal.artifact-published"),
+    payload: GoalArtifact,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literal("goal.writer-commit-recorded"),
+    payload: GoalWriterCommit,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literals(["goal.evidence-submitted", "goal.verdict-recorded"]),
+    payload: GoalEvidence,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literal("goal.failure-recorded"),
+    payload: GoalFailureRecordedPayload,
+  }),
 ]);
 export type OrchestrationV2DomainEventJson = typeof OrchestrationV2DomainEventJson.Type;
 
@@ -1671,6 +1790,7 @@ export const OrchestrationV2StoredEventJson = Schema.Struct({
 export type OrchestrationV2StoredEventJson = typeof OrchestrationV2StoredEventJson.Type;
 
 export const OrchestrationV2Command = Schema.Union([
+  GoalWorkflowCommand,
   Schema.Struct({
     type: Schema.Literal("thread.create"),
     ...OrchestrationV2CreationFields,
