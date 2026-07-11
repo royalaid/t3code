@@ -1,14 +1,11 @@
 import {
   ConnectionPersistenceError,
   EnvironmentCacheStore,
+  ORCHESTRATION_CACHE_SCHEMA_VERSION,
+  StoredOrchestrationShellSnapshot,
+  StoredOrchestrationThreadSnapshot,
 } from "@t3tools/client-runtime/platform";
-import {
-  type EnvironmentId,
-  OrchestrationShellSnapshot,
-  OrchestrationThreadDetailSnapshot,
-  ServerConfig,
-  VcsListRefsResult,
-} from "@t3tools/contracts";
+import { type EnvironmentId, ServerConfig, VcsListRefsResult } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -16,22 +13,11 @@ import * as Schema from "effect/Schema";
 
 import * as MobileDatabase from "../persistence/mobile-database";
 
-const SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION = 1;
-const THREAD_SNAPSHOT_CACHE_SCHEMA_VERSION = 2;
 const SERVER_CONFIG_CACHE_SCHEMA_VERSION = 1;
 const VCS_REFS_CACHE_SCHEMA_VERSION = 1;
 
-const StoredShellSnapshot = Schema.Struct({
-  schemaVersion: Schema.Literal(SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION),
-  environmentId: Schema.String,
-  snapshot: OrchestrationShellSnapshot,
-});
-const StoredThreadSnapshot = Schema.Struct({
-  schemaVersion: Schema.Literal(THREAD_SNAPSHOT_CACHE_SCHEMA_VERSION),
-  environmentId: Schema.String,
-  threadId: Schema.String,
-  snapshot: OrchestrationThreadDetailSnapshot,
-});
+const StoredShellSnapshot = StoredOrchestrationShellSnapshot;
+const StoredThreadSnapshot = StoredOrchestrationThreadSnapshot;
 const StoredServerConfig = Schema.Struct({
   schemaVersion: Schema.Literal(SERVER_CONFIG_CACHE_SCHEMA_VERSION),
   environmentId: Schema.String,
@@ -127,12 +113,12 @@ export const make = Effect.fn("MobileEnvironmentCacheStore.make")(function* () {
     ),
     saveShell: Effect.fn("MobileEnvironmentCache.saveShell")(function* (environmentId, snapshot) {
       const payload = yield* encodeStoredShellSnapshot({
-        schemaVersion: SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION,
+        schemaVersion: ORCHESTRATION_CACHE_SCHEMA_VERSION,
         environmentId,
         snapshot,
       }).pipe(Effect.mapError((cause) => persistenceError("save-shell", cause)));
       yield* database
-        .saveCache(environmentId, "shell", "snapshot", SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION, payload)
+        .saveCache(environmentId, "shell", "snapshot", ORCHESTRATION_CACHE_SCHEMA_VERSION, payload)
         .pipe(Effect.mapError(mapDatabaseError("save-shell")));
     }),
     loadThread: Effect.fn("MobileEnvironmentCache.loadThread")((environmentId, threadId) =>
@@ -150,15 +136,15 @@ export const make = Effect.fn("MobileEnvironmentCacheStore.make")(function* () {
       }),
     ),
     saveThread: Effect.fn("MobileEnvironmentCache.saveThread")(function* (environmentId, snapshot) {
-      const threadId = snapshot.thread.id;
+      const threadId = snapshot.projection.thread.id;
       const payload = yield* encodeStoredThreadSnapshot({
-        schemaVersion: THREAD_SNAPSHOT_CACHE_SCHEMA_VERSION,
+        schemaVersion: ORCHESTRATION_CACHE_SCHEMA_VERSION,
         environmentId,
         threadId,
         snapshot,
       }).pipe(Effect.mapError((cause) => persistenceError("save-thread", cause)));
       yield* database
-        .saveCache(environmentId, "thread", threadId, THREAD_SNAPSHOT_CACHE_SCHEMA_VERSION, payload)
+        .saveCache(environmentId, "thread", threadId, ORCHESTRATION_CACHE_SCHEMA_VERSION, payload)
         .pipe(Effect.mapError(mapDatabaseError("save-thread")));
     }),
     removeThread: Effect.fn("MobileEnvironmentCache.removeThread")((environmentId, threadId) =>
