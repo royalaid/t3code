@@ -395,6 +395,179 @@ it.layer(SharedApplicationDataPlaneTestLayer)("pending provider interruption", (
   );
 });
 
+it.layer(SharedApplicationDataPlaneTestLayer)("goal launch invariants", (it) => {
+  it.effect("atomically rejects a colliding client-selected goal root id", () =>
+    Effect.gen(function* () {
+      const applicationEngine = yield* OrchestrationEngineService;
+      const orchestrator = yield* OrchestratorV2;
+      const projectId = ProjectId.make("runtime-layer-goal-project");
+      const sourceThreadId = ThreadId.make("runtime-layer-goal-source");
+      const rootThreadId = ThreadId.make("runtime-layer-goal-root");
+      yield* applicationEngine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("runtime-layer-goal-project-create"),
+        projectId,
+        title: "Goal project",
+        workspaceRoot: process.cwd(),
+        defaultModelSelection: modelSelection,
+        scripts: [],
+        createdAt: "2026-07-12T00:00:00.000Z",
+      });
+      for (const [threadId, commandId] of [
+        [sourceThreadId, "runtime-layer-goal-source-create"],
+        [rootThreadId, "runtime-layer-goal-collision-create"],
+      ] as const) {
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(commandId),
+          threadId,
+          projectId,
+          title: String(threadId),
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: "main",
+          worktreePath: process.cwd(),
+        });
+      }
+      const failed = yield* orchestrator
+        .dispatch({
+          type: "goal.launch",
+          commandId: CommandId.make("runtime-layer-goal-launch-collision"),
+          threadId: sourceThreadId,
+          rootThreadId,
+          objective: "Do the work",
+          messageId: MessageId.make("runtime-layer-goal-message"),
+          attachments: [],
+          selectedContextText: [],
+          createdBy: "user",
+          creationSource: "web",
+        })
+        .pipe(Effect.flip);
+      assert.match(String(failed), /root.*already exists|collision/iu);
+      const source = yield* orchestrator.getThreadProjection(sourceThreadId);
+      assert.isNull(source.goal ?? null);
+    }),
+  );
+
+  it.effect("keeps a cancelled pending goal from launching after its source run settles", () =>
+    Effect.gen(function* () {
+      const applicationEngine = yield* OrchestrationEngineService;
+      const orchestrator = yield* OrchestratorV2;
+      const threadManagement = yield* ThreadManagementService;
+      const projectId = ProjectId.make("runtime-layer-goal-cancel-project");
+      const sourceThreadId = ThreadId.make("runtime-layer-goal-cancel-source");
+      const rootThreadId = ThreadId.make("runtime-layer-goal-cancel-root");
+      yield* applicationEngine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("runtime-layer-goal-cancel-project-create"),
+        projectId,
+        title: "Goal cancel project",
+        workspaceRoot: process.cwd(),
+        defaultModelSelection: modelSelection,
+        scripts: [],
+        createdAt: "2026-07-12T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-goal-cancel-source-create"),
+        threadId: sourceThreadId,
+        projectId,
+        title: "Source",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: "main",
+        worktreePath: process.cwd(),
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-goal-cancel-source-run"),
+        threadId: sourceThreadId,
+        messageId: MessageId.make("runtime-layer-goal-cancel-source-message"),
+        text: "Source work",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      const source = yield* orchestrator.getThreadProjection(sourceThreadId);
+      const sourceRun = source.runs[0]!;
+      yield* orchestrator.dispatch({
+        type: "goal.launch",
+        commandId: CommandId.make("runtime-layer-goal-cancel-launch"),
+        threadId: sourceThreadId,
+        rootThreadId,
+        objective: "Never launch after cancel",
+        messageId: MessageId.make("runtime-layer-goal-cancel-goal-message"),
+        attachments: [],
+        selectedContextText: [],
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const root = yield* orchestrator.getThreadProjection(rootThreadId);
+      yield* orchestrator.dispatch({
+        type: "goal.pending-launch.cancel",
+        commandId: CommandId.make("runtime-layer-goal-cancel-command"),
+        threadId: rootThreadId,
+        goalId: root.goal!.goal.id,
+      });
+      const sourceAfterGoalCancel = yield* orchestrator.getThreadProjection(sourceThreadId);
+      assert.equal(sourceAfterGoalCancel.runs[0]?.status, "starting");
+      assert.deepEqual(sourceAfterGoalCancel.providerSessions, []);
+      const staleClaimStart = yield* orchestrator
+        .dispatch({
+          type: "message.dispatch",
+          createdBy: "system",
+          creationSource: "server",
+          commandId: CommandId.make("runtime-layer-goal-cancel-stale-claim-start"),
+          threadId: rootThreadId,
+          messageId: MessageId.make("runtime-layer-goal-cancel-stale-claim-message"),
+          text: "must not start",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "defer_start" },
+          goalLaunchClaim: {
+            goalId: root.goal!.goal.id,
+            claimId: `goal-root-launch:${root.goal!.goal.id}`,
+          },
+        })
+        .pipe(Effect.flip);
+      assert.match(String(staleClaimStart), /claim|provisioning|cancel/iu);
+      const staleClaimFailure = yield* orchestrator
+        .dispatch({
+          type: "goal.pending-launch.fail",
+          commandId: CommandId.make("runtime-layer-goal-cancel-stale-claim-fail"),
+          threadId: rootThreadId,
+          goalId: root.goal!.goal.id,
+          claimId: `goal-root-launch:${root.goal!.goal.id}`,
+          detail: "stale launch claim rejected after cancellation",
+        })
+        .pipe(Effect.flip);
+      assert.match(String(staleClaimFailure), /no domain events|failed to dispatch/iu);
+      const afterStaleFailure = yield* orchestrator.getThreadProjection(rootThreadId);
+      assert.equal(afterStaleFailure.goal?.goal.status, "cancelled");
+      yield* threadManagement.interruptThread({
+        projectId,
+        commandId: CommandId.make("runtime-layer-goal-cancel-source-interrupt"),
+        threadId: sourceThreadId,
+        runId: sourceRun.id,
+        reason: "settle source after goal cancellation",
+      });
+      yield* Effect.yieldNow;
+      const cancelled = yield* orchestrator.getThreadProjection(rootThreadId);
+      assert.equal(cancelled.goal?.goal.status, "cancelled");
+      assert.deepEqual(cancelled.runs, []);
+      assert.deepEqual(cancelled.providerSessions, []);
+    }),
+  );
+});
+
 it.layer(SharedApplicationDataPlaneTestLayer)("shared application data plane", (it) => {
   it.effect("orders retained project transactions and V2 thread transactions in one source", () =>
     Effect.gen(function* () {

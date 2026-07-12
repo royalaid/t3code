@@ -5,6 +5,46 @@ import { McpInvocationContext } from "../../McpInvocationContext.ts";
 import { OrchestratorMcpService } from "../../OrchestratorMcpService.ts";
 
 const handlers = {
+  goal_read: ({ goalId }) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext;
+      return yield* (yield* OrchestratorMcpService).goalRead(scope, goalId);
+    }),
+  goal_capabilities: () =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext;
+      return yield* (yield* OrchestratorMcpService).goalCapabilities(scope);
+    }),
+  goal_replace_graph: (input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext;
+      return yield* (yield* OrchestratorMcpService).goalReplaceGraph(scope, input);
+    }),
+  goal_node_read: (input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext;
+      return yield* (yield* OrchestratorMcpService).goalNodeRead(scope, input);
+    }),
+  goal_node_cancel: (input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext;
+      return yield* (yield* OrchestratorMcpService).goalNodeCancel(scope, input);
+    }),
+  goal_result_publish: (input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext;
+      return yield* (yield* OrchestratorMcpService).goalResultPublish(scope, input);
+    }),
+  goal_evidence_read: (input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext;
+      return yield* (yield* OrchestratorMcpService).goalEvidenceRead(scope, input);
+    }),
+  goal_evidence_submit: (input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext;
+      return yield* (yield* OrchestratorMcpService).goalEvidenceSubmit(scope, input);
+    }),
   orchestrator_capabilities: () =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext;

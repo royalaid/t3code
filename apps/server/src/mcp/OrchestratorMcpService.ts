@@ -1,5 +1,17 @@
 import {
   CommandId,
+  type GoalDetail,
+  type GoalId,
+  type GoalMcpCapabilitiesResult,
+  type GoalMcpEvidenceReadInput,
+  type GoalMcpEvidenceReadResult,
+  type GoalMcpEvidenceSubmitInput,
+  type GoalMcpMutationResult,
+  type GoalMcpNodeCancelInput,
+  type GoalMcpNodeReadInput,
+  type GoalMcpNodeReadResult,
+  type GoalMcpReplaceGraphInput,
+  type GoalMcpResultPublishInput,
   isProviderAvailable,
   MessageId,
   type ModelSelection,
@@ -70,6 +82,8 @@ import {
 import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
 import { ScheduledTaskService } from "../scheduledTasks/ScheduledTaskService.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
+import { goalAuthority } from "./McpInvocationContext.ts";
+import { validateGoalWorkerBinding } from "./GoalMcpAuthorization.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 const MAX_WAIT_TIMEOUT_MS = 60 * 60 * 1_000;
@@ -89,6 +103,37 @@ type TerminalTaskStatus = Extract<
 >;
 
 export interface OrchestratorMcpServiceShape {
+  readonly goalRead: (
+    scope: McpInvocationScope,
+    goalId: GoalId,
+  ) => Effect.Effect<GoalDetail, OrchestratorMcpFailure>;
+  readonly goalCapabilities: (
+    scope: McpInvocationScope,
+  ) => Effect.Effect<GoalMcpCapabilitiesResult, OrchestratorMcpFailure>;
+  readonly goalReplaceGraph: (
+    scope: McpInvocationScope,
+    input: GoalMcpReplaceGraphInput,
+  ) => Effect.Effect<GoalMcpMutationResult, OrchestratorMcpFailure>;
+  readonly goalNodeRead: (
+    scope: McpInvocationScope,
+    input: GoalMcpNodeReadInput,
+  ) => Effect.Effect<GoalMcpNodeReadResult, OrchestratorMcpFailure>;
+  readonly goalNodeCancel: (
+    scope: McpInvocationScope,
+    input: GoalMcpNodeCancelInput,
+  ) => Effect.Effect<GoalMcpMutationResult, OrchestratorMcpFailure>;
+  readonly goalResultPublish: (
+    scope: McpInvocationScope,
+    input: GoalMcpResultPublishInput,
+  ) => Effect.Effect<GoalMcpMutationResult, OrchestratorMcpFailure>;
+  readonly goalEvidenceRead: (
+    scope: McpInvocationScope,
+    input: GoalMcpEvidenceReadInput,
+  ) => Effect.Effect<GoalMcpEvidenceReadResult, OrchestratorMcpFailure>;
+  readonly goalEvidenceSubmit: (
+    scope: McpInvocationScope,
+    input: GoalMcpEvidenceSubmitInput,
+  ) => Effect.Effect<GoalMcpMutationResult, OrchestratorMcpFailure>;
   readonly capabilities: (
     scope: McpInvocationScope,
   ) => Effect.Effect<OrchestratorMcpCapabilitiesResult, OrchestratorMcpFailure>;
@@ -546,14 +591,84 @@ const make = Effect.gen(function* () {
   const scheduledTasks = yield* ScheduledTaskService;
 
   const requireCapability = (scope: McpInvocationScope) =>
-    scope.capabilities.has("orchestration")
+    scope.capabilities.has("orchestration") && goalAuthority(scope).kind === "ordinary"
       ? Effect.void
       : Effect.fail(
           failure(
             "capability_denied",
-            "This MCP credential does not grant orchestration capabilities.",
+            goalAuthority(scope).kind === "ordinary"
+              ? "This MCP credential does not grant orchestration capabilities."
+              : "Goal-bound credentials cannot use generic delegation, thread creation, or scheduled-task tools.",
           ),
         );
+
+  const loadGoal = Effect.fn("OrchestratorMcpService.loadGoal")(function* (
+    scope: McpInvocationScope,
+    goalId: GoalId,
+  ) {
+    const authority = goalAuthority(scope);
+    if (authority.kind === "ordinary" || authority.goalId !== goalId) {
+      return yield* failure("goal_scope_mismatch", `Credential is not scoped to goal ${goalId}.`);
+    }
+    if (authority.kind === "goal_worker" && authority.executionThreadId !== scope.threadId) {
+      return yield* failure(
+        "goal_scope_mismatch",
+        "Goal worker credential execution thread claim does not match this invocation.",
+      );
+    }
+    const rootThreadId = authority.rootThreadId;
+    const projection = yield* loadProjection(rootThreadId);
+    const detail = projection.goal;
+    if (
+      detail === null ||
+      detail === undefined ||
+      detail.goal.id !== goalId ||
+      detail.goal.rootThreadId !== rootThreadId
+    ) {
+      return yield* failure(
+        "goal_scope_mismatch",
+        `Goal ${goalId} is not bound to root thread ${rootThreadId}.`,
+      );
+    }
+    if (authority.kind === "goal_lead") {
+      if (authority.rootThreadId !== scope.threadId) {
+        return yield* failure(
+          "goal_scope_mismatch",
+          "Goal lead credential root thread claim does not match this invocation.",
+        );
+      }
+      const activeThread = projection.providerThreads.find(
+        (candidate) => candidate.id === projection.thread.activeProviderThreadId,
+      );
+      if (
+        activeThread?.providerSessionId !== scope.providerSessionId ||
+        activeThread.providerInstanceId !== scope.providerInstanceId
+      ) {
+        return yield* failure(
+          "stale_goal_session",
+          "Goal lead credential no longer matches the root active provider session.",
+        );
+      }
+    } else {
+      const attempt = detail.attempts.find((candidate) => candidate.id === authority.attemptId);
+      if (attempt === undefined) {
+        return yield* failure("stale_goal_session", "Goal worker attempt no longer exists.");
+      }
+      const issue = validateGoalWorkerBinding({ authority, scope, attempt });
+      if (issue !== null) return yield* failure("stale_goal_session", issue);
+    }
+    return { authority, projection, detail };
+  });
+
+  const dispatchGoalMutation = Effect.fn("OrchestratorMcpService.dispatchGoalMutation")(function* (
+    scope: McpInvocationScope,
+    command: Parameters<ThreadManagementService["Service"]["dispatch"]>[0],
+  ) {
+    yield* threadManagement
+      .dispatch(command)
+      .pipe(Effect.mapError((error) => failure("orchestration_error", errorMessage(error))));
+    return { accepted: true as const };
+  });
 
   const loadProjection = (threadId: ThreadId) =>
     threadManagement
@@ -773,6 +888,162 @@ const make = Effect.gen(function* () {
     });
 
   return OrchestratorMcpService.of({
+    goalRead: (scope, goalId) =>
+      loadGoal(scope, goalId).pipe(
+        Effect.flatMap(({ authority, detail }) =>
+          authority.kind === "goal_lead"
+            ? Effect.succeed(detail)
+            : Effect.fail(
+                failure("capability_denied", "Workers must use goal_node_read for scoped data."),
+              ),
+        ),
+      ),
+    goalCapabilities: (scope) =>
+      Effect.gen(function* () {
+        const authority = goalAuthority(scope);
+        if (authority.kind === "ordinary")
+          return yield* failure("goal_scope_mismatch", "Credential is not goal scoped.");
+        yield* loadGoal(scope, authority.goalId);
+        return {
+          goalId: authority.goalId,
+          role: authority.kind === "goal_lead" ? "lead" : "worker",
+          canReplaceGraph: authority.kind === "goal_lead",
+          canCancelAnyNode: authority.kind === "goal_lead",
+          scopedNodeId: authority.kind === "goal_worker" ? authority.nodeId : null,
+        };
+      }),
+    goalReplaceGraph: (scope, input) =>
+      Effect.gen(function* () {
+        const { authority } = yield* loadGoal(scope, input.goalId);
+        if (authority.kind !== "goal_lead")
+          return yield* failure("capability_denied", "Only the root lead may replace the graph.");
+        return yield* dispatchGoalMutation(scope, {
+          type: "goal.graph.replace",
+          commandId: CommandId.make(`mcp:${scope.providerSessionId}:goal-graph:${input.graph.id}`),
+          threadId: scope.threadId,
+          goalId: input.goalId,
+          expectedRevision: input.expectedRevision,
+          graph: input.graph,
+        });
+      }),
+    goalNodeRead: (scope, input) =>
+      Effect.gen(function* () {
+        const { authority, detail } = yield* loadGoal(scope, input.goalId);
+        if (authority.kind === "goal_worker" && authority.nodeId !== input.nodeId)
+          return yield* failure(
+            "capability_denied",
+            "Workers may only read their owning goal node.",
+          );
+        const node = detail.nodes.find((candidate) => candidate.node.id === input.nodeId);
+        return node ?? (yield* failure("goal_not_found", `Node ${input.nodeId} was not found.`));
+      }),
+    goalNodeCancel: (scope, input) =>
+      Effect.gen(function* () {
+        const { authority } = yield* loadGoal(scope, input.goalId);
+        if (authority.kind !== "goal_lead")
+          return yield* failure(
+            "capability_denied",
+            "Only the root lead may request node cancellation.",
+          );
+        return yield* dispatchGoalMutation(scope, {
+          type: "goal.node.cancel",
+          commandId: CommandId.make(
+            `mcp:${scope.providerSessionId}:goal-node-cancel:${input.nodeId}`,
+          ),
+          threadId: scope.threadId,
+          goalId: input.goalId,
+          nodeId: input.nodeId,
+          ...(input.reason === undefined ? {} : { reason: input.reason }),
+        });
+      }),
+    goalResultPublish: (scope, input) =>
+      Effect.gen(function* () {
+        const { authority, detail } = yield* loadGoal(scope, input.goalId);
+        if (authority.kind !== "goal_worker")
+          return yield* failure(
+            "capability_denied",
+            "The root lead cannot publish worker results.",
+          );
+        const attempt = detail.attempts.find((candidate) => candidate.id === input.attemptId);
+        if (
+          attempt === undefined ||
+          (authority.kind === "goal_worker" &&
+            (authority.attemptId !== attempt.id || authority.nodeId !== attempt.nodeId))
+        )
+          return yield* failure(
+            "capability_denied",
+            "Attempt does not belong to the credential's owning node.",
+          );
+        const ownershipIssue = validateGoalWorkerBinding({
+          authority,
+          scope,
+          attempt,
+          artifacts: input.artifacts,
+        });
+        if (ownershipIssue !== null) return yield* failure("capability_denied", ownershipIssue);
+        const publicationKey = input.artifacts
+          .map((artifact) => artifact.id)
+          .sort()
+          .join(":");
+        return yield* dispatchGoalMutation(scope, {
+          type: "goal.result.publish",
+          commandId: CommandId.make(
+            `mcp:${scope.providerSessionId}:goal-result:${input.attemptId}:${publicationKey}`,
+          ),
+          threadId: authority.rootThreadId,
+          goalId: input.goalId,
+          attemptId: input.attemptId,
+          artifacts: input.artifacts,
+        });
+      }),
+    goalEvidenceRead: (scope, input) =>
+      loadGoal(scope, input.goalId).pipe(
+        Effect.map(({ authority, detail }) =>
+          detail.evidence.filter(
+            (evidence) =>
+              (input.evidenceId === undefined || evidence.id === input.evidenceId) &&
+              (authority.kind === "goal_lead" || evidence.attemptId === authority.attemptId),
+          ),
+        ),
+      ),
+    goalEvidenceSubmit: (scope, input) =>
+      Effect.gen(function* () {
+        const { authority, detail } = yield* loadGoal(scope, input.goalId);
+        if (authority.kind !== "goal_worker")
+          return yield* failure(
+            "capability_denied",
+            "The root lead cannot submit worker evidence.",
+          );
+        const attempt = detail.attempts.find(
+          (candidate) => candidate.id === input.evidence.attemptId,
+        );
+        if (
+          attempt === undefined ||
+          (authority.kind === "goal_worker" &&
+            (authority.attemptId !== attempt.id || authority.nodeId !== attempt.nodeId))
+        )
+          return yield* failure(
+            "capability_denied",
+            "Evidence attempt does not belong to the credential's owning node.",
+          );
+        const ownershipIssue = validateGoalWorkerBinding({
+          authority,
+          scope,
+          attempt,
+          evidence: input.evidence,
+          resolvedArtifacts: detail.artifacts,
+        });
+        if (ownershipIssue !== null) return yield* failure("capability_denied", ownershipIssue);
+        return yield* dispatchGoalMutation(scope, {
+          type: "goal.evidence.publish",
+          commandId: CommandId.make(
+            `mcp:${scope.providerSessionId}:goal-evidence:${input.evidence.id}`,
+          ),
+          threadId: authority.rootThreadId,
+          goalId: input.goalId,
+          evidence: input.evidence,
+        });
+      }),
     scheduleTask: (scope, input) =>
       Effect.gen(function* () {
         yield* requireCapability(scope);

@@ -970,6 +970,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     if (composerTrigger.kind === "slash-command") {
       const builtInSlashCommandItems = [
         {
+          id: "slash:goal",
+          type: "slash-command",
+          command: "goal",
+          label: "/goal",
+          description: "Launch a durable autonomous repository goal",
+        },
+        {
           id: "slash:model",
           type: "slash-command",
           command: "model",

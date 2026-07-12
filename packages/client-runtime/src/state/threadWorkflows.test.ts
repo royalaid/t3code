@@ -4,6 +4,7 @@ import {
   canDetachThreadProviderSession,
   canForkProjectedAssistantItem,
   deriveThreadQueueWorkflowState,
+  parseGoalComposerCommand,
 } from "./threadWorkflows.ts";
 
 const capabilities = (input?: {
@@ -28,6 +29,16 @@ const capabilities = (input?: {
   }) as never;
 
 describe("thread workflows", () => {
+  it("parses only a non-empty leading /goal objective", () => {
+    expect(parseGoalComposerCommand("/goal  ship the durable workflow ")).toEqual({
+      type: "goal",
+      objective: "ship the durable workflow",
+    });
+    expect(parseGoalComposerCommand("/goal   ")).toBeNull();
+    expect(parseGoalComposerCommand("/goals ship it")).toBeNull();
+    expect(parseGoalComposerCommand("please /goal ship it")).toBeNull();
+  });
+
   it("sorts queued messages and gates reorder and promotion from capabilities", () => {
     const state = deriveThreadQueueWorkflowState({
       thread: { id: "thread", activeProviderThreadId: "provider-thread" },

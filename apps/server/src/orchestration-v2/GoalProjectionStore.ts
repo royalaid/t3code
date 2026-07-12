@@ -12,6 +12,8 @@ import {
   GoalEvidence,
   GoalFailureRecord,
   GoalId,
+  GoalNodeId,
+  GoalAttemptId,
   GoalSummary,
   GoalWriterCommit,
   ThreadId,
@@ -26,6 +28,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 const MAX_GRAPH_NODES = 1_000;
 const MAX_GRAPH_EDGES = 5_000;
 type GoalAttemptType = typeof GoalAttempt.Type;
+type GoalArtifactType = typeof GoalArtifact.Type;
 type GoalSummaryType = typeof GoalSummary.Type;
 
 export class GoalProjectionValidationError extends Schema.TaggedErrorClass<GoalProjectionValidationError>()(
@@ -49,7 +52,7 @@ export class GoalProjectionValidationError extends Schema.TaggedErrorClass<GoalP
 ) {}
 
 const subsetOf = (child: ReadonlyArray<string>, parent: ReadonlyArray<string>) =>
-  child.every((value) => parent.includes(value));
+  parent.includes("*") || child.every((value) => parent.includes(value));
 const isWindowsRoot = (root: string) => /^[a-zA-Z]:[\\/]/.test(root) || root.startsWith("\\\\");
 const resolveSegments = (segments: ReadonlyArray<string>) => {
   const resolved: Array<string> = [];
@@ -82,7 +85,8 @@ const rootContains = (allowed: string, child: string) => {
 const writableRootsNarrow = (child: ReadonlyArray<string>, parent: ReadonlyArray<string>) =>
   child.every((root) => parent.some((allowed) => rootContains(allowed, root)));
 const sandboxRank = { "read-only": 0, "workspace-write": 1, "danger-full-access": 2 } as const;
-const approvalRank = { never: 0, untrusted: 1, "on-request": 2 } as const;
+// Lower rank is less authority. A child may require more approvals, never fewer.
+const approvalRank = { untrusted: 0, "on-request": 1, never: 2 } as const;
 
 export function validateGoalGraph(graph: GoalGraphVersion, rootPolicy: GoalType["policy"]): void {
   if (graph.nodes.length > MAX_GRAPH_NODES || graph.edges.length > MAX_GRAPH_EDGES) {
@@ -300,6 +304,22 @@ export interface GoalProjectionStoreShape {
   readonly getDetail: (
     goalId: GoalId,
   ) => Effect.Effect<GoalDetailType, GoalProjectionValidationError>;
+  readonly listPendingLaunches: Effect.Effect<
+    ReadonlyArray<GoalDetailType>,
+    GoalProjectionValidationError
+  >;
+  readonly resolveMcpBinding: (threadId: ThreadId) => Effect.Effect<
+    | { readonly kind: "lead"; readonly goalId: GoalId; readonly rootThreadId: ThreadId }
+    | {
+        readonly kind: "worker";
+        readonly goalId: GoalId;
+        readonly rootThreadId: ThreadId;
+        readonly nodeId: GoalNodeId;
+        readonly attemptId: GoalAttemptId;
+      }
+    | null,
+    GoalProjectionValidationError
+  >;
 }
 export class GoalProjectionStore extends Context.Service<
   GoalProjectionStore,
@@ -443,6 +463,31 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
           detail: `Attempt ${attemptId} belongs to a different goal.`,
         });
       return attempt;
+    });
+    const requireOwnedArtifact = Effect.fn("GoalProjectionStore.requireOwnedArtifact")(function* (
+      artifactId: GoalArtifactType["id"],
+      goalId: GoalId,
+      nodeId: GoalNodeId,
+      attemptId: GoalAttemptType["id"],
+    ) {
+      const rows =
+        yield* sql<PayloadRow>`SELECT payload_json FROM goal_artifacts WHERE artifact_id=${artifactId} LIMIT 1`;
+      if (rows[0] === undefined)
+        return yield* new GoalProjectionValidationError({
+          reason: "referential_integrity",
+          detail: `Evidence artifact ${artifactId} does not exist.`,
+        });
+      const artifact = yield* decodeArtifact(rows[0].payload_json);
+      if (
+        artifact.goalId !== goalId ||
+        artifact.nodeId !== nodeId ||
+        artifact.attemptId !== attemptId
+      )
+        return yield* new GoalProjectionValidationError({
+          reason: "referential_integrity",
+          detail: `Evidence artifact ${artifactId} belongs to a different worker scope.`,
+        });
+      return artifact;
     });
 
     const identityConflict = (entity: string, id: string) =>
@@ -715,6 +760,19 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
             event.payload.nodeId,
           );
           yield* requireAttemptForGoal(event.payload.producerAttemptId, event.payload.goalId);
+          for (const artifactId of new Set([
+            ...event.payload.artifacts,
+            ...event.payload.commands.flatMap((command) =>
+              command.logArtifactId === null ? [] : [command.logArtifactId],
+            ),
+          ])) {
+            yield* requireOwnedArtifact(
+              artifactId,
+              event.payload.goalId,
+              event.payload.nodeId,
+              event.payload.attemptId,
+            );
+          }
           const existingRows =
             yield* sql<PayloadRow>`SELECT payload_json FROM goal_evidence WHERE evidence_id=${event.payload.id}`;
           let payload = event.payload;
@@ -778,11 +836,45 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         }
       }
     });
+    const listPendingLaunches = Effect.gen(function* () {
+      const rows =
+        yield* sql<PayloadRow>`SELECT payload_json FROM goals WHERE status IN ('waiting_for_source', 'provisioning') ORDER BY created_at`;
+      return yield* Effect.forEach(rows, (row) =>
+        decodeGoal(row.payload_json).pipe(Effect.flatMap((goal) => getDetail(goal.id))),
+      );
+    });
+    const resolveMcpBinding = Effect.fn("GoalProjectionStore.resolveMcpBinding")(function* (
+      threadId: ThreadId,
+    ) {
+      const rootRows =
+        yield* sql<PayloadRow>`SELECT payload_json FROM goals WHERE root_thread_id=${threadId} LIMIT 1`;
+      if (rootRows[0] !== undefined) {
+        const goal = yield* decodeGoal(rootRows[0].payload_json);
+        return { kind: "lead" as const, goalId: goal.id, rootThreadId: goal.rootThreadId };
+      }
+      const attemptRows =
+        yield* sql<PayloadRow>`SELECT payload_json FROM goal_attempts WHERE execution_thread_id=${threadId} ORDER BY updated_at DESC LIMIT 1`;
+      if (attemptRows[0] === undefined) return null;
+      const attempt = yield* decodeAttempt(attemptRows[0].payload_json);
+      const goalRows =
+        yield* sql<PayloadRow>`SELECT payload_json FROM goals WHERE goal_id=${attempt.goalId} LIMIT 1`;
+      if (goalRows[0] === undefined) return null;
+      const goal = yield* decodeGoal(goalRows[0].payload_json);
+      return {
+        kind: "worker" as const,
+        goalId: goal.id,
+        rootThreadId: goal.rootThreadId,
+        nodeId: attempt.nodeId,
+        attemptId: attempt.id,
+      };
+    });
     return GoalProjectionStore.of({
       create: (goal) => mapStoreError(create(goal)),
       activateGraph: (input) => mapStoreError(activateGraph(input)),
       apply: (event) => mapStoreError(apply(event)),
       getDetail: (goalId) => mapStoreError(getDetail(goalId)),
+      listPendingLaunches: mapStoreError(listPendingLaunches),
+      resolveMcpBinding: (threadId) => mapStoreError(resolveMcpBinding(threadId)),
     });
   }),
 );

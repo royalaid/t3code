@@ -356,6 +356,13 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       const q = composerTrigger.query.toLowerCase();
       const allBuiltIn = [
         {
+          id: "cmd:goal",
+          type: "slash-command" as const,
+          command: "goal",
+          label: "/goal",
+          description: "Launch a durable autonomous repository goal",
+        },
+        {
           id: "cmd:model",
           type: "slash-command" as const,
           command: "model",

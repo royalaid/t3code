@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 import {
   Goal,
   GoalGraphVersion,
+  GoalSourceHandoff,
   GoalWorkflowCommand,
   GoalWorkflowEvent,
   GoalWorkflowPolicy,
@@ -14,6 +15,7 @@ const decodeGoalGraphVersion = Schema.decodeUnknownSync(GoalGraphVersion);
 const decodeGoalWorkflowCommand = Schema.decodeUnknownSync(GoalWorkflowCommand);
 const decodeGoalWorkflowEvent = Schema.decodeUnknownSync(GoalWorkflowEvent);
 const decodeGoalWorkflowPolicy = Schema.decodeUnknownSync(GoalWorkflowPolicy);
+const decodeGoalSourceHandoff = Schema.decodeUnknownSync(GoalSourceHandoff);
 
 const policy = {
   sandboxMode: "workspace-write",
@@ -121,5 +123,33 @@ describe("goal workflow contracts", () => {
         },
       }).type,
     ).toBe("goal.graph-version-activated");
+  });
+
+  it("bounds the portable source handoff at the transport boundary", () => {
+    const valid = {
+      objective: "ship it",
+      attachments: [],
+      selectedContextText: ["context"],
+      sourceSummary: "summary",
+      projectInstructions: ["instructions"],
+      branchState: "main @ abc123",
+      relevantCheckpoints: ["checkpoint"],
+    } as const;
+    expect(decodeGoalSourceHandoff(valid).objective).toBe("ship it");
+    expect(() =>
+      decodeGoalSourceHandoff({ ...valid, selectedContextText: Array(33).fill("context") }),
+    ).toThrow();
+    expect(() =>
+      decodeGoalSourceHandoff({ ...valid, selectedContextText: ["x".repeat(20_001)] }),
+    ).toThrow();
+    expect(() =>
+      decodeGoalSourceHandoff({ ...valid, projectInstructions: Array(17).fill("instruction") }),
+    ).toThrow();
+    expect(() =>
+      decodeGoalSourceHandoff({ ...valid, sourceSummary: "x".repeat(40_001) }),
+    ).toThrow();
+    expect(() =>
+      decodeGoalSourceHandoff({ ...valid, relevantCheckpoints: Array(33).fill("checkpoint") }),
+    ).toThrow();
   });
 });

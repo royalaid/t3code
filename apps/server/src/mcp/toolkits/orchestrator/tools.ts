@@ -26,6 +26,18 @@ import {
   OrchestratorMcpThreadStartInput,
   OrchestratorMcpThreadWaitInput,
   OrchestratorMcpThreadWaitResult,
+  GoalMcpReadInput,
+  GoalMcpReadResult,
+  GoalMcpCapabilitiesResult,
+  GoalMcpReplaceGraphInput,
+  GoalMcpNodeReadInput,
+  GoalMcpNodeReadResult,
+  GoalMcpNodeCancelInput,
+  GoalMcpResultPublishInput,
+  GoalMcpEvidenceReadInput,
+  GoalMcpEvidenceReadResult,
+  GoalMcpEvidenceSubmitInput,
+  GoalMcpMutationResult,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
@@ -33,6 +45,62 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { OrchestratorMcpService } from "../../OrchestratorMcpService.ts";
 
 const dependencies = [McpInvocationContext.McpInvocationContext, OrchestratorMcpService];
+
+export const GoalReadTool = Tool.make("goal_read", {
+  parameters: GoalMcpReadInput,
+  success: GoalMcpReadResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Readonly, true);
+export const GoalCapabilitiesTool = Tool.make("goal_capabilities", {
+  success: GoalMcpCapabilitiesResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Readonly, true);
+export const GoalReplaceGraphTool = Tool.make("goal_replace_graph", {
+  parameters: GoalMcpReplaceGraphInput,
+  success: GoalMcpMutationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Destructive, true);
+export const GoalNodeReadTool = Tool.make("goal_node_read", {
+  parameters: GoalMcpNodeReadInput,
+  success: GoalMcpNodeReadResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Readonly, true);
+export const GoalNodeCancelTool = Tool.make("goal_node_cancel", {
+  parameters: GoalMcpNodeCancelInput,
+  success: GoalMcpMutationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Destructive, true);
+export const GoalResultPublishTool = Tool.make("goal_result_publish", {
+  parameters: GoalMcpResultPublishInput,
+  success: GoalMcpMutationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Destructive, true);
+export const GoalEvidenceReadTool = Tool.make("goal_evidence_read", {
+  parameters: GoalMcpEvidenceReadInput,
+  success: GoalMcpEvidenceReadResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Readonly, true);
+export const GoalEvidenceSubmitTool = Tool.make("goal_evidence_submit", {
+  parameters: GoalMcpEvidenceSubmitInput,
+  success: GoalMcpMutationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Destructive, true);
 
 export const OrchestratorCapabilitiesTool = Tool.make("orchestrator_capabilities", {
   description:
@@ -230,6 +298,14 @@ export const ThreadInterruptTool = Tool.make("t3_thread_interrupt", {
   .annotate(Tool.Destructive, true);
 
 export const OrchestratorToolkit = Toolkit.make(
+  GoalReadTool,
+  GoalCapabilitiesTool,
+  GoalReplaceGraphTool,
+  GoalNodeReadTool,
+  GoalNodeCancelTool,
+  GoalResultPublishTool,
+  GoalEvidenceReadTool,
+  GoalEvidenceSubmitTool,
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
   TaskStatusTool,

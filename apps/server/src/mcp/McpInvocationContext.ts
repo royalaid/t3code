@@ -1,5 +1,8 @@
 import {
   type EnvironmentId,
+  type GoalAttemptId,
+  type GoalId,
+  type GoalNodeId,
   PreviewAutomationUnavailableError,
   type ProviderInstanceId,
   type ThreadId,
@@ -9,6 +12,19 @@ import * as Effect from "effect/Effect";
 
 export type McpCapability = "preview" | "orchestration";
 
+export type McpGoalAuthority =
+  | { readonly kind: "ordinary" }
+  | { readonly kind: "goal_lead"; readonly goalId: GoalId; readonly rootThreadId: ThreadId }
+  | {
+      readonly kind: "goal_worker";
+      readonly goalId: GoalId;
+      readonly rootThreadId: ThreadId;
+      readonly executionThreadId: ThreadId;
+      readonly nodeId: GoalNodeId;
+      readonly attemptId: GoalAttemptId;
+      readonly nativeOwnerAttemptId: GoalAttemptId;
+    };
+
 export interface McpInvocationScope {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
@@ -16,7 +32,11 @@ export interface McpInvocationScope {
   readonly providerInstanceId: ProviderInstanceId;
   readonly capabilities: ReadonlySet<McpCapability>;
   readonly issuedAt: number;
+  readonly authority?: McpGoalAuthority;
 }
+
+export const goalAuthority = (scope: McpInvocationScope): McpGoalAuthority =>
+  scope.authority ?? { kind: "ordinary" };
 
 export class McpInvocationContext extends Context.Service<
   McpInvocationContext,

@@ -17,6 +17,7 @@ import {
   modelSelectionsEqual,
   resolveThreadOutboxDeliveryAction,
   resolveThreadOutboxFailureAction,
+  resolveThreadOutboxMessageKind,
   resolveQueuedThreadSettings,
   shouldRetryThreadOutboxDelivery,
   threadOutboxRetryDelayMs,
@@ -43,6 +44,13 @@ function queuedMessage(input: {
 }
 
 describe("thread outbox", () => {
+  it("routes queued creations containing /goal through goal launch instead of provider text", () => {
+    expect(resolveThreadOutboxMessageKind(" /goal ship mobile parity ", true)).toBe(
+      "goal_creation",
+    );
+    expect(resolveThreadOutboxMessageKind(" /goal ship mobile parity ", false)).toBe("goal");
+    expect(resolveThreadOutboxMessageKind("ordinary provider text", true)).toBe("turn_creation");
+  });
   it("groups messages by scoped thread and preserves creation order", () => {
     const later = queuedMessage({
       messageId: "message-2",

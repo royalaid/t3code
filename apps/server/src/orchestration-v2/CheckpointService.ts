@@ -116,6 +116,7 @@ export type CheckpointServiceV2Error = typeof CheckpointServiceV2Error.Type;
 const isCheckpointRestoreError = Schema.is(CheckpointRestoreError);
 
 export interface CheckpointServiceV2Shape {
+  readonly isGitRepository: (cwd: string) => Effect.Effect<boolean>;
   readonly prepareRootRunScope: (input: {
     readonly threadId: ThreadId;
     readonly runId: RunId;
@@ -542,6 +543,7 @@ export const layer: Layer.Layer<
       );
 
     return CheckpointServiceV2.of({
+      isGitRepository: isGitCheckpointable,
       prepareRootRunScope: (input) =>
         makeRootRunScope({ ...input, idAllocator }).pipe(
           Effect.mapError(

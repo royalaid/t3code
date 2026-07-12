@@ -20,10 +20,14 @@ import {
   ProjectId,
   ProviderSessionId,
   RunId,
+  MessageId,
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { ChatAttachment } from "./chatAttachment.ts";
+import { ModelSelection } from "./modelSelection.ts";
+import { ProviderInteractionMode, RuntimeMode } from "./providerPolicy.ts";
 
 export const GoalLifecycleStatus = Schema.Literals([
   "waiting_for_source",
@@ -252,6 +256,21 @@ export const GoalWriterCommit = Schema.Struct({
   updatedAt: GoalTimestamp,
 });
 
+const GoalHandoffText = Schema.String.check(Schema.isMaxLength(20_000));
+const GoalSourceSummary = Schema.String.check(Schema.isMaxLength(40_000));
+const GoalHandoffTextList = (maximum: number) =>
+  Schema.Array(GoalHandoffText).check(Schema.isMaxLength(maximum));
+
+export const GoalSourceHandoff = Schema.Struct({
+  objective: TrimmedNonEmptyString.check(Schema.isMaxLength(20_000)),
+  attachments: Schema.Array(ChatAttachment).check(Schema.isMaxLength(32)),
+  selectedContextText: GoalHandoffTextList(32),
+  sourceSummary: Schema.NullOr(GoalSourceSummary),
+  projectInstructions: GoalHandoffTextList(16),
+  branchState: Schema.NullOr(GoalHandoffText),
+  relevantCheckpoints: GoalHandoffTextList(32),
+});
+
 export const Goal = Schema.Struct({
   id: GoalId,
   projectId: Schema.optional(ProjectId),
@@ -259,6 +278,22 @@ export const Goal = Schema.Struct({
   status: GoalLifecycleStatus,
   sourceThreadId: ThreadId,
   rootThreadId: ThreadId,
+  /** Run that must settle before the source capsule may be finalized. */
+  sourceActiveRunId: Schema.optional(Schema.NullOr(RunId)),
+  pendingLaunchClaimId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  /** Immutable, client-supplied inputs captured before any provider launch. */
+  sourceInput: Schema.optional(
+    Schema.Struct({
+      messageId: MessageId,
+      attachments: GoalSourceHandoff.fields.attachments,
+      selectedContextText: GoalSourceHandoff.fields.selectedContextText,
+    }),
+  ),
+  /** Bounded portable handoff finalized only after sourceActiveRunId settles. */
+  sourceHandoff: Schema.optional(Schema.NullOr(GoalSourceHandoff)),
+  rootModelSelection: Schema.optional(ModelSelection),
+  rootRuntimeMode: Schema.optional(RuntimeMode),
+  rootInteractionMode: Schema.optional(ProviderInteractionMode),
   policy: GoalWorkflowPolicy,
   currentGraphVersionId: Schema.NullOr(GoalGraphVersionId),
   currentRevision: NonNegativeInt,
@@ -347,6 +382,18 @@ export const GoalFailureRecord = Schema.Struct({
 
 const commandBase = { commandId: CommandId, threadId: ThreadId, goalId: GoalId };
 export const GoalWorkflowCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("goal.launch"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    rootThreadId: ThreadId,
+    objective: TrimmedNonEmptyString.check(Schema.isMaxLength(20_000)),
+    messageId: MessageId,
+    attachments: GoalSourceHandoff.fields.attachments,
+    selectedContextText: GoalSourceHandoff.fields.selectedContextText,
+    createdBy: Schema.Literals(["user", "agent", "system"]),
+    creationSource: Schema.Literals(["web", "mobile", "mcp", "provider", "server"]),
+  }),
   Schema.Struct({ type: Schema.Literal("goal.create"), ...commandBase, goal: Goal }),
   Schema.Struct({ type: Schema.Literal("goal.reopen"), ...commandBase }),
   Schema.Struct({
@@ -355,6 +402,23 @@ export const GoalWorkflowCommand = Schema.Union([
     reason: Schema.optional(Schema.String),
   }),
   Schema.Struct({ type: Schema.Literal("goal.pending-launch.cancel"), ...commandBase }),
+  Schema.Struct({
+    type: Schema.Literal("goal.pending-launch.fail"),
+    ...commandBase,
+    claimId: TrimmedNonEmptyString,
+    detail: Schema.String.check(Schema.isMaxLength(4_000)),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("goal.pending-launch.claim"),
+    ...commandBase,
+    claimId: TrimmedNonEmptyString,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("goal.pending-launch.complete"),
+    ...commandBase,
+    handoff: GoalSourceHandoff,
+    claimId: TrimmedNonEmptyString,
+  }),
   Schema.Struct({
     type: Schema.Literal("goal.graph.replace"),
     ...commandBase,

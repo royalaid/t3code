@@ -8,6 +8,7 @@ import {
   ContextHandoffId,
   ContextTransferId,
   EventId,
+  GoalId,
   MessageId,
   NodeId,
   NonNegativeInt,
@@ -1863,6 +1864,9 @@ export const OrchestrationV2Command = Schema.Union([
     attachments: Schema.Array(ChatAttachment),
     modelSelection: Schema.optional(ModelSelection),
     sourcePlanRef: Schema.optional(Schema.Struct({ threadId: ThreadId, planId: PlanId })),
+    goalLaunchClaim: Schema.optional(
+      Schema.Struct({ goalId: GoalId, claimId: TrimmedNonEmptyString }),
+    ),
     dispatchMode: Schema.Union([
       Schema.Struct({ type: Schema.Literal("defer_start") }),
       Schema.Struct({ type: Schema.Literal("steer_active"), targetRunId: RunId }),
@@ -2048,6 +2052,7 @@ export const OrchestrationV2ThreadLaunchInput = Schema.Struct({
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy,
+  awaitPreparation: Schema.optional(Schema.Boolean),
   initialMessage: Schema.optional(
     Schema.Struct({
       messageId: Schema.optional(MessageId),

@@ -1,14 +1,27 @@
 import { splitPromptIntoComposerSegments } from "./composer-editor-mentions";
 import { INLINE_TERMINAL_CONTEXT_PLACEHOLDER } from "./lib/terminalContext";
+import { parseGoalComposerCommand } from "@t3tools/client-runtime/state/thread-workflows";
 
 export type ComposerTriggerKind = "path" | "slash-command" | "skill";
-export type ComposerSlashCommand = "model" | "plan" | "default";
+export type ComposerSlashCommand = "goal" | "model" | "plan" | "default";
 
 export interface ComposerTrigger {
   kind: ComposerTriggerKind;
   query: string;
   rangeStart: number;
   rangeEnd: number;
+}
+
+export function resolveGoalComposerSubmission(rawPrompt: string, promptWithContexts: string) {
+  const command = parseGoalComposerCommand(rawPrompt.trim());
+  if (command === null) return null;
+  const context = promptWithContexts.startsWith(rawPrompt)
+    ? promptWithContexts.slice(rawPrompt.length).trim().slice(0, 20_000)
+    : "";
+  return {
+    objective: command.objective,
+    selectedContextText: context === "" ? [] : [context],
+  } as const;
 }
 
 const isInlineTokenSegment = (
@@ -257,7 +270,7 @@ export function detectComposerTrigger(text: string, cursorInput: number): Compos
 
 export function parseStandaloneComposerSlashCommand(
   text: string,
-): Exclude<ComposerSlashCommand, "model"> | null {
+): Exclude<ComposerSlashCommand, "model" | "goal"> | null {
   const match = /^\/(plan|default)\s*$/i.exec(text.trim());
   if (!match) {
     return null;

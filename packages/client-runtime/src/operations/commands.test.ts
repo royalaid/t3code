@@ -41,6 +41,7 @@ import {
   forkThreadFromRun,
   mergeThreadBack,
   promoteQueuedRun,
+  provisionGoalSource,
   reorderQueuedRun,
   revertThreadCheckpoint,
   startThreadTurn,
@@ -323,6 +324,52 @@ describe("V2 environment commands", () => {
         },
       });
     }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
+  it.effect(
+    "provisions goal sources without a provider message and preserves workspace strategy",
+    () =>
+      Effect.gen(function* () {
+        const launches: OrchestrationV2ThreadLaunchInput[] = [];
+        const supervisor = yield* makeSupervisor({ commands: [], projects: [], launches });
+        const base = {
+          threadId: v2ThreadId,
+          projectId: ProjectId.make("project-1"),
+          title: "Goal source",
+          modelSelection: v2Projection.thread.modelSelection,
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          branch: "main",
+          worktreePath: null,
+        };
+        yield* provisionGoalSource({
+          ...base,
+          commandId: CommandId.make("goal-source-worktree"),
+          workspaceStrategy: {
+            type: "worktree",
+            baseRef: "main",
+            branch: "goal-worktree",
+            startFromOrigin: true,
+          },
+        }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+        yield* provisionGoalSource({
+          ...base,
+          commandId: CommandId.make("goal-source-root"),
+          workspaceStrategy: { type: "root", branch: "main" },
+        }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+        expect(launches).toHaveLength(2);
+        expect(launches[0]).toMatchObject({
+          commandId: "goal-source-worktree",
+          awaitPreparation: true,
+          workspaceStrategy: { type: "worktree", startFromOrigin: true },
+        });
+        expect(launches[0]).not.toHaveProperty("initialMessage");
+        expect(launches[1]).toMatchObject({
+          awaitPreparation: true,
+          workspaceStrategy: { type: "root", branch: "main" },
+        });
+        expect(launches[1]).not.toHaveProperty("initialMessage");
+      }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
   );
 
   it.effect("maps explicit active-run delivery modes to V2 dispatch semantics", () =>

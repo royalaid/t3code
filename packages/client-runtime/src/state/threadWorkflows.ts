@@ -105,3 +105,14 @@ export function canDetachThreadProviderSession(projection: Projection): boolean 
   const session = resolveThreadProviderSession(projection);
   return session !== null && session.status !== "stopped" && session.status !== "error";
 }
+export type GoalComposerCommand = {
+  readonly type: "goal";
+  readonly objective: string;
+};
+
+/** T3-owned command parser. This must run before provider slash-command dispatch. */
+export function parseGoalComposerCommand(text: string): GoalComposerCommand | null {
+  const match = /^\s*\/goal(?:\s+([\s\S]*?))?\s*$/u.exec(text);
+  const objective = match?.[1]?.trim() ?? "";
+  return objective.length === 0 ? null : { type: "goal", objective };
+}

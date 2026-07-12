@@ -23,6 +23,7 @@ import { layer as idAllocatorLayer } from "./IdAllocator.ts";
 import { layer as orchestratorLayer } from "./Orchestrator.ts";
 import { layer as projectionStoreLayer } from "./ProjectionStore.ts";
 import { layer as goalProjectionStoreLayer } from "./GoalProjectionStore.ts";
+import { layer as goalLaunchServiceLayer } from "./GoalLaunchService.ts";
 import { layer as projectionMaintenanceLayer } from "./ProjectionMaintenance.ts";
 import { layerFromProviderInstanceRegistry as providerAdapterRegistryLayerFromProviderInstances } from "./ProviderAdapterRegistry.ts";
 import { layer as providerEventIngestorLayer } from "./ProviderEventIngestor.ts";
@@ -89,7 +90,7 @@ const providerSessionManagerProvided = providerSessionManagerLayer.pipe(
       providerAdapterRegistryProvided,
       eventSinkProvided,
       idAllocatorLayer,
-      projectionStoreLayer,
+      storesLayer,
     ),
   ),
 );
@@ -220,6 +221,11 @@ const threadLaunchProvided = threadLaunchServiceLayer.pipe(
 const threadLifecycleProvided = threadLifecycleServiceLayer.pipe(
   Layer.provide(threadManagementProvided),
 );
+const goalLaunchProvided = goalLaunchServiceLayer.pipe(
+  Layer.provide(
+    Layer.mergeAll(storesLayer, eventSinkProvided, threadLaunchProvided, threadManagementProvided),
+  ),
+);
 const scheduledTaskProvided = scheduledTaskServiceLayer.pipe(
   Layer.provide(Layer.mergeAll(threadLaunchProvided, threadManagementProvided)),
 );
@@ -240,4 +246,5 @@ export const OrchestrationV2ProductionLayerLive = Layer.mergeAll(
   threadLaunchProvided,
   threadLifecycleProvided,
   scheduledTaskProvided,
+  goalLaunchProvided,
 );

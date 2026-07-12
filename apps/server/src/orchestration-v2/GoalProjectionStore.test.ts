@@ -1,4 +1,4 @@
-import { assert, it } from "@effect/vitest";
+import { assert, expect, it } from "@effect/vitest";
 import {
   GoalArtifactId,
   GoalAttemptId,
@@ -17,6 +17,7 @@ import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import {
   GoalProjectionStore,
   GoalProjectionValidationError,
+  validateGoalGraph,
   layer as goalProjectionStoreLayer,
 } from "./GoalProjectionStore.ts";
 
@@ -53,6 +54,42 @@ const makeNode = (id: string) => ({
   },
   evidenceRequirements: [],
   policy,
+});
+
+it("allows approval narrowing and rejects approval authority expansion", () => {
+  const graphWithApproval = (approvalPolicy: "untrusted" | "on-request" | "never") => ({
+    id: GoalGraphVersionId.make(`graph:approval:${approvalPolicy}`),
+    goalId: GoalId.make("goal:approval"),
+    revision: 1,
+    publishedByNodeId: GoalNodeId.make("lead"),
+    nodes: [
+      {
+        ...makeNode("worker"),
+        policy: { ...policy, approvalPolicy },
+      },
+    ],
+    edges: [],
+    createdAt: "2026-07-11T00:00:00.000Z",
+  });
+
+  expect(() =>
+    validateGoalGraph(graphWithApproval("untrusted"), {
+      ...policy,
+      approvalPolicy: "on-request",
+    }),
+  ).not.toThrow();
+  expect(() =>
+    validateGoalGraph(graphWithApproval("never"), {
+      ...policy,
+      approvalPolicy: "on-request",
+    }),
+  ).toThrow(GoalProjectionValidationError);
+  expect(() =>
+    validateGoalGraph(graphWithApproval("never"), {
+      ...policy,
+      approvalPolicy: "untrusted",
+    }),
+  ).toThrow(GoalProjectionValidationError);
 });
 
 it.layer(TestLayer)("GoalProjectionStore", (it) => {
@@ -550,6 +587,19 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         summary: "pending",
         createdAt: "2026-07-11T00:00:06.000Z",
       };
+      assert.equal(
+        (yield* Effect.flip(
+          store.apply({
+            type: "goal.evidence-submitted",
+            payload: {
+              ...evidence,
+              id: GoalEvidenceId.make("evidence:missing-artifact"),
+              artifacts: [GoalArtifactId.make("artifact:missing")],
+            },
+          }),
+        )).reason,
+        "referential_integrity",
+      );
       yield* store.apply({ type: "goal.evidence-submitted", payload: evidence });
       assert.equal(
         (yield* Effect.flip(

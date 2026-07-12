@@ -1,4 +1,5 @@
 import { isTransportConnectionErrorMessage } from "@t3tools/client-runtime/errors";
+import { parseGoalComposerCommand } from "@t3tools/client-runtime/state/thread-workflows";
 import type { EnvironmentShellStatus } from "@t3tools/client-runtime/state/shell";
 import {
   CommandId,
@@ -23,6 +24,15 @@ import { scopedThreadKey } from "../lib/scopedEntities";
 
 const THREAD_OUTBOX_SCHEMA_VERSION = 3;
 const THREAD_OUTBOX_MAX_RETRY_DELAY_MS = 16_000;
+
+export function resolveThreadOutboxMessageKind(
+  text: string,
+  isCreation: boolean,
+): "turn" | "turn_creation" | "goal" | "goal_creation" {
+  const goal = parseGoalComposerCommand(text) !== null;
+  if (goal) return isCreation ? "goal_creation" : "goal";
+  return isCreation ? "turn_creation" : "turn";
+}
 
 const QueuedThreadCreationSchema = Schema.Struct({
   projectId: ProjectId,

@@ -38,8 +38,13 @@ import {
 } from "./ProviderAdapter.ts";
 import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
 import { ProjectionStoreV2 } from "./ProjectionStore.ts";
+import { GoalProjectionStore } from "./GoalProjectionStore.ts";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+/** Keep binding-store failures in the error channel; never issue an ordinary credential on error. */
+export const resolveGoalMcpBinding = <A, E>(lookup: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+  lookup;
 
 export const ProviderSessionReleaseReason = Schema.Literals([
   "idle_timeout",
@@ -236,6 +241,7 @@ export const layerWithOptions = (
   | EventSinkV2
   | IdAllocatorV2
   | McpSessionRegistry.McpSessionRegistry
+  | GoalProjectionStore
   | ProjectionStoreV2
   | ProviderAdapterRegistryV2
 > =>
@@ -247,20 +253,52 @@ export const layerWithOptions = (
       const eventSink = yield* EventSinkV2;
       const idAllocator = yield* IdAllocatorV2;
       const projectionStore = yield* ProjectionStoreV2;
+      const goalProjectionStore = yield* GoalProjectionStore;
       const layerScope = yield* Effect.scope;
       const sessions = yield* Ref.make(new Map<string, LiveSessionEntry>());
       const nextSubscriberId = yield* Ref.make(0);
       const sessionOpen = yield* makeKeyedSerialExecutor<ProviderSessionId>();
       const idleTimeoutMs = Math.max(1, options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
-      const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
-        options.configureMcp === false
-          ? Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))
-          : mcpSessionRegistry.revokeThread(threadId).pipe(
-              Effect.andThen(mcpSessionRegistry.issue({ threadId, providerInstanceId })),
-              Effect.tap((credential) =>
-                Effect.sync(() => McpProviderSession.setMcpProviderSession(credential.config)),
-              ),
-            );
+      const prepareMcpSession = Effect.fn("ProviderSessionManager.prepareMcpSession")(function* (
+        threadId: ThreadId,
+        providerInstanceId: ProviderInstanceId,
+        providerSessionId: ProviderSessionId,
+      ) {
+        if (options.configureMcp === false) {
+          McpProviderSession.clearMcpProviderSession(threadId);
+          return;
+        }
+        const binding = yield* resolveGoalMcpBinding(
+          goalProjectionStore.resolveMcpBinding(threadId),
+        ).pipe(Effect.orDie);
+        yield* mcpSessionRegistry.revokeThread(threadId);
+        const credential = yield* mcpSessionRegistry.issue({
+          threadId,
+          providerInstanceId,
+          providerSessionId,
+          ...(binding === null
+            ? {}
+            : {
+                authority:
+                  binding.kind === "lead"
+                    ? {
+                        kind: "goal_lead" as const,
+                        goalId: binding.goalId,
+                        rootThreadId: binding.rootThreadId,
+                      }
+                    : {
+                        kind: "goal_worker" as const,
+                        goalId: binding.goalId,
+                        rootThreadId: binding.rootThreadId,
+                        executionThreadId: threadId,
+                        nodeId: binding.nodeId,
+                        attemptId: binding.attemptId,
+                        nativeOwnerAttemptId: binding.attemptId,
+                      },
+              }),
+        });
+        McpProviderSession.setMcpProviderSession(credential.config);
+      });
       const clearMcpSession = (threadId: ThreadId) =>
         mcpSessionRegistry
           .revokeThread(threadId)
@@ -714,7 +752,11 @@ export const layerWithOptions = (
         Effect.gen(function* () {
           const attached = yield* attachThread(input);
           if (attached) {
-            yield* prepareMcpSession(input.threadId, input.providerInstanceId);
+            yield* prepareMcpSession(
+              input.threadId,
+              input.providerInstanceId,
+              input.providerSessionId,
+            );
             const entry = (yield* Ref.get(sessions)).get(sessionKey(input.providerSessionId));
             if (entry !== undefined) {
               yield* withActivityError(
@@ -1106,7 +1148,11 @@ export const layerWithOptions = (
                     }),
                 ),
               );
-              yield* prepareMcpSession(input.threadId, input.modelSelection.instanceId);
+              yield* prepareMcpSession(
+                input.threadId,
+                input.modelSelection.instanceId,
+                input.providerSessionId,
+              );
               const sessionScope = yield* Scope.make();
               const runtime = yield* adapter
                 .openSession({

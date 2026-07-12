@@ -5,11 +5,13 @@ import {
   type EnvironmentThreadShell,
 } from "@t3tools/client-runtime/state/shell";
 import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
+import { parseGoalComposerCommand } from "@t3tools/client-runtime/state/thread-workflows";
 import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
   type MessageId,
+  ThreadId,
 } from "@t3tools/contracts";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import * as Cause from "effect/Cause";
@@ -27,6 +29,7 @@ import {
   modelSelectionsEqual,
   resolveThreadOutboxDeliveryAction,
   resolveThreadOutboxFailureAction,
+  resolveThreadOutboxMessageKind,
   resolveQueuedThreadSettings,
   threadOutboxRetryDelayMs,
   type QueuedThreadCreation,
@@ -83,6 +86,10 @@ function settingsCommandId(message: QueuedThreadMessage, setting: string): Comma
 
 export function useThreadOutboxDrain(): void {
   const startTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const provisionGoalSource = useAtomCommand(threadEnvironment.provisionGoalSource, {
+    reportFailure: false,
+  });
+  const launchGoal = useAtomCommand(threadEnvironment.launchGoal, { reportFailure: false });
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
@@ -213,24 +220,43 @@ export function useThreadOutboxDrain(): void {
         }
       }
 
-      const deliveryResult = await startTurn({
-        environmentId: queuedMessage.environmentId,
-        input: {
-          commandId: queuedMessage.commandId,
-          creationSource: "mobile",
-          threadId: queuedMessage.threadId,
-          message: {
-            messageId: queuedMessage.messageId,
-            role: "user",
-            text: queuedMessage.text,
-            attachments: queuedMessage.attachments,
-          },
-          modelSelection: settings.modelSelection,
-          runtimeMode: settings.runtimeMode,
-          interactionMode: settings.interactionMode,
-          createdAt: queuedMessage.createdAt,
-        },
-      });
+      const goalCommand =
+        resolveThreadOutboxMessageKind(queuedMessage.text, false) === "goal"
+          ? parseGoalComposerCommand(queuedMessage.text)
+          : null;
+      const deliveryResult =
+        goalCommand === null
+          ? await startTurn({
+              environmentId: queuedMessage.environmentId,
+              input: {
+                commandId: queuedMessage.commandId,
+                creationSource: "mobile",
+                threadId: queuedMessage.threadId,
+                message: {
+                  messageId: queuedMessage.messageId,
+                  role: "user",
+                  text: queuedMessage.text,
+                  attachments: queuedMessage.attachments,
+                },
+                modelSelection: settings.modelSelection,
+                runtimeMode: settings.runtimeMode,
+                interactionMode: settings.interactionMode,
+                createdAt: queuedMessage.createdAt,
+              },
+            })
+          : await launchGoal({
+              environmentId: queuedMessage.environmentId,
+              input: {
+                commandId: queuedMessage.commandId,
+                creationSource: "mobile",
+                threadId: queuedMessage.threadId,
+                rootThreadId: ThreadId.make(`goal-root:${queuedMessage.commandId}`),
+                objective: goalCommand.objective,
+                messageId: queuedMessage.messageId,
+                attachments: queuedMessage.attachments,
+                selectedContextText: [],
+              },
+            });
       return completeDelivery(deliveryResult);
     },
     [
@@ -238,6 +264,7 @@ export function useThreadOutboxDrain(): void {
       setThreadInteractionMode,
       setThreadRuntimeMode,
       startTurn,
+      launchGoal,
       updateThreadMetadata,
     ],
   );
@@ -253,6 +280,68 @@ export function useThreadOutboxDrain(): void {
         return false;
       }
       const { completeDelivery } = makeDeliveryHelpers(queuedMessage);
+      const goalCommand =
+        resolveThreadOutboxMessageKind(queuedMessage.text, true) === "goal_creation"
+          ? parseGoalComposerCommand(queuedMessage.text)
+          : null;
+      if (goalCommand !== null) {
+        const runtimeMode = queuedMessage.runtimeMode ?? DEFAULT_RUNTIME_MODE;
+        const interactionMode = queuedMessage.interactionMode ?? DEFAULT_PROVIDER_INTERACTION_MODE;
+        const worktreeBranch = buildTemporaryWorktreeBranchName(() =>
+          String(queuedMessage.commandId)
+            .replace(/[^a-f0-9]/giu, "")
+            .slice(-8)
+            .padEnd(8, "0"),
+        );
+        const createResult = await provisionGoalSource({
+          environmentId: queuedMessage.environmentId,
+          input: {
+            commandId: CommandId.make(`${queuedMessage.commandId}:source`),
+            creationSource: "mobile",
+            threadId: queuedMessage.threadId,
+            projectId: creation.projectId,
+            title: goalCommand.objective.slice(0, 512),
+            modelSelection,
+            runtimeMode,
+            interactionMode,
+            branch: creation.branch,
+            worktreePath: creation.worktreePath,
+            workspaceStrategy:
+              creation.workspaceMode === "worktree"
+                ? {
+                    type: "worktree",
+                    baseRef: creation.branch!,
+                    branch: worktreeBranch,
+                    ...(creation.startFromOrigin ? { startFromOrigin: true } : {}),
+                  }
+                : creation.worktreePath === null
+                  ? {
+                      type: "root",
+                      ...(creation.branch === null ? {} : { branch: creation.branch }),
+                    }
+                  : {
+                      type: "existing_worktree",
+                      worktreePath: creation.worktreePath,
+                      ...(creation.branch === null ? {} : { branch: creation.branch }),
+                    },
+          },
+        });
+        if (createResult._tag === "Failure") return completeDelivery(createResult);
+        const goalResult = await launchGoal({
+          environmentId: queuedMessage.environmentId,
+          input: {
+            commandId: queuedMessage.commandId,
+            creationSource: "mobile",
+            threadId: queuedMessage.threadId,
+            rootThreadId: ThreadId.make(`goal-root:${queuedMessage.commandId}`),
+            objective: goalCommand.objective,
+            messageId: queuedMessage.messageId,
+            attachments: queuedMessage.attachments,
+            selectedContextText: [],
+          },
+        });
+        return completeDelivery(goalResult);
+      }
       const deliveryResult = await startTurn({
         environmentId: queuedMessage.environmentId,
         input: buildProjectThreadStartTurnInput({
@@ -276,7 +365,7 @@ export function useThreadOutboxDrain(): void {
       });
       return completeDelivery(deliveryResult);
     },
-    [makeDeliveryHelpers, startTurn],
+    [launchGoal, makeDeliveryHelpers, provisionGoalSource, startTurn],
   );
 
   useEffect(() => {

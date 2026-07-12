@@ -124,6 +124,31 @@ export interface StartThreadTurnInput extends ThreadCommandInput {
   readonly dispatchMode?: "auto" | "queue" | "steer" | "restart";
 }
 
+export interface LaunchGoalInput extends ThreadCommandInput {
+  readonly rootThreadId: ThreadId;
+  readonly objective: string;
+  readonly messageId: MessageId;
+  readonly attachments: ReadonlyArray<ChatAttachment | UploadChatAttachment>;
+  readonly selectedContextText: ReadonlyArray<string>;
+}
+
+export interface ProvisionGoalSourceInput extends CreateThreadInput {
+  readonly reuseExistingThread?: boolean;
+  readonly workspaceStrategy:
+    | { readonly type: "root"; readonly branch?: string }
+    | {
+        readonly type: "existing_worktree";
+        readonly worktreePath: string;
+        readonly branch?: string;
+      }
+    | {
+        readonly type: "worktree";
+        readonly baseRef: string;
+        readonly branch?: string;
+        readonly startFromOrigin?: boolean;
+      };
+}
+
 export interface InterruptThreadTurnInput extends ThreadCommandInput {
   readonly runId?: RunId;
   /** Temporary caller compatibility while UI naming moves from turns to runs. */
@@ -499,6 +524,45 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
     ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
     ...(input.sourceProposedPlan === undefined ? {} : { sourcePlanRef: input.sourceProposedPlan }),
     dispatchMode,
+  });
+});
+
+/** Persist client-only attachments before creating any durable goal state. */
+export const launchGoal = Effect.fn("EnvironmentCommands.launchGoal")(function* (
+  input: LaunchGoalInput,
+) {
+  const commandId = yield* allocateCommandId(input);
+  const attachments = yield* persistAttachments(input.threadId, input.messageId, input.attachments);
+  return yield* dispatch({
+    type: "goal.launch",
+    commandId,
+    threadId: input.threadId,
+    rootThreadId: input.rootThreadId,
+    createdBy: "user",
+    creationSource: input.creationSource ?? "web",
+    objective: input.objective,
+    messageId: input.messageId,
+    attachments,
+    selectedContextText: [...input.selectedContextText],
+  });
+});
+
+/** Provision a durable goal source thread/workspace without starting a provider turn. */
+export const provisionGoalSource = Effect.fn("EnvironmentCommands.provisionGoalSource")(function* (
+  input: ProvisionGoalSourceInput,
+) {
+  return yield* request(ORCHESTRATION_V2_WS_METHODS.launchThread, {
+    commandId: yield* allocateCommandId(input),
+    creationSource: input.creationSource ?? "web",
+    threadId: input.threadId,
+    ...(input.reuseExistingThread === true ? { reuseExistingThread: true } : {}),
+    projectId: input.projectId,
+    title: input.title,
+    modelSelection: input.modelSelection,
+    runtimeMode: input.runtimeMode,
+    interactionMode: input.interactionMode,
+    workspaceStrategy: input.workspaceStrategy,
+    awaitPreparation: true,
   });
 });
 

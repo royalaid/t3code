@@ -33,6 +33,7 @@ import { layer as eventStoreLayer } from "../EventStore.ts";
 import { layer as idAllocatorLayer } from "../IdAllocator.ts";
 import { layer as orchestratorLayer } from "../Orchestrator.ts";
 import { layer as projectionStoreLayer } from "../ProjectionStore.ts";
+import { layer as goalProjectionStoreLayer } from "../GoalProjectionStore.ts";
 import { OrchestratorV2, type OrchestratorV2Error } from "../Orchestrator.ts";
 import { ProviderAdapterRegistryV2 } from "../ProviderAdapterRegistry.ts";
 import { layer as providerEventIngestorLayer } from "../ProviderEventIngestor.ts";
@@ -234,6 +235,7 @@ export function makeOrchestratorV2ReplayLayerWithRegistry<Error>(
   const storesLayer = Layer.mergeAll(
     eventStoreLayer,
     projectionStoreLayer,
+    goalProjectionStoreLayer,
     commandReceiptStoreLayer,
     effectOutboxLayer,
     turnItemPositionStoreLayer,

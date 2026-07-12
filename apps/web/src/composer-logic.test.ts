@@ -7,6 +7,7 @@ import {
   expandCollapsedComposerCursor,
   isCollapsedCursorAdjacentToInlineToken,
   parseStandaloneComposerSlashCommand,
+  resolveGoalComposerSubmission,
   replaceTextRange,
 } from "./composer-logic";
 import { INLINE_TERMINAL_CONTEXT_PLACEHOLDER } from "./lib/terminalContext";
@@ -346,5 +347,26 @@ describe("parseStandaloneComposerSlashCommand", () => {
 
   it("ignores slash commands with extra message text", () => {
     expect(parseStandaloneComposerSlashCommand("/plan explain this")).toBeNull();
+  });
+});
+
+describe("resolveGoalComposerSubmission", () => {
+  it("parses the raw command before provider prefixes and excludes it from selected context", () => {
+    expect(
+      resolveGoalComposerSubmission(
+        "/goal ship reliable queues",
+        "/goal ship reliable queues\n\n<terminal>targeted test output</terminal>",
+      ),
+    ).toEqual({
+      objective: "ship reliable queues",
+      selectedContextText: ["<terminal>targeted test output</terminal>"],
+    });
+    expect(resolveGoalComposerSubmission("high /goal text", "high /goal text")).toBeNull();
+    expect(
+      resolveGoalComposerSubmission(
+        "/effort high\n/goal ship reliable queues",
+        "/effort high\n/goal ship reliable queues",
+      ),
+    ).toBeNull();
   });
 });

@@ -1,6 +1,14 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  GoalAttemptId,
+  GoalId,
+  GoalNodeId,
+  ProviderInstanceId,
+  ProviderSessionId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { HttpServer } from "effect/unstable/http";
 
@@ -27,6 +35,33 @@ const makeRegistry = (now: () => number, httpServer = fakeHttpServer) =>
       Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
       Effect.provide(NodeServices.layer),
     );
+
+it.effect("issues a credential with exact worker authority and provider session binding", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const providerSessionId = ProviderSessionId.make("provider-session:worker");
+    const authority = {
+      kind: "goal_worker" as const,
+      goalId: GoalId.make("goal:worker"),
+      rootThreadId: ThreadId.make("thread:root"),
+      executionThreadId: ThreadId.make("thread:worker"),
+      nodeId: GoalNodeId.make("node:worker"),
+      attemptId: GoalAttemptId.make("attempt:worker"),
+      nativeOwnerAttemptId: GoalAttemptId.make("attempt:worker"),
+    };
+    const issued = yield* registry.issue({
+      threadId: authority.executionThreadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      providerSessionId,
+      authority,
+    });
+    const resolved = yield* registry.resolve(
+      issued.config.authorizationHeader.replace(/^Bearer\s+/, ""),
+    );
+    expect(resolved?.providerSessionId).toBe(providerSessionId);
+    expect(resolved?.authority).toEqual(authority);
+  }),
+);
 
 it.effect("stores only a token hash, resolves the bearer token, and revokes by thread", () =>
   Effect.gen(function* () {

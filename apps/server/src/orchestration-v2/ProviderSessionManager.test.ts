@@ -38,6 +38,7 @@ import {
   layer as idAllocatorLayer,
 } from "./IdAllocator.ts";
 import { ProjectionStoreV2, layer as projectionStoreLayer } from "./ProjectionStore.ts";
+import { layer as goalProjectionStoreLayer } from "./GoalProjectionStore.ts";
 import {
   ProviderAdapterEventStreamError,
   type ProviderAdapterV2Event,
@@ -49,13 +50,24 @@ import {
 import { makeSingleLayer as makeProviderAdapterRegistryLayer } from "./ProviderAdapterRegistry.ts";
 import {
   ProviderSessionManagerV2,
+  resolveGoalMcpBinding,
   layerWithOptions as providerSessionManagerLayerWithOptions,
 } from "./ProviderSessionManager.ts";
 
-const TestDatabaseLayer = SqlitePersistenceMemory;
-const TestStoresLayer = Layer.merge(eventStoreLayer, projectionStoreLayer).pipe(
-  Layer.provide(TestDatabaseLayer),
+it.effect("fails closed when goal MCP binding lookup fails", () =>
+  Effect.gen(function* () {
+    const failure = new Error("binding store unavailable");
+    const observed = yield* resolveGoalMcpBinding(Effect.fail(failure)).pipe(Effect.flip);
+    assert.strictEqual(observed, failure);
+  }),
 );
+
+const TestDatabaseLayer = SqlitePersistenceMemory;
+const TestStoresLayer = Layer.mergeAll(
+  eventStoreLayer,
+  projectionStoreLayer,
+  goalProjectionStoreLayer,
+).pipe(Layer.provide(TestDatabaseLayer));
 const TestEventSinkLayer = eventSinkLayer.pipe(
   Layer.provide(Layer.mergeAll(TestStoresLayer, TestDatabaseLayer)),
 );

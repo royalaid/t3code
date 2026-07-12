@@ -1,4 +1,5 @@
 import {
+  CommandId,
   DEFAULT_MODEL,
   defaultInstanceIdForDriver,
   type EnvironmentId,
@@ -73,6 +74,7 @@ import { useDiffPanelStore } from "../diffPanelStore";
 import {
   collapseExpandedComposerCursor,
   parseStandaloneComposerSlashCommand,
+  resolveGoalComposerSubmission,
 } from "../composer-logic";
 import {
   derivePendingApprovals,
@@ -1031,6 +1033,10 @@ function ChatViewContent(props: ChatViewProps) {
     reportFailure: false,
   });
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const launchGoal = useAtomCommand(threadEnvironment.launchGoal, { reportFailure: false });
+  const provisionGoalSource = useAtomCommand(threadEnvironment.provisionGoalSource, {
+    reportFailure: false,
+  });
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, {
     reportFailure: false,
   });
@@ -4143,6 +4149,7 @@ function ChatViewContent(props: ChatViewProps) {
       messageTextWithPreviewAnnotations,
       composerReviewCommentsSnapshot,
     );
+    const goalCommand = resolveGoalComposerSubmission(promptForSend, messageTextForSend);
     const messageIdForSend = newMessageId();
     const messageCreatedAt = new Date().toISOString();
     const outgoingMessageText = formatOutgoingPrompt({
@@ -4152,6 +4159,7 @@ function ChatViewContent(props: ChatViewProps) {
       effort: ctxSelectedPromptEffort,
       text: messageTextForSend || IMAGE_ONLY_BOOTSTRAP_PROMPT,
     });
+    const goalRootThreadId = goalCommand === null ? null : newThreadId();
     const turnAttachmentsPromise = Promise.all(
       composerImagesSnapshot.map(async (image) => ({
         type: "image" as const,
@@ -4183,24 +4191,26 @@ function ChatViewContent(props: ChatViewProps) {
       threadKey: scopedThreadKey(scopeThreadRef(activeThread.environmentId, threadIdForSend)),
       messageId: messageIdForSend,
     });
-    setOptimisticUserMessages((existing) => [
-      ...existing,
-      {
-        id: messageIdForSend,
-        role: "user",
-        text: outgoingMessageText,
-        ...(optimisticAttachments.length > 0 ? { attachments: optimisticAttachments } : {}),
-        runId: null,
-        createdAt: messageCreatedAt,
-        updatedAt: messageCreatedAt,
-        streaming: false,
-        ...(phase === "running" && dispatchMode === "queue"
-          ? { inputIntent: "queued_turn" as const }
-          : phase === "running" && dispatchMode === "steer"
-            ? { inputIntent: "steer" as const }
-            : {}),
-      },
-    ]);
+    if (goalCommand === null) {
+      setOptimisticUserMessages((existing) => [
+        ...existing,
+        {
+          id: messageIdForSend,
+          role: "user",
+          text: outgoingMessageText,
+          ...(optimisticAttachments.length > 0 ? { attachments: optimisticAttachments } : {}),
+          runId: null,
+          createdAt: messageCreatedAt,
+          updatedAt: messageCreatedAt,
+          streaming: false,
+          ...(phase === "running" && dispatchMode === "queue"
+            ? { inputIntent: "queued_turn" as const }
+            : phase === "running" && dispatchMode === "steer"
+              ? { inputIntent: "steer" as const }
+              : {}),
+        },
+      ]);
+    }
     setThreadError(threadIdForSend, null);
     if (expiredTerminalContextCount > 0) {
       const toastCopy = buildExpiredTerminalContextToastCopy(
@@ -4311,29 +4321,89 @@ function ChatViewContent(props: ChatViewProps) {
             }
           : undefined;
       beginLocalDispatch({ preparingWorktree: false });
-      const startResult = await startThreadTurn({
-        environmentId,
-        input: {
-          threadId: threadIdForSend,
-          message: {
-            messageId: messageIdForSend,
-            role: "user",
-            text: outgoingMessageText,
-            attachments: turnAttachmentsResult.value,
+      if (goalCommand !== null && (isLocalDraftThread || baseBranchForWorktree !== null)) {
+        const preparedWorktree = bootstrap?.prepareWorktree;
+        const sourceCreate = await provisionGoalSource({
+          environmentId,
+          input: {
+            commandId: CommandId.make(`goal-source:${messageIdForSend}`),
+            threadId: threadIdForSend,
+            projectId: activeProject.id,
+            title,
+            modelSelection: threadCreateModelSelection,
+            runtimeMode,
+            interactionMode,
+            branch: activeThreadBranch,
+            worktreePath: activeThread.worktreePath,
+            ...(isLocalDraftThread ? {} : { reuseExistingThread: true }),
+            workspaceStrategy:
+              preparedWorktree !== undefined
+                ? {
+                    type: "worktree",
+                    baseRef: preparedWorktree.baseBranch,
+                    branch: preparedWorktree.branch,
+                    ...(preparedWorktree.startFromOrigin ? { startFromOrigin: true } : {}),
+                  }
+                : activeThread.worktreePath === null
+                  ? {
+                      type: "root",
+                      ...(activeThreadBranch === null ? {} : { branch: activeThreadBranch }),
+                    }
+                  : {
+                      type: "existing_worktree",
+                      worktreePath: activeThread.worktreePath,
+                      ...(activeThreadBranch === null ? {} : { branch: activeThreadBranch }),
+                    },
+            createdAt: messageCreatedAt,
           },
-          modelSelection: ctxSelectedModelSelection,
-          titleSeed: title,
-          runtimeMode,
-          interactionMode,
-          dispatchMode,
-          ...(bootstrap ? { bootstrap } : {}),
-          createdAt: messageCreatedAt,
-        },
-      });
+        });
+        if (sourceCreate._tag === "Failure") failure = sourceCreate;
+      }
+      const startResult =
+        failure !== null
+          ? failure
+          : goalCommand === null
+            ? await startThreadTurn({
+                environmentId,
+                input: {
+                  threadId: threadIdForSend,
+                  message: {
+                    messageId: messageIdForSend,
+                    role: "user",
+                    text: outgoingMessageText,
+                    attachments: turnAttachmentsResult.value,
+                  },
+                  modelSelection: ctxSelectedModelSelection,
+                  titleSeed: title,
+                  runtimeMode,
+                  interactionMode,
+                  dispatchMode,
+                  ...(bootstrap ? { bootstrap } : {}),
+                  createdAt: messageCreatedAt,
+                },
+              })
+            : await launchGoal({
+                environmentId,
+                input: {
+                  threadId: threadIdForSend,
+                  rootThreadId: goalRootThreadId!,
+                  objective: goalCommand.objective,
+                  messageId: messageIdForSend,
+                  attachments: turnAttachmentsResult.value,
+                  selectedContextText: goalCommand.selectedContextText,
+                  createdAt: messageCreatedAt,
+                },
+              });
       if (startResult._tag === "Failure") {
         failure = startResult;
       } else {
         turnStartSucceeded = true;
+        if (goalRootThreadId !== null) {
+          await navigate({
+            to: "/$environmentId/$threadId",
+            params: buildThreadRouteParams(scopeThreadRef(environmentId, goalRootThreadId)),
+          });
+        }
       }
     }
 

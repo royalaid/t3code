@@ -1,6 +1,7 @@
 import {
   type ChatAttachment,
   CommandId,
+  GoalId,
   type ModelSelection,
   OrchestrationV2Command,
   type OrchestrationV2AppThread,
@@ -42,6 +43,7 @@ import { EventSinkV2 } from "./EventSink.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
 import { makeKeyedSerialExecutor } from "./KeyedSerialExecutor.ts";
+import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { applyToProjection, emptyProjection, ProjectionStoreV2 } from "./ProjectionStore.ts";
 import type { ProviderAdapterV2Shape } from "./ProviderAdapter.ts";
 import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
@@ -192,9 +194,13 @@ function commandThreadId(command: OrchestrationV2Command): ThreadId {
     case "checkpoint.rollback":
     case "provider.switch":
     case "goal.create":
+    case "goal.launch":
     case "goal.reopen":
     case "goal.cancel":
     case "goal.pending-launch.cancel":
+    case "goal.pending-launch.fail":
+    case "goal.pending-launch.claim":
+    case "goal.pending-launch.complete":
     case "goal.graph.replace":
     case "goal.node.cancel":
     case "goal.result.publish":
@@ -214,6 +220,27 @@ function nextTurnItemOrdinal(projection: OrchestrationV2ThreadProjection): numbe
 }
 
 const WORKSPACE_PREPARATION_INPUT = "Preparing workspace";
+
+const UNSAFE_GOAL_URL = /^(?:blob:|file:|client-local:)/iu;
+const CLIENT_ONLY_GOAL_FIELDS = new Set(["previewUrl", "previewUri", "localUrl", "localUri"]);
+
+function assertPortableGoalValue(value: unknown, path = "goal"): void {
+  if (typeof value === "string" && UNSAFE_GOAL_URL.test(value.trim())) {
+    throw new Error(`Goal launch contains a client-local URL at ${path}.`);
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => assertPortableGoalValue(entry, `${path}[${index}]`));
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const [key, entry] of Object.entries(value)) {
+      if (CLIENT_ONLY_GOAL_FIELDS.has(key)) {
+        throw new Error(`Goal launch contains a client-only preview field at ${path}.${key}.`);
+      }
+      assertPortableGoalValue(entry, `${path}.${key}`);
+    }
+  }
+}
 
 function isBlockingRun(run: OrchestrationV2Run): boolean {
   return (
@@ -413,6 +440,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const commandReceipts = yield* CommandReceiptStoreV2;
   const idAllocator = yield* IdAllocatorV2;
   const projectionStore = yield* ProjectionStoreV2;
+  const projectSnapshots = yield* Effect.serviceOption(ProjectionSnapshotQuery);
   const providerAdapters = yield* ProviderAdapterRegistryV2;
   const providerSessions = yield* ProviderSessionManagerV2;
   const providerSwitchService = yield* ProviderSwitchServiceV2;
@@ -1990,6 +2018,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   ) =>
     Effect.gen(function* () {
       const projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+      if (command.goalLaunchClaim !== undefined) {
+        const goal = projection.goal?.goal;
+        if (
+          goal === undefined ||
+          goal.id !== command.goalLaunchClaim.goalId ||
+          goal.status !== "provisioning" ||
+          goal.pendingLaunchClaimId !== command.goalLaunchClaim.claimId
+        ) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "Goal launch claim is stale, cancelled, or no longer provisioning.",
+          });
+        }
+      }
       const modelSelection = command.modelSelection ?? projection.thread.modelSelection;
       const dispatchMode = command.dispatchMode;
       const sourcePlanProjection =
@@ -4958,6 +5001,151 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }),
     );
 
+  const dispatchGoalCommand = Effect.fn("orchestrationV2.dispatch.goalCommand")(function* (
+    command: Exclude<
+      Extract<OrchestrationV2Command, { readonly type: `goal.${string}` }>,
+      { readonly type: "goal.launch" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    const detail = projection.goal;
+    if (detail === null || detail === undefined || detail.goal.id !== command.goalId) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Goal ${command.goalId} is not linked to root thread ${command.threadId}.`,
+      });
+    }
+    const now = DateTime.formatIso(yield* DateTime.now);
+    switch (command.type) {
+      case "goal.graph.replace":
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "goal.graph-version-activated",
+          threadId: command.threadId,
+          occurredAt: yield* DateTime.now,
+          payload: {
+            goalId: command.goalId,
+            expectedRevision: command.expectedRevision,
+            graph: command.graph,
+            activatedAt: now,
+          },
+        });
+        return;
+      case "goal.pending-launch.cancel":
+      case "goal.cancel":
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "goal.cancelled",
+          threadId: command.threadId,
+          occurredAt: yield* DateTime.now,
+          payload: { ...detail.goal, status: "cancelled", updatedAt: now },
+        });
+        return;
+      case "goal.pending-launch.claim":
+        if (detail.goal.status !== "waiting_for_source") return;
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "goal.updated",
+          threadId: command.threadId,
+          occurredAt: yield* DateTime.now,
+          payload: {
+            ...detail.goal,
+            status: "provisioning",
+            sourceActiveRunId: null,
+            pendingLaunchClaimId: command.claimId,
+            updatedAt: now,
+          },
+        });
+        return;
+      case "goal.pending-launch.complete":
+        if (
+          detail.goal.status !== "provisioning" ||
+          detail.goal.pendingLaunchClaimId !== command.claimId
+        )
+          return;
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "goal.updated",
+          threadId: command.threadId,
+          occurredAt: yield* DateTime.now,
+          payload: {
+            ...detail.goal,
+            status: "planning",
+            sourceHandoff: command.handoff,
+            updatedAt: now,
+          },
+        });
+        return;
+      case "goal.pending-launch.fail":
+        if (
+          detail.goal.status !== "provisioning" ||
+          detail.goal.pendingLaunchClaimId !== command.claimId
+        )
+          return;
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "goal.updated",
+          threadId: command.threadId,
+          occurredAt: yield* DateTime.now,
+          payload: { ...detail.goal, status: "failed", updatedAt: now },
+        });
+        return;
+      case "goal.node.cancel": {
+        const node = detail.nodes.find((candidate) => candidate.node.id === command.nodeId);
+        if (node === undefined) return yield* dispatchUnsupported(command);
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "goal.node-cancellation-requested",
+          threadId: command.threadId,
+          occurredAt: yield* DateTime.now,
+          payload: { ...node, blocker: command.reason ?? "Cancellation requested", updatedAt: now },
+        });
+        return;
+      }
+      case "goal.result.publish":
+        for (const artifact of command.artifacts) {
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "goal.artifact-published",
+            threadId: command.threadId,
+            occurredAt: yield* DateTime.now,
+            payload: artifact,
+          });
+        }
+        return;
+      case "goal.evidence.publish":
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "goal.evidence-submitted",
+          threadId: command.threadId,
+          occurredAt: yield* DateTime.now,
+          payload: command.evidence,
+        });
+        return;
+      case "goal.create":
+      case "goal.reopen":
+        return yield* dispatchUnsupported(command);
+    }
+  });
+
   const dispatchOnce = Effect.fn("orchestrationV2.dispatch.once")(function* (
     command: OrchestrationV2Command,
   ): Effect.fn.Return<
@@ -4986,6 +5174,144 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       | undefined;
     switch (command.type) {
+      case "goal.launch": {
+        yield* Effect.try({
+          try: () => assertPortableGoalValue(command),
+          catch: (cause) =>
+            new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause,
+            }),
+        });
+        const source = yield* getProjectionWithPendingEvents(command.threadId, events);
+        const rootThreadId = command.rootThreadId;
+        if (rootThreadId === command.threadId) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "A goal root thread must be distinct from its source thread.",
+          });
+        }
+        const existingRoot = yield* Effect.option(
+          projectionStore.getThreadProjection(rootThreadId),
+        );
+        if (Option.isSome(existingRoot)) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: `Goal root thread ${rootThreadId} already exists (root id collision).`,
+          });
+        }
+        const project = Option.isSome(projectSnapshots)
+          ? yield* projectSnapshots.value
+              .getProjectShellById(source.thread.projectId)
+              .pipe(Effect.map(Option.getOrUndefined), mapDispatchError(command))
+          : undefined;
+        const sourceWorkspaceRoot = source.thread.worktreePath ?? project?.workspaceRoot;
+        if (sourceWorkspaceRoot === undefined) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: `Source project ${source.thread.projectId} is unavailable.`,
+          });
+        }
+        if (!(yield* checkpointService.isGitRepository(sourceWorkspaceRoot))) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: `/goal requires a Git repository; ${sourceWorkspaceRoot} is not one.`,
+          });
+        }
+        const goalId = GoalId.make(`goal:${command.commandId}`);
+        const providerAllowlist = yield* providerAdapters.list().pipe(mapDispatchError(command));
+        const activeRun = source.runs.find(isBlockingRun);
+        const now = DateTime.formatIso(yield* DateTime.now);
+        const runtimePolicy =
+          source.thread.runtimeMode === "approval-required"
+            ? { sandboxMode: "read-only" as const, approvalPolicy: "untrusted" as const }
+            : source.thread.runtimeMode === "auto-accept-edits"
+              ? { sandboxMode: "workspace-write" as const, approvalPolicy: "on-request" as const }
+              : { sandboxMode: "danger-full-access" as const, approvalPolicy: "never" as const };
+        const goal = {
+          id: goalId,
+          projectId: source.thread.projectId,
+          objective: command.objective,
+          status: "waiting_for_source" as const,
+          sourceThreadId: command.threadId,
+          rootThreadId,
+          sourceActiveRunId: activeRun?.id ?? null,
+          pendingLaunchClaimId: null,
+          sourceInput: {
+            messageId: command.messageId,
+            attachments: command.attachments,
+            selectedContextText: command.selectedContextText,
+          },
+          sourceHandoff: null,
+          rootModelSelection: source.thread.modelSelection,
+          rootRuntimeMode: source.thread.runtimeMode,
+          rootInteractionMode: source.thread.interactionMode,
+          policy: {
+            ...runtimePolicy,
+            writableRoots: [
+              `goal-workspace://${goalId}`,
+              ...(source.thread.worktreePath === null ? [] : [source.thread.worktreePath]),
+            ],
+            providerAllowlist,
+            // "*" means inherited tool access. Graph validation still prevents a child
+            // from broadening sandbox, approval, provider, or writable-root authority.
+            toolAllowlist: ["*"],
+          },
+          currentGraphVersionId: null,
+          currentRevision: 0,
+          integrationBranch: null,
+          integrationWorktreePath: null,
+          integrationSha: null,
+          verifiedSha: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        yield* dispatchThreadCreate(
+          {
+            type: "thread.create",
+            commandId: command.commandId,
+            threadId: rootThreadId,
+            projectId: source.thread.projectId,
+            title: command.objective.slice(0, 512),
+            modelSelection: source.thread.modelSelection,
+            runtimeMode: source.thread.runtimeMode,
+            interactionMode: source.thread.interactionMode,
+            branch: null,
+            worktreePath: null,
+            createdBy: command.createdBy,
+            creationSource: command.creationSource,
+          },
+          events,
+        );
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "goal.created",
+          threadId: rootThreadId,
+          occurredAt: yield* DateTime.now,
+          payload: goal,
+        });
+        break;
+      }
+      case "goal.create":
+      case "goal.reopen":
+      case "goal.cancel":
+      case "goal.pending-launch.cancel":
+      case "goal.pending-launch.fail":
+      case "goal.pending-launch.claim":
+      case "goal.pending-launch.complete":
+      case "goal.graph.replace":
+      case "goal.node.cancel":
+      case "goal.result.publish":
+      case "goal.evidence.publish":
+        yield* dispatchGoalCommand(command, events);
+        break;
       case "thread.create":
         yield* dispatchThreadCreate(command, events);
         break;

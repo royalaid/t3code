@@ -116,10 +116,14 @@ function commandThreadIds(command: OrchestrationV2Command): ReadonlyArray<Thread
     case "runtime-request.respond":
     case "checkpoint.rollback":
     case "provider.switch":
+    case "goal.launch":
     case "goal.create":
     case "goal.reopen":
     case "goal.cancel":
     case "goal.pending-launch.cancel":
+    case "goal.pending-launch.fail":
+    case "goal.pending-launch.claim":
+    case "goal.pending-launch.complete":
     case "goal.graph.replace":
     case "goal.node.cancel":
     case "goal.result.publish":

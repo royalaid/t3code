@@ -2,6 +2,10 @@ import * as Schema from "effect/Schema";
 
 import {
   ContextTransferId,
+  GoalAttemptId,
+  GoalEvidenceId,
+  GoalId,
+  GoalNodeId,
   IsoDateTime,
   MessageId,
   NodeId,
@@ -23,6 +27,13 @@ import {
   OrchestrationV2TurnItemStatus,
 } from "./orchestrationV2.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+import {
+  GoalArtifact,
+  GoalDetail,
+  GoalEvidence,
+  GoalGraphVersion,
+  GoalNodeProjection,
+} from "./goalWorkflow.ts";
 
 const OrchestratorMcpPrompt = TrimmedNonEmptyString.check(Schema.isMaxLength(120_000));
 const OrchestratorMcpTitle = TrimmedNonEmptyString.check(Schema.isMaxLength(512));
@@ -433,6 +444,52 @@ export const OrchestratorMcpDeleteScheduledTaskResult = Schema.Struct({
 export type OrchestratorMcpDeleteScheduledTaskResult =
   typeof OrchestratorMcpDeleteScheduledTaskResult.Type;
 
+export const GoalMcpReadInput = Schema.Struct({ goalId: GoalId });
+export type GoalMcpReadInput = typeof GoalMcpReadInput.Type;
+export const GoalMcpReadResult = GoalDetail;
+export type GoalMcpReadResult = typeof GoalMcpReadResult.Type;
+export const GoalMcpCapabilitiesResult = Schema.Struct({
+  goalId: GoalId,
+  role: Schema.Literals(["lead", "worker"]),
+  canReplaceGraph: Schema.Boolean,
+  canCancelAnyNode: Schema.Boolean,
+  scopedNodeId: Schema.NullOr(GoalNodeId),
+});
+export type GoalMcpCapabilitiesResult = typeof GoalMcpCapabilitiesResult.Type;
+export const GoalMcpReplaceGraphInput = Schema.Struct({
+  goalId: GoalId,
+  expectedRevision: NonNegativeInt,
+  graph: GoalGraphVersion,
+});
+export type GoalMcpReplaceGraphInput = typeof GoalMcpReplaceGraphInput.Type;
+export const GoalMcpNodeReadInput = Schema.Struct({ goalId: GoalId, nodeId: GoalNodeId });
+export type GoalMcpNodeReadInput = typeof GoalMcpNodeReadInput.Type;
+export const GoalMcpNodeReadResult = GoalNodeProjection;
+export type GoalMcpNodeReadResult = typeof GoalMcpNodeReadResult.Type;
+export const GoalMcpNodeCancelInput = Schema.Struct({
+  goalId: GoalId,
+  nodeId: GoalNodeId,
+  reason: Schema.optional(Schema.String),
+});
+export type GoalMcpNodeCancelInput = typeof GoalMcpNodeCancelInput.Type;
+export const GoalMcpResultPublishInput = Schema.Struct({
+  goalId: GoalId,
+  attemptId: GoalAttemptId,
+  artifacts: Schema.Array(GoalArtifact),
+});
+export type GoalMcpResultPublishInput = typeof GoalMcpResultPublishInput.Type;
+export const GoalMcpEvidenceReadInput = Schema.Struct({
+  goalId: GoalId,
+  evidenceId: Schema.optional(GoalEvidenceId),
+});
+export type GoalMcpEvidenceReadInput = typeof GoalMcpEvidenceReadInput.Type;
+export const GoalMcpEvidenceReadResult = Schema.Array(GoalEvidence);
+export type GoalMcpEvidenceReadResult = typeof GoalMcpEvidenceReadResult.Type;
+export const GoalMcpEvidenceSubmitInput = Schema.Struct({ goalId: GoalId, evidence: GoalEvidence });
+export type GoalMcpEvidenceSubmitInput = typeof GoalMcpEvidenceSubmitInput.Type;
+export const GoalMcpMutationResult = Schema.Struct({ accepted: Schema.Boolean });
+export type GoalMcpMutationResult = typeof GoalMcpMutationResult.Type;
+
 export class OrchestratorMcpFailure extends Schema.TaggedErrorClass<OrchestratorMcpFailure>()(
   "OrchestratorMcpFailure",
   {
@@ -451,6 +508,10 @@ export class OrchestratorMcpFailure extends Schema.TaggedErrorClass<Orchestrator
       "thread_not_interruptible",
       "invalid_request",
       "orchestration_error",
+      "goal_not_found",
+      "goal_scope_mismatch",
+      "stale_goal_session",
+      "stale_revision",
     ]),
     message: Schema.String,
   },

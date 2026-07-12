@@ -11,6 +11,7 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -163,6 +164,44 @@ function waitUntil<E, R>(predicate: () => Effect.Effect<boolean, E, R>): Effect.
     assert.fail("Condition was not reached before timeout.");
   });
 }
+
+it.effect("waits for goal source workspace preparation before returning", () =>
+  Effect.gen(function* () {
+    const setupEntered = yield* Deferred.make<void>();
+    const allowSetup = yield* Deferred.make<void>();
+    const harness = makeHarness({
+      runSetup: () =>
+        Deferred.succeed(setupEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowSetup)),
+          Effect.as({ status: "no-script" as const }),
+        ),
+    });
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const input = {
+        ...launchInput({
+          command: "command:goal-source:await-workspace",
+          thread: "thread:goal-source:await-workspace",
+          workspace: { type: "worktree" as const, baseRef: "main" },
+        }),
+        awaitPreparation: true,
+      };
+      const fiber = yield* launches
+        .launch(input)
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(setupEntered);
+      assert.isUndefined(fiber.pollUnsafe());
+      yield* Deferred.succeed(allowSetup, undefined);
+      const launched = yield* Fiber.join(fiber);
+      assert.equal(launched.projection.thread.worktreePath, "/repo-worktrees/feature");
+      const retry = yield* launches.launch(input);
+      assert.isTrue(retry.resumed);
+      assert.equal(retry.projection.thread.worktreePath, "/repo-worktrees/feature");
+      assert.equal(harness.createWorktree.mock.calls.length, 1);
+      assert.equal(harness.runSetup.mock.calls.length, 1);
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
 
 it.effect("returns a visible preparing message while provisioning is still blocked", () =>
   Effect.gen(function* () {
