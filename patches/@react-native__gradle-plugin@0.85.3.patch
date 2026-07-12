@@ -1,0 +1,8 @@
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index b3c46a3bf5eb21c0bb1c9435b5582aecbc57d57a..6f2842272ef9b0569f510db8d905ff1a6030f6d4 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -16 +16,2 @@
+-plugins { id("org.gradle.toolchains.foojay-resolver-convention").version("0.5.0") }
++// Foojay 0.5.0 references a Gradle API field removed in Gradle 9.
++plugins { id("org.gradle.toolchains.foojay-resolver-convention").version("1.0.0") }
