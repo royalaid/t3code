@@ -8,6 +8,7 @@ import {
   GoalGraphEdge,
   GoalNodeProjection,
   GoalAttempt,
+  type GoalAttempt as GoalAttemptType,
   GoalArtifact,
   GoalEvidence,
   GoalFailureRecord,
@@ -27,7 +28,6 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 const MAX_GRAPH_NODES = 1_000;
 const MAX_GRAPH_EDGES = 5_000;
-type GoalAttemptType = typeof GoalAttempt.Type;
 type GoalArtifactType = typeof GoalArtifact.Type;
 type GoalSummaryType = typeof GoalSummary.Type;
 
@@ -305,6 +305,10 @@ export interface GoalProjectionStoreShape {
     goalId: GoalId,
   ) => Effect.Effect<GoalDetailType, GoalProjectionValidationError>;
   readonly listPendingLaunches: Effect.Effect<
+    ReadonlyArray<GoalDetailType>,
+    GoalProjectionValidationError
+  >;
+  readonly listSchedulable: Effect.Effect<
     ReadonlyArray<GoalDetailType>,
     GoalProjectionValidationError
   >;
@@ -843,6 +847,13 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         decodeGoal(row.payload_json).pipe(Effect.flatMap((goal) => getDetail(goal.id))),
       );
     });
+    const listSchedulable = Effect.gen(function* () {
+      const rows =
+        yield* sql<PayloadRow>`SELECT payload_json FROM goals WHERE status IN ('planning', 'running') AND current_graph_version_id IS NOT NULL ORDER BY created_at, goal_id`;
+      return yield* Effect.forEach(rows, (row) =>
+        decodeGoal(row.payload_json).pipe(Effect.flatMap((goal) => getDetail(goal.id))),
+      );
+    });
     const resolveMcpBinding = Effect.fn("GoalProjectionStore.resolveMcpBinding")(function* (
       threadId: ThreadId,
     ) {
@@ -874,6 +885,7 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
       apply: (event) => mapStoreError(apply(event)),
       getDetail: (goalId) => mapStoreError(getDetail(goalId)),
       listPendingLaunches: mapStoreError(listPendingLaunches),
+      listSchedulable: mapStoreError(listSchedulable),
       resolveMcpBinding: (threadId) => mapStoreError(resolveMcpBinding(threadId)),
     });
   }),

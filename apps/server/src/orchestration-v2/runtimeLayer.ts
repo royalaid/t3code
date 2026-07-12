@@ -24,6 +24,10 @@ import { layer as orchestratorLayer } from "./Orchestrator.ts";
 import { layer as projectionStoreLayer } from "./ProjectionStore.ts";
 import { layer as goalProjectionStoreLayer } from "./GoalProjectionStore.ts";
 import { layer as goalLaunchServiceLayer } from "./GoalLaunchService.ts";
+import { layer as goalAttemptExecutionServiceLayer } from "./GoalAttemptExecutionService.ts";
+import { layer as goalRoutingServiceLayer } from "./GoalRoutingService.ts";
+import { layer as goalSchedulerLayer } from "./GoalScheduler.ts";
+import { layer as goalWorkflowServiceLayer } from "./GoalWorkflowService.ts";
 import { layer as projectionMaintenanceLayer } from "./ProjectionMaintenance.ts";
 import { layerFromProviderInstanceRegistry as providerAdapterRegistryLayerFromProviderInstances } from "./ProviderAdapterRegistry.ts";
 import { layer as providerEventIngestorLayer } from "./ProviderEventIngestor.ts";
@@ -80,6 +84,7 @@ const contextHandoffServiceProvided = contextHandoffServiceLayer.pipe(
 );
 
 const providerAdapterRegistryProvided = providerAdapterRegistryLayerFromProviderInstances;
+const goalRoutingProvided = goalRoutingServiceLayer;
 const providerSwitchServiceProvided = providerSwitchServiceLayer.pipe(
   Layer.provide(providerAdapterRegistryProvided),
 );
@@ -152,33 +157,6 @@ const runFinalizationServiceProvided = runFinalizationServiceLayer.pipe(
   Layer.provide(Layer.merge(checkpointCaptureServiceProvided, projectionStoreLayer)),
 );
 
-const effectExecutorProvided = effectExecutorLayer.pipe(
-  Layer.provide(
-    Layer.mergeAll(
-      runFinalizationServiceProvided,
-      checkpointRollbackServiceProvided,
-      providerSessionManagerProvided,
-      providerTurnControlServiceProvided,
-      providerTurnStartServiceProvided,
-      runtimeRequestServiceProvided,
-    ),
-  ),
-);
-const effectWorkerProvided = effectWorkerLayer.pipe(
-  Layer.provide(Layer.merge(storesLayer, effectExecutorProvided)),
-);
-const providerRuntimeRecoveryProvided = providerRuntimeRecoveryLayer.pipe(
-  Layer.provide(
-    Layer.mergeAll(
-      effectWorkerProvided,
-      storesLayer,
-      eventSinkProvided,
-      idAllocatorLayer,
-      projectionStoreLayer,
-    ),
-  ),
-);
-
 const orchestratorProvided = orchestratorLayer.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -186,7 +164,6 @@ const orchestratorProvided = orchestratorLayer.pipe(
       commandPolicyLayer,
       storesLayer,
       eventSinkProvided,
-      effectWorkerProvided,
       commandReceiptStoreProvided,
       contextHandoffServiceProvided,
       idAllocatorLayer,
@@ -218,12 +195,60 @@ const threadLaunchProvided = threadLaunchServiceLayer.pipe(
     ),
   ),
 );
+const goalAttemptExecutionProvided = goalAttemptExecutionServiceLayer.pipe(
+  Layer.provide(
+    Layer.mergeAll(storesLayer, eventSinkProvided, idAllocatorLayer, threadManagementProvided),
+  ),
+);
+const effectExecutorProvided = effectExecutorLayer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      goalAttemptExecutionProvided,
+      runFinalizationServiceProvided,
+      checkpointRollbackServiceProvided,
+      providerSessionManagerProvided,
+      providerTurnControlServiceProvided,
+      providerTurnStartServiceProvided,
+      runtimeRequestServiceProvided,
+    ),
+  ),
+);
+const effectWorkerProvided = effectWorkerLayer.pipe(
+  Layer.provide(Layer.merge(storesLayer, effectExecutorProvided)),
+);
+const providerRuntimeRecoveryProvided = providerRuntimeRecoveryLayer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      effectWorkerProvided,
+      storesLayer,
+      eventSinkProvided,
+      idAllocatorLayer,
+      projectionStoreLayer,
+    ),
+  ),
+);
 const threadLifecycleProvided = threadLifecycleServiceLayer.pipe(
   Layer.provide(threadManagementProvided),
 );
 const goalLaunchProvided = goalLaunchServiceLayer.pipe(
   Layer.provide(
     Layer.mergeAll(storesLayer, eventSinkProvided, threadLaunchProvided, threadManagementProvided),
+  ),
+);
+const goalSchedulerProvided = goalSchedulerLayer.pipe(
+  Layer.provide(
+    Layer.mergeAll(storesLayer, eventSinkProvided, idAllocatorLayer, goalRoutingProvided),
+  ),
+);
+const goalWorkflowProvided = goalWorkflowServiceLayer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      storesLayer,
+      eventSinkProvided,
+      goalSchedulerProvided,
+      idAllocatorLayer,
+      threadManagementProvided,
+    ),
   ),
 );
 const scheduledTaskProvided = scheduledTaskServiceLayer.pipe(
@@ -237,6 +262,7 @@ export const OrchestrationV2LayerLive = Layer.mergeAll(
   providerSessionManagerProvided,
   providerRuntimeRecoveryProvided,
   projectionMaintenanceProvided,
+  goalWorkflowProvided,
 );
 
 export const OrchestrationV2ProductionLayerLive = Layer.mergeAll(

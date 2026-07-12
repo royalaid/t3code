@@ -904,12 +904,32 @@ const make = Effect.gen(function* () {
         if (authority.kind === "ordinary")
           return yield* failure("goal_scope_mismatch", "Credential is not goal scoped.");
         yield* loadGoal(scope, authority.goalId);
+        const providers = yield* loadProviders;
+        const routeCandidates = providers
+          .flatMap((provider) =>
+            provider.models.map((model) => ({
+              providerInstanceId: provider.instanceId,
+              model: model.slug,
+              capabilities: [],
+              unmetConstraints: [
+                ...(isProviderAvailable(provider) ? [] : ["provider_not_installed"]),
+                ...(provider.installed ? [] : ["provider_not_installed"]),
+                ...(provider.enabled ? [] : ["provider_disabled"]),
+                ...(provider.auth.status === "authenticated" ? [] : ["provider_not_authenticated"]),
+              ].filter((value, index, values) => values.indexOf(value) === index),
+            })),
+          )
+          .toSorted((left, right) => {
+            const providerOrder = left.providerInstanceId.localeCompare(right.providerInstanceId);
+            return providerOrder === 0 ? left.model.localeCompare(right.model) : providerOrder;
+          });
         return {
           goalId: authority.goalId,
           role: authority.kind === "goal_lead" ? "lead" : "worker",
           canReplaceGraph: authority.kind === "goal_lead",
           canCancelAnyNode: authority.kind === "goal_lead",
           scopedNodeId: authority.kind === "goal_worker" ? authority.nodeId : null,
+          routeCandidates,
         };
       }),
     goalReplaceGraph: (scope, input) =>

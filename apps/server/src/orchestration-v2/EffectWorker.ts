@@ -15,6 +15,7 @@ import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderTurnControlServiceV2 } from "./ProviderTurnControlService.ts";
 import { ProviderTurnStartServiceV2 } from "./ProviderTurnStartService.ts";
 import { RuntimeRequestServiceV2 } from "./RuntimeRequestService.ts";
+import { GoalAttemptExecutionService } from "./GoalAttemptExecutionService.ts";
 
 export class OrchestrationEffectExecutionError extends Schema.TaggedErrorClass<OrchestrationEffectExecutionError>()(
   "OrchestrationEffectExecutionError",
@@ -45,6 +46,7 @@ export const executorLayer: Layer.Layer<
   | ProviderTurnControlServiceV2
   | ProviderTurnStartServiceV2
   | RuntimeRequestServiceV2
+  | GoalAttemptExecutionService
 > = Layer.effect(
   OrchestrationEffectExecutorV2,
   Effect.gen(function* () {
@@ -55,9 +57,26 @@ export const executorLayer: Layer.Layer<
     const providerTurnControl = yield* ProviderTurnControlServiceV2;
     const providerTurnStart = yield* ProviderTurnStartServiceV2;
     const runtimeRequests = yield* RuntimeRequestServiceV2;
+    const goalAttempts = yield* GoalAttemptExecutionService;
     return OrchestrationEffectExecutorV2.of({
       execute: (effect) => {
         switch (effect.request.type) {
+          case "goal-attempt.launch":
+            return goalAttempts
+              .launch({
+                goalId: effect.request.goalId,
+                attemptId: effect.request.attemptId,
+              })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
           case "provider-session.detach":
             return providerSessions
               .detach({
@@ -285,6 +304,11 @@ export interface OrchestrationEffectWorkerOptions {
   readonly maxAttempts?: number;
 }
 
+export const orchestrationEffectAttemptLimit = (
+  effectType: OrchestrationEffectV2["request"]["type"],
+  defaultLimit: number,
+): number => (effectType === "goal-attempt.launch" ? 2 : defaultLimit);
+
 export const layerWithOptions = (
   options: OrchestrationEffectWorkerOptions = {},
 ): Layer.Layer<
@@ -355,7 +379,7 @@ export const layerWithOptions = (
           error,
         });
         const updated =
-          effect.attemptCount >= maxAttempts
+          effect.attemptCount >= orchestrationEffectAttemptLimit(effect.request.type, maxAttempts)
             ? yield* outbox.fail({ effectId: effect.id, workerId, error })
             : yield* outbox.retry({
                 effectId: effect.id,

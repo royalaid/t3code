@@ -1,5 +1,11 @@
 import {
   CommandId,
+  type GoalGraphVersionId,
+  type GoalId,
+  type GoalAttemptId,
+  type GoalAttemptStatus,
+  type GoalNodeId,
+  type GoalNodeStatus,
   type OrchestrationV2Run,
   OrchestrationV2DomainEvent,
   OrchestrationV2StoredEvent,
@@ -97,6 +103,45 @@ export interface EventSinkV2Shape {
   }) => Effect.Effect<
     {
       readonly committed: boolean;
+      readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
+    },
+    EventSinkV2Error
+  >;
+  readonly commitGoalNodeCommand: (input: {
+    readonly commandId: CommandId;
+    readonly threadId: ThreadId;
+    readonly commandType: string;
+    readonly acceptedAt: DateTime.Utc;
+    readonly goalId: GoalId;
+    readonly graphVersionId: GoalGraphVersionId;
+    readonly nodeId: GoalNodeId;
+    readonly expectedStatuses: ReadonlyArray<GoalNodeStatus>;
+    readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
+    readonly effects: ReadonlyArray<PendingOrchestrationEffectV2>;
+  }) => Effect.Effect<
+    {
+      readonly committed: boolean;
+      readonly stale: boolean;
+      readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
+    },
+    EventSinkV2Error
+  >;
+  readonly commitGoalAttemptCommand: (input: {
+    readonly commandId: CommandId;
+    readonly threadId: ThreadId;
+    readonly commandType: string;
+    readonly acceptedAt: DateTime.Utc;
+    readonly goalId: GoalId;
+    readonly graphVersionId: GoalGraphVersionId;
+    readonly nodeId: GoalNodeId;
+    readonly attemptId: GoalAttemptId;
+    readonly expectedStatuses: ReadonlyArray<GoalAttemptStatus>;
+    readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
+    readonly effects: ReadonlyArray<PendingOrchestrationEffectV2>;
+  }) => Effect.Effect<
+    {
+      readonly committed: boolean;
+      readonly stale: boolean;
       readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
     },
     EventSinkV2Error
@@ -391,6 +436,130 @@ const baseLayer: Layer.Layer<
       };
     });
 
+    type GoalCasCommandInput = Pick<
+      Parameters<EventSinkV2Shape["commitGoalNodeCommand"]>[0],
+      "commandId" | "threadId" | "commandType" | "acceptedAt" | "events" | "effects"
+    >;
+    const commitGoalCasCommandEffect = Effect.fn("orchestrationV2.EventSink.commitGoalCasCommand")(
+      function* (input: GoalCasCommandInput, currentMatches: Effect.Effect<boolean, unknown>) {
+        const result = yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const prior = yield* commandReceipts.getByCommandId(input.commandId);
+            if (Option.isSome(prior)) {
+              const existing = yield* existingCommandResult(input.commandId);
+              return {
+                committed: false as const,
+                stale: false as const,
+                storedEvents: existing.storedEvents,
+              };
+            }
+            if (!(yield* currentMatches)) {
+              return {
+                committed: false as const,
+                stale: true as const,
+                storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+              };
+            }
+            const reserved = yield* commandReceipts.insertIfAbsent({
+              commandId: input.commandId,
+              threadId: input.threadId,
+              commandType: input.commandType,
+              acceptedAt: input.acceptedAt,
+              resultSequence: 0,
+              status: "accepted",
+              error: null,
+            });
+            if (!reserved) {
+              const existing = yield* existingCommandResult(input.commandId);
+              return {
+                committed: false as const,
+                stale: false as const,
+                storedEvents: existing.storedEvents,
+              };
+            }
+            const normalized = yield* normalizeEvents(input.events);
+            const storedEvents = yield* eventStore.append({
+              commandId: input.commandId,
+              events: normalized,
+            });
+            const sequence = storedEvents.at(-1)?.sequence;
+            if (sequence === undefined) {
+              return yield* Effect.die(
+                new Error(`Goal CAS command ${input.commandId} produced no events.`),
+              );
+            }
+            yield* applyStoredEvents(storedEvents);
+            yield* effectOutbox.enqueue(input.effects);
+            yield* commandReceipts.upsert({
+              commandId: input.commandId,
+              threadId: input.threadId,
+              commandType: input.commandType,
+              acceptedAt: input.acceptedAt,
+              resultSequence: sequence,
+              status: "accepted",
+              error: null,
+            });
+            return { committed: true as const, stale: false as const, storedEvents };
+          }),
+        );
+        if (input.effects.length > 0) yield* effectOutbox.notifyAvailable;
+        if (result.committed) {
+          yield* eventStore.publishCommitted(result.storedEvents);
+          yield* PubSub.publishAll(liveEvents, result.storedEvents);
+        }
+        return result;
+      },
+    );
+
+    const commitGoalNodeCommandEffect = Effect.fn(
+      "orchestrationV2.EventSink.commitGoalNodeCommand",
+    )(function* (input: Parameters<EventSinkV2Shape["commitGoalNodeCommand"]>[0]) {
+      return yield* commitGoalCasCommandEffect(
+        input,
+        sql<{ readonly status: string }>`
+          SELECT n.status
+          FROM goals g
+          JOIN goal_nodes n
+            ON n.goal_id = g.goal_id
+            AND n.graph_version_id = g.current_graph_version_id
+          WHERE g.goal_id = ${input.goalId}
+            AND g.current_graph_version_id = ${input.graphVersionId}
+            AND n.node_id = ${input.nodeId}
+          LIMIT 1
+        `.pipe(
+          Effect.map(
+            (rows) =>
+              rows[0] !== undefined && input.expectedStatuses.includes(rows[0].status as never),
+          ),
+        ),
+      );
+    });
+
+    const commitGoalAttemptCommandEffect = Effect.fn(
+      "orchestrationV2.EventSink.commitGoalAttemptCommand",
+    )(function* (input: Parameters<EventSinkV2Shape["commitGoalAttemptCommand"]>[0]) {
+      return yield* commitGoalCasCommandEffect(
+        input,
+        sql<{ readonly status: string }>`
+          SELECT a.status
+          FROM goals g
+          JOIN goal_attempts a
+            ON a.goal_id = g.goal_id
+            AND a.graph_version_id = g.current_graph_version_id
+          WHERE g.goal_id = ${input.goalId}
+            AND g.current_graph_version_id = ${input.graphVersionId}
+            AND a.node_id = ${input.nodeId}
+            AND a.attempt_id = ${input.attemptId}
+          LIMIT 1
+        `.pipe(
+          Effect.map(
+            (rows) =>
+              rows[0] !== undefined && input.expectedStatuses.includes(rows[0].status as never),
+          ),
+        ),
+      );
+    });
+
     const commitRejectedCommandEffect = Effect.fn(
       "orchestrationV2.EventSink.commitRejectedCommand",
     )(function* (input: Parameters<EventSinkV2Shape["commitRejectedCommand"]>[0]) {
@@ -508,6 +677,28 @@ const baseLayer: Layer.Layer<
         ),
       commitCommand: (input) =>
         commitCommandEffect(input).pipe(
+          Effect.mapError(
+            (cause) =>
+              new EventSinkWriteError({
+                commandId: input.commandId,
+                eventCount: input.events.length,
+                cause,
+              }),
+          ),
+        ),
+      commitGoalNodeCommand: (input) =>
+        commitGoalNodeCommandEffect(input).pipe(
+          Effect.mapError(
+            (cause) =>
+              new EventSinkWriteError({
+                commandId: input.commandId,
+                eventCount: input.events.length,
+                cause,
+              }),
+          ),
+        ),
+      commitGoalAttemptCommand: (input) =>
+        commitGoalAttemptCommandEffect(input).pipe(
           Effect.mapError(
             (cause) =>
               new EventSinkWriteError({

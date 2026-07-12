@@ -17,12 +17,17 @@ import * as Ref from "effect/Ref";
 
 import { CheckpointRollbackServiceV2 } from "./CheckpointRollbackService.ts";
 import type { OrchestrationEffectV2 } from "./EffectOutbox.ts";
-import { executorLayer, OrchestrationEffectExecutorV2 } from "./EffectWorker.ts";
+import {
+  executorLayer,
+  orchestrationEffectAttemptLimit,
+  OrchestrationEffectExecutorV2,
+} from "./EffectWorker.ts";
 import { RunFinalizationService } from "./RunFinalizationService.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderTurnControlServiceV2 } from "./ProviderTurnControlService.ts";
 import { ProviderTurnStartError, ProviderTurnStartServiceV2 } from "./ProviderTurnStartService.ts";
 import { RuntimeRequestServiceV2 } from "./RuntimeRequestService.ts";
+import { GoalAttemptExecutionService } from "./GoalAttemptExecutionService.ts";
 
 const threadId = ThreadId.make("thread:effect-worker-restart");
 const oldSessionId = ProviderSessionId.make("provider-session:effect-worker-restart:old");
@@ -33,6 +38,11 @@ const providerThreadId = ProviderThreadId.make("provider-thread:effect-worker-re
 const providerTurnId = ProviderTurnId.make("provider-turn:effect-worker-restart");
 const attemptId = RunAttemptId.make("run-attempt:effect-worker-restart");
 const runId = RunId.make("run:effect-worker-restart");
+
+it("limits goal attempt infrastructure launch to one retry", () => {
+  assert.equal(orchestrationEffectAttemptLimit("goal-attempt.launch", 5), 2);
+  assert.equal(orchestrationEffectAttemptLimit("provider-turn.start", 5), 5);
+});
 
 function restartEffect(
   now: DateTime.Utc,
@@ -75,6 +85,10 @@ function makeExecutorLayer(input: {
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const dependencies = Layer.mergeAll(
+    Layer.succeed(
+      GoalAttemptExecutionService,
+      GoalAttemptExecutionService.of({ launch: () => Effect.void }),
+    ),
     Layer.succeed(
       ProviderTurnControlServiceV2,
       ProviderTurnControlServiceV2.of({

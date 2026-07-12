@@ -65,6 +65,7 @@ export const GoalAttemptStatus = Schema.Literals([
   "cancelled",
   "expired",
 ]);
+export type GoalAttemptStatus = typeof GoalAttemptStatus.Type;
 export const GoalWorkspaceMode = Schema.Literals(["read_only", "writer", "integration"]);
 const normalizeGoalTimestamp = (value: string) =>
   Option.match(DateTime.make(value), {
@@ -135,12 +136,14 @@ export const GoalRoutingRequest = Schema.Union([
     costClass: Schema.Literals(["economy", "standard", "premium"]),
   }),
 ]);
+export type GoalRoutingRequest = typeof GoalRoutingRequest.Type;
 export const GoalRouteCandidate = Schema.Struct({
   providerInstanceId: ProviderInstanceId,
   model: TrimmedNonEmptyString,
   capabilities: Schema.Array(TrimmedNonEmptyString),
   unmetConstraints: Schema.Array(TrimmedNonEmptyString),
 });
+export type GoalRouteCandidate = typeof GoalRouteCandidate.Type;
 export const GoalResolvedRoute = Schema.Struct({
   requested: GoalRoutingRequest,
   providerInstanceId: ProviderInstanceId,
@@ -148,6 +151,16 @@ export const GoalResolvedRoute = Schema.Struct({
   capabilitySnapshot: Schema.Array(TrimmedNonEmptyString),
   rationale: TrimmedNonEmptyString,
 });
+export type GoalResolvedRoute = typeof GoalResolvedRoute.Type;
+export const GoalRoutingDecision = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("resolved"), route: GoalResolvedRoute }),
+  Schema.Struct({
+    type: Schema.Literal("ambiguous"),
+    candidates: Schema.Array(GoalRouteCandidate),
+    unmetConstraints: Schema.Array(TrimmedNonEmptyString),
+  }),
+]);
+export type GoalRoutingDecision = typeof GoalRoutingDecision.Type;
 
 export const GoalGraphNode = Schema.Struct({
   id: GoalNodeId,
@@ -210,6 +223,7 @@ export const GoalAttempt = Schema.Struct({
   createdAt: GoalTimestamp,
   updatedAt: GoalTimestamp,
 });
+export type GoalAttempt = typeof GoalAttempt.Type;
 export const GoalArtifact = Schema.Struct({
   id: GoalArtifactId,
   goalId: GoalId,
@@ -240,6 +254,7 @@ export const GoalEvidence = Schema.Struct({
   summary: Schema.String,
   createdAt: GoalTimestamp,
 });
+export type GoalEvidence = typeof GoalEvidence.Type;
 export const GoalWriterCommit = Schema.Struct({
   id: GoalArtifactId,
   goalId: GoalId,
@@ -314,6 +329,7 @@ export const GoalNodeProjection = Schema.Struct({
   blocker: Schema.NullOr(Schema.String),
   updatedAt: GoalTimestamp,
 });
+export type GoalNodeProjection = typeof GoalNodeProjection.Type;
 export const GoalSummary = Schema.Struct({
   id: GoalId,
   status: GoalLifecycleStatus,
@@ -366,6 +382,12 @@ export const GoalFailureReason = Schema.Union([
   }),
   Schema.Struct({ type: Schema.Literal("unsupported_queue_steer"), detail: TrimmedNonEmptyString }),
   Schema.Struct({ type: Schema.Literal("stale_active_run_target"), detail: TrimmedNonEmptyString }),
+  Schema.Struct({
+    type: Schema.Literal("resource_backstop"),
+    limit: PositiveInt,
+    observed: NonNegativeInt,
+    warning: Schema.Boolean,
+  }),
 ]);
 
 export const GoalFailureRecord = Schema.Struct({
