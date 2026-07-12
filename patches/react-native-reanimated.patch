@@ -1,0 +1,12 @@
+diff --git a/android/build.gradle b/android/build.gradle
+index 8167d16df2b2a5d6fa2708775bfefc2b6f950456..d7a7dbd2e62fd180cdf447090fac6b67330ca15a 100644
+--- a/android/build.gradle
++++ b/android/build.gradle
+@@ -186,6 +186,7 @@ android {
+     }
+     externalNativeBuild {
+         cmake {
++            buildStagingDirectory new File(rootProject.rootDir, ".cxx/reanimated")
+             version = System.getenv("CMAKE_VERSION") ?: "3.22.1"
+             path "CMakeLists.txt"
+         }
