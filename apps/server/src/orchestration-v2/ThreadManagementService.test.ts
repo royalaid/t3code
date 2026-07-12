@@ -43,6 +43,8 @@ it("stamps authoritative provenance on commands that create threads or messages"
 it("leaves commands that do not create durable authored content unchanged", () => {
   const command: OrchestrationV2Command = {
     type: "run.interrupt",
+    createdBy: "user",
+    creationSource: "web",
     commandId: CommandId.make("command:thread-management:interrupt"),
     threadId: ThreadId.make("thread:thread-management:interrupt"),
     runId: RunId.make("run:thread-management:interrupt"),

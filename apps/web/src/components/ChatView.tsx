@@ -146,6 +146,8 @@ import { RightPanelTabs } from "./RightPanelTabs";
 import { DiffWorkerPoolProvider } from "./DiffWorkerPoolProvider";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
+import { GoalWorkflowPanel } from "./goal/GoalWorkflowPanel";
+import { GoalRootControl } from "./goal/GoalRootControl";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
 import { ChevronDownIcon } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
@@ -1167,6 +1169,7 @@ function ChatViewContent(props: ChatViewProps) {
   const threadPanelPopoverAnchorRef = useRef<HTMLElement | null>(null);
   // Tracks whether the user explicitly dismissed the sidebar for the active turn.
   const planSidebarDismissedForTurnRef = useRef<string | null>(null);
+  const autoOpenedGoalIdsRef = useRef<Set<string>>(new Set());
   // When set, the thread-change reset effect will open the sidebar instead of closing it.
   // Used by "Implement in a new thread" to carry the sidebar-open intent across navigation.
   const planSidebarOpenOnNextThreadRef = useRef(false);
@@ -1400,6 +1403,12 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const previewPanelOpen = activeRightPanelKind === "preview" && isPreviewSupportedInRuntime();
   const rightPanelOpen = rightPanelState.isOpen;
+  useEffect(() => {
+    const goal = serverProjection?.goal;
+    if (!activeThreadRef || !goal || autoOpenedGoalIdsRef.current.has(goal.goal.id)) return;
+    autoOpenedGoalIdsRef.current.add(goal.goal.id);
+    useRightPanelStore.getState().open(activeThreadRef, "goal");
+  }, [activeThreadRef, serverProjection?.goal]);
   const canMaximizeRightPanel = rightPanelOpen && !shouldUsePlanSidebarSheet;
   const rightPanelMaximized =
     canMaximizeRightPanel && maximizedRightPanelThreadKey === routeThreadKey;
@@ -5134,7 +5143,9 @@ function ChatViewContent(props: ChatViewProps) {
   }
 
   const rightPanelContent = activeThreadRef ? (
-    activeRightPanelSurface?.kind === "preview" ? (
+    activeRightPanelSurface?.kind === "goal" && serverProjection?.goal ? (
+      <GoalWorkflowPanel detail={serverProjection.goal} />
+    ) : activeRightPanelSurface?.kind === "preview" ? (
       <Suspense fallback={null}>
         <PreviewPanel
           mode="embedded"
@@ -5432,6 +5443,13 @@ function ChatViewContent(props: ChatViewProps) {
               </div>
               <div className="chat-composer-horizontal-inset">
                 <div className="pointer-events-auto relative z-10 isolate">
+                  {isServerThread && activeThread && serverProjection?.goal ? (
+                    <GoalRootControl
+                      environmentId={activeThread.environmentId}
+                      threadId={activeThread.id}
+                      detail={serverProjection.goal}
+                    />
+                  ) : null}
                   {isServerThread && activeThread ? (
                     <QueuedRunsControl
                       environmentId={activeThread.environmentId}

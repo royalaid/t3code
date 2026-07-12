@@ -1330,6 +1330,8 @@ const make = Effect.gen(function* () {
         yield* threadManagement
           .dispatch({
             type: "run.interrupt",
+            createdBy: "agent",
+            creationSource: "mcp",
             commandId: stableCommandId({
               scope,
               requestKey: key,

@@ -174,6 +174,8 @@ export const layer = Layer.effect(
         yield* threads
           .dispatch({
             type: "run.interrupt",
+            createdBy: "system",
+            creationSource: "server",
             commandId: CommandId.make(`goal-worker-ceiling-interrupt:${attempt.id}`),
             threadId: attempt.executionThreadId,
             runId: attempt.runId,
@@ -341,6 +343,8 @@ export const layer = Layer.effect(
         yield* threads
           .dispatch({
             type: "run.interrupt",
+            createdBy: "system",
+            creationSource: "server",
             commandId: CommandId.make(`goal-native-overage-interrupt:${attempt.id}`),
             threadId: domainEvent.threadId,
             runId: attempt.runId,
@@ -350,9 +354,92 @@ export const layer = Layer.effect(
       }
     });
 
+    const cancelGoalRuns = Effect.fn("GoalWorkflowService.cancelGoalRuns")(function* (
+      domainEvent: OrchestrationV2DomainEvent,
+    ) {
+      if (domainEvent.type !== "goal.cancelled") return;
+      const detail = yield* goals
+        .getDetail(domainEvent.payload.id)
+        .pipe(Effect.mapError(workflowError("read-cancelled-goal")));
+      const root = yield* threads
+        .getThreadProjection(detail.goal.rootThreadId)
+        .pipe(Effect.mapError(workflowError("read-cancelled-root")));
+      const targets = [
+        ...root.runs
+          .filter((run) => ACTIVE_RUN_STATUSES.has(run.status))
+          .map((run) => ({ threadId: detail.goal.rootThreadId, runId: run.id })),
+        ...detail.attempts.flatMap((attempt) =>
+          attempt.executionThreadId !== null &&
+          attempt.runId !== null &&
+          ["leased", "launching", "running", "stalled"].includes(attempt.status)
+            ? [{ threadId: attempt.executionThreadId, runId: attempt.runId }]
+            : [],
+        ),
+      ];
+      yield* Effect.forEach(
+        targets,
+        (target) =>
+          threads.dispatch({
+            type: "run.interrupt",
+            createdBy: "system",
+            creationSource: "server",
+            commandId: CommandId.make(`goal-cancel-interrupt:${detail.goal.id}:${target.runId}`),
+            threadId: target.threadId,
+            runId: target.runId,
+            reason: "Goal cancelled by the user.",
+          }),
+        { concurrency: 4, discard: true },
+      );
+    });
+
+    const pauseForRootControl = Effect.fn("GoalWorkflowService.pauseForRootControl")(function* (
+      domainEvent: OrchestrationV2DomainEvent,
+    ) {
+      if (domainEvent.type !== "run.updated") return;
+      if (
+        !ACTIVE_RUN_STATUSES.has(domainEvent.payload.status) &&
+        domainEvent.payload.status !== "interrupted"
+      )
+        return;
+      const binding = yield* goals
+        .resolveMcpBinding(domainEvent.threadId)
+        .pipe(Effect.mapError(workflowError("resolve-root-control")));
+      if (binding?.kind !== "lead") return;
+      const detail = yield* goals
+        .getDetail(binding.goalId)
+        .pipe(Effect.mapError(workflowError("read-root-control-goal")));
+      if (detail.goal.status !== "running") return;
+      const now = yield* DateTime.now;
+      const timestamp = DateTime.formatIso(now);
+      const commandId = CommandId.make(`goal-root-control-pause:${domainEvent.id}`);
+      const eventId = yield* ids.allocate
+        .event({ threadId: detail.goal.rootThreadId, commandId })
+        .pipe(Effect.mapError(workflowError("allocate-root-control-event")));
+      yield* eventSink
+        .commitCommand({
+          commandId,
+          threadId: detail.goal.rootThreadId,
+          commandType: "goal.root-control.pause",
+          acceptedAt: now,
+          events: [
+            {
+              id: eventId,
+              threadId: detail.goal.rootThreadId,
+              type: "goal.updated",
+              payload: { ...detail.goal, status: "paused", updatedAt: timestamp },
+              occurredAt: now,
+            },
+          ],
+          effects: [],
+        })
+        .pipe(Effect.mapError(workflowError("persist-root-control-pause")));
+    });
+
     const observe = eventSink.stream().pipe(
       Stream.runForEach((stored) =>
-        updateAttempt(stored.event).pipe(
+        cancelGoalRuns(stored.event).pipe(
+          Effect.andThen(pauseForRootControl(stored.event)),
+          Effect.andThen(updateAttempt(stored.event)),
           Effect.andThen(stored.event.type.startsWith("goal.") ? reconcile : Effect.void),
           Effect.catchCause((cause) =>
             Effect.logError("Goal workflow event processing failed", {

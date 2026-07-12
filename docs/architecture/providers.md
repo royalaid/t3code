@@ -13,7 +13,7 @@ Methods mirror the `NativeApi` interface defined in `@t3tools/contracts`:
 - `providers.respondToRequest`, `providers.stopSession`
 - `shell.openInEditor`, `server.getConfig`
 
-Codex is the only implemented provider. `claudeCode` is reserved in contracts/UI.
+The V2 registry supports installed Codex, Claude, Cursor, ACP-registry, and other configured adapters through one capability contract. Provider behavior remains adapter-native; the scheduler filters live capability snapshots and policy allowlists, and it never treats a provider name as a hidden ranking rule. Dynamic goal workers may use any authenticated V2 instance that satisfies the node request, while every resolved provider and model is persisted for replay and recovery.
 
 ## Client transport
 

@@ -146,44 +146,48 @@ export function useThreadComposerState() {
 
   const activeThreadBusy = threadRuntimeIsActive(selectedThreadRuntime);
 
-  const onSendMessage = useCallback(async () => {
-    if (!selectedThreadShell) {
-      return null;
-    }
+  const onSendMessage = useCallback(
+    async (dispatchMode: "auto" | "queue" | "steer" = "auto") => {
+      if (!selectedThreadShell) {
+        return null;
+      }
 
-    const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
-    const draft = getComposerDraftSnapshot(threadKey);
-    const thread = selectedThreadShell;
-    const text = draft.text.trim();
-    const attachments = draft.attachments;
-    if (text.length === 0 && attachments.length === 0) {
-      return null;
-    }
+      const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+      const draft = getComposerDraftSnapshot(threadKey);
+      const thread = selectedThreadShell;
+      const text = draft.text.trim();
+      const attachments = draft.attachments;
+      if (text.length === 0 && attachments.length === 0) {
+        return null;
+      }
 
-    const metadata = makeQueuedMessageMetadata();
-    const messageId = MessageId.make(metadata.messageId);
-    try {
-      await enqueueThreadOutboxMessage({
-        environmentId: selectedThreadShell.environmentId,
-        threadId: selectedThreadShell.id,
-        messageId,
-        commandId: CommandId.make(metadata.commandId),
-        text,
-        attachments,
-        modelSelection: draft.modelSelection ?? thread.modelSelection,
-        runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
-        interactionMode: draft.interactionMode ?? thread.interactionMode,
-        createdAt: metadata.createdAt,
-      });
-      clearComposerDraftContent(threadKey);
-      return messageId;
-    } catch (error) {
-      setPendingConnectionError(
-        error instanceof Error ? error.message : "Failed to save the queued message.",
-      );
-      return null;
-    }
-  }, [selectedThreadShell]);
+      const metadata = makeQueuedMessageMetadata();
+      const messageId = MessageId.make(metadata.messageId);
+      try {
+        await enqueueThreadOutboxMessage({
+          environmentId: selectedThreadShell.environmentId,
+          threadId: selectedThreadShell.id,
+          messageId,
+          commandId: CommandId.make(metadata.commandId),
+          text,
+          attachments,
+          modelSelection: draft.modelSelection ?? thread.modelSelection,
+          runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
+          interactionMode: draft.interactionMode ?? thread.interactionMode,
+          dispatchMode,
+          createdAt: metadata.createdAt,
+        });
+        clearComposerDraftContent(threadKey);
+        return messageId;
+      } catch (error) {
+        setPendingConnectionError(
+          error instanceof Error ? error.message : "Failed to save the queued message.",
+        );
+        return null;
+      }
+    },
+    [selectedThreadShell],
+  );
 
   const onChangeDraftMessage = useCallback(
     (value: string) => {

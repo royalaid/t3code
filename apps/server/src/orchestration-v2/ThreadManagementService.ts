@@ -441,6 +441,8 @@ const make = Effect.gen(function* () {
       }
       const dispatch = yield* orchestrator.dispatch({
         type: "run.interrupt",
+        createdBy: "system",
+        creationSource: "server",
         commandId: input.commandId,
         threadId: input.threadId,
         runId: interruptibleRun.id,

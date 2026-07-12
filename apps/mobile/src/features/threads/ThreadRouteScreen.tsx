@@ -451,6 +451,7 @@ function ThreadRouteContent(
       environmentId: selectedThread.environmentId,
       input: {
         threadId: selectedThread.id,
+        creationSource: "mobile",
         ...(runtime.activeRunId ? { runId: runtime.activeRunId } : {}),
       },
     });

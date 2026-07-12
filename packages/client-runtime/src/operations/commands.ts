@@ -4,6 +4,7 @@ import {
   OrchestrationV2CheckpointUnavailableError,
   WS_METHODS,
   type ChatAttachment,
+  type GoalId,
   type MessageId,
   type ModelSelection,
   type OrchestrationV2Command,
@@ -130,6 +131,11 @@ export interface LaunchGoalInput extends ThreadCommandInput {
   readonly messageId: MessageId;
   readonly attachments: ReadonlyArray<ChatAttachment | UploadChatAttachment>;
   readonly selectedContextText: ReadonlyArray<string>;
+}
+
+export interface CancelGoalInput extends ThreadCommandInput {
+  readonly goalId: GoalId;
+  readonly reason?: string;
 }
 
 export interface ProvisionGoalSourceInput extends CreateThreadInput {
@@ -547,6 +553,18 @@ export const launchGoal = Effect.fn("EnvironmentCommands.launchGoal")(function* 
   });
 });
 
+export const cancelGoal = Effect.fn("EnvironmentCommands.cancelGoal")(function* (
+  input: CancelGoalInput,
+) {
+  return yield* dispatch({
+    type: "goal.cancel",
+    commandId: yield* allocateCommandId(input),
+    threadId: input.threadId,
+    goalId: input.goalId,
+    ...(input.reason === undefined ? {} : { reason: input.reason }),
+  });
+});
+
 /** Provision a durable goal source thread/workspace without starting a provider turn. */
 export const provisionGoalSource = Effect.fn("EnvironmentCommands.provisionGoalSource")(function* (
   input: ProvisionGoalSourceInput,
@@ -583,6 +601,8 @@ export const interruptThreadTurn = Effect.fn("EnvironmentCommands.interruptThrea
   if (runId === undefined) return { sequence: 0 };
   return yield* dispatch({
     type: "run.interrupt",
+    createdBy: "user",
+    creationSource: input.creationSource ?? "web",
     commandId: yield* allocateCommandId(input),
     threadId: input.threadId,
     runId,
@@ -697,6 +717,8 @@ export const reorderQueuedRun = Effect.fn("EnvironmentCommands.reorderQueuedRun"
 ) {
   return yield* dispatch({
     type: "queued-run.reorder",
+    createdBy: "user",
+    creationSource: input.creationSource ?? "web",
     commandId: yield* allocateCommandId(input),
     threadId: input.threadId,
     runId: input.runId,
@@ -709,6 +731,8 @@ export const promoteQueuedRun = Effect.fn("EnvironmentCommands.promoteQueuedRun"
 ) {
   return yield* dispatch({
     type: "queued-message.promote-to-steer",
+    createdBy: "user",
+    creationSource: input.creationSource ?? "web",
     commandId: yield* allocateCommandId(input),
     threadId: input.threadId,
     queuedRunId: input.queuedRunId,

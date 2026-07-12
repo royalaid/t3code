@@ -1897,6 +1897,7 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("run.interrupt"),
+    ...OrchestrationV2CreationFields,
     commandId: CommandId,
     threadId: ThreadId,
     runId: RunId,
@@ -1904,6 +1905,7 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("queued-message.promote-to-steer"),
+    ...OrchestrationV2CreationFields,
     commandId: CommandId,
     threadId: ThreadId,
     queuedRunId: RunId,
@@ -1911,6 +1913,7 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("queued-run.reorder"),
+    ...OrchestrationV2CreationFields,
     commandId: CommandId,
     threadId: ThreadId,
     runId: RunId,

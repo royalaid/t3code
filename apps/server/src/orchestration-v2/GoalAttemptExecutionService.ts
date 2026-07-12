@@ -17,6 +17,7 @@ import * as Schema from "effect/Schema";
 import { EventSinkV2 } from "./EventSink.ts";
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
+import { GoalWorkspaceService } from "./GoalWorkspaceService.ts";
 import { ThreadManagementService } from "./ThreadManagementService.ts";
 
 export function goalWorkerPrompt(input: {
@@ -78,6 +79,7 @@ export const layer = Layer.effect(
     const threads = yield* ThreadManagementService;
     const events = yield* EventSinkV2;
     const ids = yield* IdAllocatorV2;
+    const workspaces = yield* GoalWorkspaceService;
 
     const launch = Effect.fn("GoalAttemptExecutionService.launch")(function* (input: {
       readonly goalId: GoalDetail["goal"]["id"];
@@ -106,14 +108,9 @@ export const layer = Layer.effect(
       if (projection === undefined) {
         return yield* failure("read-node", input.attemptId)("Attempt node does not exist.");
       }
-      if (projection.node.workspaceMode !== "read_only") {
-        return yield* failure(
-          "resolve-workspace",
-          input.attemptId,
-        )(
-          "Writer and integration attempts require an isolated workspace from GoalWorkspaceService.",
-        );
-      }
+      const workspace = yield* workspaces
+        .prepareAttempt(input)
+        .pipe(Effect.mapError(failure("resolve-workspace", input.attemptId)));
       const projectId = detail.goal.projectId;
       if (projectId === undefined) {
         return yield* failure("resolve-project", input.attemptId)("Goal has no project identity.");
@@ -138,8 +135,8 @@ export const layer = Layer.effect(
                 ? "auto-accept-edits"
                 : "full-access",
           interactionMode: detail.goal.rootInteractionMode ?? "default",
-          branch: null,
-          worktreePath: null,
+          branch: workspace.branch,
+          worktreePath: workspace.path,
           createdBy: "system",
           creationSource: "server",
         })
@@ -183,6 +180,8 @@ export const layer = Layer.effect(
           ...attempt,
           status: "launching",
           executionThreadId,
+          baseIntegrationSha: workspace.baseSha,
+          workspacePath: workspace.path,
           leaseExpiresAt: DateTime.formatIso(DateTime.add(now, { minutes: 10 })),
           updatedAt: DateTime.formatIso(now),
         };

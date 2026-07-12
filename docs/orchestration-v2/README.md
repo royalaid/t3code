@@ -16,6 +16,7 @@ V2 is designed around the real provider behavior observed in the Codex app-serve
 - [Orchestrator MCP Server](./orchestrator-mcp-server.md)
 - [Provider Capability System](./provider-capability-system.md)
 - [Testing Strategy](./testing-strategy.md)
+- [Dynamic Goal Workflows](./goal-workflows.md)
 
 ## Primary Goals
 

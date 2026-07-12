@@ -615,6 +615,8 @@ export function materializeFixtureInput(input: {
           pushDispatch(
             {
               type: "run.interrupt",
+              createdBy: "system",
+              creationSource: "server",
               commandId: yield* idAllocator.allocate.command({
                 fixtureName: input.scenario,
                 commandName: `interrupt-${step.targetRunIndex}`,

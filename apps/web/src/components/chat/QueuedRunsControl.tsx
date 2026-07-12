@@ -18,7 +18,7 @@ export function QueuedRunsControl(props: {
   )?.projection;
   const reorder = useAtomCommand(threadEnvironment.reorderQueuedRun);
   const promote = useAtomCommand(threadEnvironment.promoteQueuedRun);
-  const [busyRunId, setBusyRunId] = useState<RunId | null>(null);
+  const [busyRunIds, setBusyRunIds] = useState<ReadonlySet<RunId>>(() => new Set());
   const workflow = useMemo(
     () => (projection ? deriveThreadQueueWorkflowState(projection) : null),
     [projection],
@@ -29,22 +29,36 @@ export function QueuedRunsControl(props: {
   if (queued.length === 0) return null;
 
   const move = async (runId: RunId, beforeRunId: RunId | null) => {
-    setBusyRunId(runId);
-    await reorder({
-      environmentId: props.environmentId,
-      input: { threadId: props.threadId, runId, beforeRunId },
-    });
-    setBusyRunId(null);
+    setBusyRunIds((current) => new Set(current).add(runId));
+    try {
+      await reorder({
+        environmentId: props.environmentId,
+        input: { threadId: props.threadId, runId, beforeRunId },
+      });
+    } finally {
+      setBusyRunIds((current) => {
+        const next = new Set(current);
+        next.delete(runId);
+        return next;
+      });
+    }
   };
 
   const steer = async (queuedRunId: RunId) => {
     if (activeRun === null) return;
-    setBusyRunId(queuedRunId);
-    await promote({
-      environmentId: props.environmentId,
-      input: { threadId: props.threadId, queuedRunId, targetRunId: activeRun.id },
-    });
-    setBusyRunId(null);
+    setBusyRunIds((current) => new Set(current).add(queuedRunId));
+    try {
+      await promote({
+        environmentId: props.environmentId,
+        input: { threadId: props.threadId, queuedRunId, targetRunId: activeRun.id },
+      });
+    } finally {
+      setBusyRunIds((current) => {
+        const next = new Set(current);
+        next.delete(queuedRunId);
+        return next;
+      });
+    }
   };
 
   return (
@@ -65,7 +79,7 @@ export function QueuedRunsControl(props: {
               size="icon-xs"
               variant="ghost"
               aria-label="Move queued message up"
-              disabled={busyRunId !== null || !workflow?.canReorder || index === 0}
+              disabled={busyRunIds.has(run.id) || !workflow?.canReorder || index === 0}
               onClick={() => void move(run.id, queued[index - 1]?.run.id ?? null)}
             >
               <ArrowUpIcon className="size-3" />
@@ -74,7 +88,9 @@ export function QueuedRunsControl(props: {
               size="icon-xs"
               variant="ghost"
               aria-label="Move queued message down"
-              disabled={busyRunId !== null || !workflow?.canReorder || index === queued.length - 1}
+              disabled={
+                busyRunIds.has(run.id) || !workflow?.canReorder || index === queued.length - 1
+              }
               onClick={() => void move(run.id, queued[index + 2]?.run.id ?? null)}
             >
               <ArrowDownIcon className="size-3" />
@@ -82,7 +98,7 @@ export function QueuedRunsControl(props: {
             <Button
               size="xs"
               variant="outline"
-              disabled={busyRunId !== null || !workflow?.canPromoteToSteer}
+              disabled={busyRunIds.has(run.id) || !workflow?.canPromoteToSteer}
               title={activeRun === null ? "There is no active run to steer" : "Promote to steer"}
               onClick={() => void steer(run.id)}
             >

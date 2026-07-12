@@ -44,6 +44,8 @@ export class GoalProjectionValidationError extends Schema.TaggedErrorClass<GoalP
       "cycle",
       "structural_limit",
       "policy_expansion",
+      "stale_evidence",
+      "independent_verification_required",
       "referential_integrity",
       "persistence_error",
     ]),
@@ -525,6 +527,7 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
           });
           const nextGoal = {
             ...goal,
+            status: "running" as const,
             currentGraphVersionId: input.graph.id,
             currentRevision: input.graph.revision,
             verifiedSha: null,
@@ -532,7 +535,7 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
           };
           const nextGoalPayload = yield* encodeGoal(nextGoal);
           const claimed = yield* sql<{ readonly goal_id: string }>`UPDATE goals
-            SET current_graph_version_id=${input.graph.id}, current_revision=${input.graph.revision},
+            SET status='running', current_graph_version_id=${input.graph.id}, current_revision=${input.graph.revision},
               verified_sha=NULL, payload_json=${nextGoalPayload}, updated_at=${input.graph.createdAt}
             WHERE goal_id=${input.goalId} AND current_revision=${input.expectedRevision}
             RETURNING goal_id`;
@@ -758,12 +761,37 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         }
         case "goal.evidence-submitted":
         case "goal.verdict-recorded": {
-          yield* requireAttempt(
+          const verifierAttempt = yield* requireAttempt(
             event.payload.attemptId,
             event.payload.goalId,
             event.payload.nodeId,
           );
-          yield* requireAttemptForGoal(event.payload.producerAttemptId, event.payload.goalId);
+          const producerAttempt = yield* requireAttemptForGoal(
+            event.payload.producerAttemptId,
+            event.payload.goalId,
+          );
+          if (event.payload.verdict === "accepted") {
+            const goal = yield* readGoal(event.payload.goalId);
+            if (
+              goal.integrationSha === null ||
+              event.payload.integrationSha !== goal.integrationSha
+            )
+              return yield* new GoalProjectionValidationError({
+                reason: "stale_evidence",
+                detail: `Accepted evidence targets ${event.payload.integrationSha}, current integration SHA is ${goal.integrationSha ?? "unavailable"}.`,
+              });
+            if (
+              verifierAttempt.id === producerAttempt.id ||
+              verifierAttempt.nodeId === producerAttempt.nodeId ||
+              verifierAttempt.executionThreadId === null ||
+              producerAttempt.executionThreadId === null ||
+              verifierAttempt.executionThreadId === producerAttempt.executionThreadId
+            )
+              return yield* new GoalProjectionValidationError({
+                reason: "independent_verification_required",
+                detail: "Accepted evidence requires a distinct verifier attempt, node, and thread.",
+              });
+          }
           for (const artifactId of new Set([
             ...event.payload.artifacts,
             ...event.payload.commands.flatMap((command) =>

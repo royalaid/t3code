@@ -289,6 +289,8 @@ export const GoalSourceHandoff = Schema.Struct({
 export const Goal = Schema.Struct({
   id: GoalId,
   projectId: Schema.optional(ProjectId),
+  repositoryRoot: Schema.optional(GoalHandoffText),
+  sourceWorkspacePath: Schema.optional(GoalHandoffText),
   objective: TrimmedNonEmptyString,
   status: GoalLifecycleStatus,
   sourceThreadId: ThreadId,

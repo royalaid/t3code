@@ -22,34 +22,49 @@ export function ThreadQueueControl(props: {
   );
   const reorder = useAtomCommand(threadEnvironment.reorderQueuedRun, "reorder queued message");
   const promote = useAtomCommand(threadEnvironment.promoteQueuedRun, "promote queued message");
-  const [busyRunId, setBusyRunId] = useState<RunId | null>(null);
+  const [busyRunIds, setBusyRunIds] = useState<ReadonlySet<RunId>>(() => new Set());
   const iconColor = useThemeColor("--color-icon-subtle");
 
   if (!workflow || workflow.queuedRuns.length === 0) return null;
 
   const move = async (runId: RunId, beforeRunId: RunId | null) => {
-    setBusyRunId(runId);
+    setBusyRunIds((current) => new Set(current).add(runId));
     void Haptics.selectionAsync();
-    await reorder({
-      environmentId: props.environmentId,
-      input: { threadId: props.threadId, runId, beforeRunId },
-    });
-    setBusyRunId(null);
+    try {
+      await reorder({
+        environmentId: props.environmentId,
+        input: { threadId: props.threadId, runId, beforeRunId, creationSource: "mobile" },
+      });
+    } finally {
+      setBusyRunIds((current) => {
+        const next = new Set(current);
+        next.delete(runId);
+        return next;
+      });
+    }
   };
 
   const steer = async (queuedRunId: RunId) => {
     if (!workflow.activeRun || !workflow.canPromoteToSteer) return;
-    setBusyRunId(queuedRunId);
+    setBusyRunIds((current) => new Set(current).add(queuedRunId));
     void Haptics.selectionAsync();
-    await promote({
-      environmentId: props.environmentId,
-      input: {
-        threadId: props.threadId,
-        queuedRunId,
-        targetRunId: workflow.activeRun.id,
-      },
-    });
-    setBusyRunId(null);
+    try {
+      await promote({
+        environmentId: props.environmentId,
+        input: {
+          threadId: props.threadId,
+          creationSource: "mobile",
+          queuedRunId,
+          targetRunId: workflow.activeRun.id,
+        },
+      });
+    } finally {
+      setBusyRunIds((current) => {
+        const next = new Set(current);
+        next.delete(queuedRunId);
+        return next;
+      });
+    }
   };
 
   return (
@@ -73,7 +88,7 @@ export function ThreadQueueControl(props: {
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Move queued message up"
-              disabled={busyRunId !== null || !workflow.canReorder || index === 0}
+              disabled={busyRunIds.has(run.id) || !workflow.canReorder || index === 0}
               onPress={() => void move(run.id, workflow.queuedRuns[index - 1]?.run.id ?? null)}
               className="h-9 w-9 items-center justify-center disabled:opacity-30"
             >
@@ -83,7 +98,7 @@ export function ThreadQueueControl(props: {
               accessibilityRole="button"
               accessibilityLabel="Move queued message down"
               disabled={
-                busyRunId !== null ||
+                busyRunIds.has(run.id) ||
                 !workflow.canReorder ||
                 index === workflow.queuedRuns.length - 1
               }
@@ -95,7 +110,7 @@ export function ThreadQueueControl(props: {
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Promote queued message to steer"
-              disabled={busyRunId !== null || !workflow.canPromoteToSteer}
+              disabled={busyRunIds.has(run.id) || !workflow.canPromoteToSteer}
               onPress={() => void steer(run.id)}
               className="min-h-8 flex-row items-center gap-1 rounded-lg border border-neutral-300/60 px-2 disabled:opacity-30 dark:border-white/[0.1]"
             >

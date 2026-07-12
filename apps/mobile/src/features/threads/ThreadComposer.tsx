@@ -105,7 +105,7 @@ export interface ThreadComposerProps {
   readonly onNativePasteImages: (uris: ReadonlyArray<string>) => Promise<void>;
   readonly onRemoveDraftImage: (imageId: string) => void;
   readonly onStopThread: () => void;
-  readonly onSendMessage: () => Promise<MessageId | null>;
+  readonly onSendMessage: (dispatchMode?: "auto" | "queue" | "steer") => Promise<MessageId | null>;
   readonly onUpdateModelSelection: (modelSelection: ModelSelection) => void;
   readonly onUpdateRuntimeMode: (runtimeMode: RuntimeMode) => void;
   readonly onUpdateInteractionMode: (interactionMode: ProviderInteractionMode) => void;
@@ -292,8 +292,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   }, [onExpandedChange]);
   const showStopAction = threadRuntimeIsActive(props.selectedThread.runtime);
 
-  const sendLabel =
-    props.connectionState !== "connected" || props.activeThreadBusy || props.queueCount > 0
+  const sendLabel = showStopAction
+    ? "Steer"
+    : props.connectionState !== "connected" || props.queueCount > 0
       ? "Queue"
       : "Send";
   const currentModelSelection = props.selectedThread.modelSelection;
@@ -504,28 +505,31 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   // ── Handle command selection ──────────────────────────────
   const { onChangeDraftMessage, onUpdateInteractionMode, draftMessage, onSendMessage } = props;
 
-  const handleSend = useCallback(async () => {
-    const threadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
-    if (inFlightThreadIdsRef.current.has(threadKey)) return;
-    inFlightThreadIdsRef.current.add(threadKey);
-    // Sending a prompt starts agent work: arm the lock-screen card now, while
-    // the app is foregrounded and the activity token can be registered.
-    armAgentAwarenessLiveActivityForLocalWork({
-      threadTitle: props.selectedThread.title,
-      projectTitle: props.environmentLabel ?? "T3 Code",
-    });
-    try {
-      await onSendMessage();
-    } finally {
-      inFlightThreadIdsRef.current.delete(threadKey);
-    }
-  }, [
-    onSendMessage,
-    props.environmentId,
-    props.environmentLabel,
-    props.selectedThread.id,
-    props.selectedThread.title,
-  ]);
+  const handleSend = useCallback(
+    async (dispatchMode: "auto" | "queue" | "steer" = "auto") => {
+      const threadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
+      if (inFlightThreadIdsRef.current.has(threadKey)) return;
+      inFlightThreadIdsRef.current.add(threadKey);
+      // Sending a prompt starts agent work: arm the lock-screen card now, while
+      // the app is foregrounded and the activity token can be registered.
+      armAgentAwarenessLiveActivityForLocalWork({
+        threadTitle: props.selectedThread.title,
+        projectTitle: props.environmentLabel ?? "T3 Code",
+      });
+      try {
+        await onSendMessage(dispatchMode);
+      } finally {
+        inFlightThreadIdsRef.current.delete(threadKey);
+      }
+    },
+    [
+      onSendMessage,
+      props.environmentId,
+      props.environmentLabel,
+      props.selectedThread.id,
+      props.selectedThread.title,
+    ],
+  );
   const handleCommandSelect = useCallback(
     (item: ComposerCommandItem) => {
       if (!composerTrigger) return;
@@ -828,7 +832,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                   icon="arrow.up"
                   variant="primary"
                   disabled={!canSend}
-                  onPress={handleSend}
+                  onPress={() => void handleSend()}
                 />
               )}
             </Animated.View>
@@ -871,12 +875,27 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                   />
                 </ControlPillMenu>
                 {showStopAction ? (
-                  <ComposerToolbarButton
-                    icon="stop.fill"
-                    variant="danger"
-                    onPress={props.onStopThread}
-                    showChevron={false}
-                  />
+                  <>
+                    <ComposerToolbarButton
+                      accessibilityLabel="Steer active turn"
+                      icon="arrow.turn.up.right"
+                      label="Steer"
+                      onPress={() => void handleSend("steer")}
+                    />
+                    <ComposerToolbarButton
+                      accessibilityLabel="Queue follow-up"
+                      icon="text.badge.plus"
+                      label="Queue"
+                      onPress={() => void handleSend("queue")}
+                    />
+                    <ComposerToolbarButton
+                      accessibilityLabel="Stop active turn"
+                      icon="stop.fill"
+                      variant="danger"
+                      onPress={props.onStopThread}
+                      showChevron={false}
+                    />
+                  </>
                 ) : null}
               </ComposerToolbarScroller>
               <ComposerToolbarButton
@@ -884,7 +903,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                 icon="arrow.up"
                 variant="primary"
                 disabled={!canSend}
-                onPress={handleSend}
+                onPress={() => void handleSend()}
                 showChevron={false}
               />
             </ComposerToolbarRow>

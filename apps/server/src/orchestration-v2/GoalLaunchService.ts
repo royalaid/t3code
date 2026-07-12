@@ -14,6 +14,7 @@ import * as Path from "effect/Path";
 
 import { EventSinkV2 } from "./EventSink.ts";
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
+import { GoalWorkspaceService } from "./GoalWorkspaceService.ts";
 import { ThreadLaunchService } from "./ThreadLaunchService.ts";
 import { ThreadManagementService } from "./ThreadManagementService.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -148,6 +149,7 @@ export const layer = Layer.effect(
   GoalLaunchService,
   Effect.gen(function* () {
     const goals = yield* GoalProjectionStore;
+    const workspaces = yield* GoalWorkspaceService;
     const events = yield* EventSinkV2;
     const launches = yield* ThreadLaunchService;
     const threads = yield* ThreadManagementService;
@@ -199,6 +201,12 @@ export const layer = Layer.effect(
         worktreePath: source.thread.worktreePath,
         checkpoints: source.checkpoints,
       });
+      const provisioned = yield* workspaces.provision(current.goal.id);
+      const integrationWorktreePath = provisioned.goal.integrationWorktreePath;
+      const integrationBranch = provisioned.goal.integrationBranch;
+      if (integrationWorktreePath === null || integrationBranch === null) {
+        return yield* Effect.die("Goal integration workspace was not provisioned.");
+      }
       yield* launches.launch({
         commandId: CommandId.make(`goal-root-launch:${current.goal.id}`),
         threadId: current.goal.rootThreadId,
@@ -214,7 +222,11 @@ export const layer = Layer.effect(
         interactionMode:
           current.goal.rootInteractionMode ??
           (yield* Effect.die("Goal is missing its interaction mode.")),
-        workspaceStrategy: { type: "root" },
+        workspaceStrategy: {
+          type: "existing_worktree",
+          worktreePath: integrationWorktreePath,
+          branch: integrationBranch,
+        },
         initialMessage: {
           text: `Goal objective:\n${current.goal.objective}\n\nSource summary:\n${handoff.sourceSummary ?? "The source thread has no conversation history."}\n\nProject instructions:\n${handoff.projectInstructions.join("\n\n") || "No project instruction file was found."}\n\nBranch state:\n${handoff.branchState ?? "Unknown"}\n\nRelevant checkpoints:\n${handoff.relevantCheckpoints.join("\n") || "None"}\n\nSelected context:\n${handoff.selectedContextText.join("\n\n") || "None"}`,
           attachments: handoff.attachments,

@@ -42,6 +42,7 @@ import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
 import { EventSinkV2 } from "./EventSink.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
+import { GoalProjectionStore } from "./GoalProjectionStore.ts";
 import { makeKeyedSerialExecutor } from "./KeyedSerialExecutor.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { applyToProjection, emptyProjection, ProjectionStoreV2 } from "./ProjectionStore.ts";
@@ -432,6 +433,13 @@ function rootProviderThreadsForProvider(
     );
 }
 
+export function goalThreadAcceptsHumanOperation(
+  bindingKind: "lead" | "worker" | null,
+  creationSource: "web" | "mobile" | "mcp" | "provider" | "server",
+): boolean {
+  return bindingKind !== "worker" || creationSource === "server";
+}
+
 const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(function* () {
   const checkpointService = yield* CheckpointServiceV2;
   const commandPolicy = yield* CommandPolicyV2;
@@ -439,6 +447,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const eventSink = yield* EventSinkV2;
   const commandReceipts = yield* CommandReceiptStoreV2;
   const idAllocator = yield* IdAllocatorV2;
+  const goalProjectionStore = yield* GoalProjectionStore;
   const projectionStore = yield* ProjectionStoreV2;
   const projectSnapshots = yield* Effect.serviceOption(ProjectionSnapshotQuery);
   const providerAdapters = yield* ProviderAdapterRegistryV2;
@@ -5165,6 +5174,31 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.thread_id": commandThreadId(command),
     });
 
+    if (
+      command.type === "message.dispatch" ||
+      command.type === "run.interrupt" ||
+      command.type === "queued-message.promote-to-steer" ||
+      command.type === "queued-run.reorder"
+    ) {
+      const binding = yield* goalProjectionStore.resolveMcpBinding(command.threadId).pipe(
+        Effect.mapError(
+          (cause) =>
+            new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause,
+            }),
+        ),
+      );
+      if (!goalThreadAcceptsHumanOperation(binding?.kind ?? null, command.creationSource)) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Goal child thread ${command.threadId} is inspect-only; Queue, Steer, Stop, and send are root-only operations.`,
+        });
+      }
+    }
+
     const events = yield* Ref.make<Array<OrchestrationV2DomainEvent>>([]);
     const effects = yield* Ref.make<Array<PendingOrchestrationEffectV2>>([]);
     let cancelUnsettledEffects:
@@ -5236,6 +5270,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const goal = {
           id: goalId,
           projectId: source.thread.projectId,
+          repositoryRoot: project?.workspaceRoot ?? sourceWorkspaceRoot,
+          sourceWorkspacePath: sourceWorkspaceRoot,
           objective: command.objective,
           status: "waiting_for_source" as const,
           sourceThreadId: command.threadId,
@@ -5589,6 +5625,7 @@ export const layer: Layer.Layer<
   | CommandReceiptStoreV2
   | ContextHandoffServiceV2
   | EventSinkV2
+  | GoalProjectionStore
   | IdAllocatorV2
   | ProviderAdapterRegistryV2
   | ProviderSessionManagerV2

@@ -202,6 +202,18 @@ describe("rightPanelStore", () => {
     });
   });
 
+  it("keeps the goal workflow as a dismissible singleton surface", () => {
+    useRightPanelStore.getState().open(refA, "goal");
+    useRightPanelStore.getState().open(refA, "goal");
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "goal",
+      surfaces: [{ id: "goal", kind: "goal" }],
+    });
+    useRightPanelStore.getState().closeSurface(refA, "goal");
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBeNull();
+  });
+
   it("replaces the standalone explorer with peer file surfaces", () => {
     useRightPanelStore.getState().open(refA, "files");
     useRightPanelStore.getState().openFile(refA, "src/index.ts");

@@ -241,6 +241,7 @@ export function useThreadOutboxDrain(): void {
                 modelSelection: settings.modelSelection,
                 runtimeMode: settings.runtimeMode,
                 interactionMode: settings.interactionMode,
+                dispatchMode: queuedMessage.dispatchMode,
                 createdAt: queuedMessage.createdAt,
               },
             })

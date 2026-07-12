@@ -608,7 +608,7 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
             payload: { ...evidence, integrationSha: "sha:different", verdict: "accepted" },
           }),
         )).reason,
-        "referential_integrity",
+        "stale_evidence",
       );
       assert.equal(
         (yield* Effect.flip(
@@ -654,7 +654,7 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
       );
       yield* store.apply({
         type: "goal.verdict-recorded",
-        payload: { ...evidence, verdict: "accepted" },
+        payload: { ...evidence, verdict: "rejected" },
       });
       yield* store.apply({
         type: "goal.writer-commit-recorded",
@@ -718,7 +718,7 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
       assert.equal(detail.failures[0]?.recoveryState, "resolved");
       assert.equal(detail.artifacts[0]?.uri, artifact.uri);
       assert.equal(detail.evidence[0]?.integrationSha, evidence.integrationSha);
-      assert.equal(detail.evidence[0]?.verdict, "accepted");
+      assert.equal(detail.evidence[0]?.verdict, "rejected");
     }),
   );
 });

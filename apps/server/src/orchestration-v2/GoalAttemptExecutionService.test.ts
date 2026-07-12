@@ -20,6 +20,7 @@ import { GoalAttemptExecutionService, layer } from "./GoalAttemptExecutionServic
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
 import { layer as idAllocatorLayer } from "./IdAllocator.ts";
 import { ThreadManagementService } from "./ThreadManagementService.ts";
+import { GoalWorkspaceService } from "./GoalWorkspaceService.ts";
 
 it.effect("launches a read-only worker once and persists the durable execution binding", () =>
   Effect.gen(function* () {
@@ -166,6 +167,19 @@ it.effect("launches a read-only worker once and persists the durable execution b
             Effect.as({ committed: true, stale: false, storedEvents: [] }),
           ),
       }),
+      Layer.succeed(
+        GoalWorkspaceService,
+        GoalWorkspaceService.of({
+          provision: () => Effect.succeed(detail),
+          prepareAttempt: () =>
+            Effect.succeed({
+              path: "C:/worktrees/goal-read",
+              branch: "goal-read/execute",
+              baseSha: "sha:base",
+              sharedReadOnly: true,
+            }),
+        }),
+      ),
       idAllocatorLayer,
     );
     yield* Effect.gen(function* () {
@@ -181,6 +195,8 @@ it.effect("launches a read-only worker once and persists the durable execution b
     assert.equal(dispatched[0]?.type, "thread.create");
     if (dispatched[0]?.type === "thread.create") {
       assert.equal(dispatched[0].threadId, workerThreadId);
+      assert.equal(dispatched[0].branch, "goal-read/execute");
+      assert.equal(dispatched[0].worktreePath, "C:/worktrees/goal-read");
     }
     const persisted = (yield* Ref.get(committed)) as ReadonlyArray<{
       readonly expectedStatuses: ReadonlyArray<string>;
