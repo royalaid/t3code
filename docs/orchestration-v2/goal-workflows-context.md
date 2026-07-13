@@ -114,7 +114,13 @@ The native Windows validation uses a disposable worktree at `C:\t3goal-android`
 and a real Android emulator. Windows-specific CMake staging patches shorten the
 package build directories for React Native Worklets, Reanimated, Expo Modules
 Core, Nitro Modules, and Nitro Markdown; each patch is generated through
-`pnpm patch`/`patch-commit` and must be validated from a clean install.
+`pnpm patch`/`patch-commit` and is validated from a clean install. Their
+individual CMake targets pass. At this checkpoint, the clean full
+`android:dev` build proceeds through those targets but still fails in the
+unpatched `react-native-screens` package with Ninja's Windows
+`build.ninja ... still dirty` loop. Do not represent Android runtime validation
+as complete until that final package-level issue is resolved and the app is
+installed/launched on the emulator.
 
 Before declaring a release candidate, run:
 
