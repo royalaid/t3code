@@ -89,6 +89,15 @@ const TestProviderInstanceRegistry = Layer.succeed(ProviderInstanceRegistry, {
 });
 
 const TestLayer = OrchestrationV2LayerLive.pipe(
+  Layer.provide(
+    Layer.succeed(ProjectEnrichmentService, {
+      peek: () => Effect.succeed({ repositoryIdentity: null, faviconPath: null }),
+      request: () => Effect.void,
+      getAvailable: () => Effect.succeed({ repositoryIdentity: null, faviconPath: null }),
+      invalidate: () => Effect.void,
+      subscribeChanges: Effect.never,
+    }),
+  ),
   Layer.provide(mcpSessionRegistryTestLayer),
   Layer.provide(SqlitePersistenceMemory),
   Layer.provide(CheckpointStoreTestLayer),

@@ -1,4 +1,5 @@
 import * as Layer from "effect/Layer";
+import { OrchestrationProjectionSnapshotQueryLive } from "../orchestration/Layers/ProjectionSnapshotQuery.ts";
 import {
   OrchestrationEventInfrastructureLayerLive,
   OrchestrationLayerLive,
@@ -164,6 +165,7 @@ const runFinalizationServiceProvided = runFinalizationServiceLayer.pipe(
 const orchestratorProvided = orchestratorLayer.pipe(
   Layer.provide(
     Layer.mergeAll(
+      OrchestrationProjectionSnapshotQueryLive,
       checkpointServiceProvided,
       commandPolicyLayer,
       storesLayer,
@@ -251,6 +253,7 @@ const threadLifecycleProvided = threadLifecycleServiceLayer.pipe(
 const goalLaunchProvided = goalLaunchServiceLayer.pipe(
   Layer.provide(
     Layer.mergeAll(
+      OrchestrationProjectionSnapshotQueryLive,
       storesLayer,
       eventSinkProvided,
       goalWorkspaceProvided,
