@@ -220,9 +220,9 @@ it.layer(TestLayer)("orchestration V2 foundation persistence", (it) => {
         },
         evidenceRequirements: [],
         policy: {
-          sandboxMode: "workspace-write" as const,
+          sandboxMode: "read-only" as const,
           approvalPolicy: "on-request" as const,
-          writableRoots: ["/workspace"],
+          writableRoots: [],
           providerAllowlist: ["codex"],
           toolAllowlist: ["shell"],
         },
