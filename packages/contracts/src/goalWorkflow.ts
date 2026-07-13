@@ -492,6 +492,8 @@ export type GoalWorkflowCommand = typeof GoalWorkflowCommand.Type;
 export const GoalGraphActivatedPayload = Schema.Struct({
   goalId: GoalId,
   expectedRevision: NonNegativeInt,
+  /** Present on live events; optional only so projections can replay legacy stored events. */
+  expectedStatus: Schema.optional(GoalLifecycleStatus),
   graph: GoalGraphVersion,
   activatedAt: GoalTimestamp,
 });

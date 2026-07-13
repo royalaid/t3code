@@ -5165,6 +5165,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           payload: {
             goalId: command.goalId,
             expectedRevision: command.expectedRevision,
+            expectedStatus: detail.goal.status,
             graph: command.graph,
             activatedAt: now,
           },

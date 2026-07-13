@@ -319,7 +319,7 @@ const baseLayer: Layer.Layer<
           for (const stored of events) {
             yield* projectionStore.apply(stored.event);
             if (stored.event.type.startsWith("goal.")) {
-              yield* goalProjectionStore.apply(stored.event as GoalWorkflowEvent);
+              yield* goalProjectionStore.applyTrustedReplay(stored.event as GoalWorkflowEvent);
             }
             if (stored.event.type === "turn-item.updated") {
               yield* sql`

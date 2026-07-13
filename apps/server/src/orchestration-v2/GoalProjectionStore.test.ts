@@ -15,6 +15,7 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import { canonicalGoalLeadPublisherId, goalGraphPublisherIssue } from "./GoalGraphSemantics.ts";
 import {
   GoalProjectionStore,
   GoalProjectionValidationError,
@@ -57,6 +58,45 @@ const makeNode = (id: string) => ({
   evidenceRequirements: [],
   policy: readOnlyPolicy,
 });
+const makeWriter = (id: string) => ({
+  ...makeNode(id),
+  workspaceMode: "writer" as const,
+  outputContract: { kind: "commit" as const, description: "commit", requiredFields: [] },
+  policy,
+});
+const makeVerifier = (id: string) => ({
+  ...makeNode(id),
+  outputContract: {
+    kind: "verification" as const,
+    description: "verification",
+    requiredFields: ["verdict"],
+  },
+  evidenceRequirements: [{ kind: "command" as const, description: "test log", required: true }],
+});
+const makeCompletionGraph = (input: {
+  readonly goalId: GoalId;
+  readonly rootThreadId: ThreadId;
+  readonly revision?: number;
+  readonly id?: string;
+}) => {
+  const writer = makeWriter(`writer:${input.revision ?? 1}`);
+  const verifier = makeVerifier(`verifier:${input.revision ?? 1}`);
+  return {
+    id: GoalGraphVersionId.make(input.id ?? `graph:${input.revision ?? 1}`),
+    goalId: input.goalId,
+    revision: input.revision ?? 1,
+    publishedByNodeId: canonicalGoalLeadPublisherId(input.rootThreadId),
+    nodes: [writer, verifier],
+    edges: [
+      {
+        id: GoalEdgeId.make(`edge:${input.revision ?? 1}`),
+        fromNodeId: writer.id,
+        toNodeId: verifier.id,
+      },
+    ],
+    createdAt: "2026-07-11T00:00:01.000Z",
+  } as const;
+};
 
 it("allows approval narrowing and rejects approval authority expansion", () => {
   const graphWithApproval = (approvalPolicy: "untrusted" | "on-request" | "never") => ({
@@ -137,6 +177,378 @@ it("rejects graph workspace modes that could bypass isolated writer integration"
 });
 
 it.layer(TestLayer)("GoalProjectionStore", (it) => {
+  it.effect("enforces canonical publisher provenance and completion-valid graphs", () =>
+    Effect.gen(function* () {
+      const store = yield* GoalProjectionStore;
+      const goalId = GoalId.make("goal:strict-graph");
+      const rootThreadId = ThreadId.make("thread:strict-root");
+      yield* store.create({
+        id: goalId,
+        objective: "strict graph",
+        status: "planning",
+        sourceThreadId: ThreadId.make("thread:strict-source"),
+        rootThreadId,
+        policy,
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: "goal/strict",
+        integrationWorktreePath: "/strict",
+        integrationSha: "sha:strict",
+        verifiedSha: null,
+        createdAt: "2026-07-11T00:00:00.000Z",
+        updatedAt: "2026-07-11T00:00:00.000Z",
+      });
+      const valid = makeCompletionGraph({ goalId, rootThreadId, id: "graph:strict" });
+      const invalidGraphs = [
+        { ...valid, nodes: [], edges: [] },
+        { ...valid, nodes: [makeWriter("writer:only")], edges: [] },
+        {
+          ...valid,
+          nodes: [makeWriter("writer:pseudo"), makeNode("pseudo-verifier")],
+          edges: [
+            {
+              id: GoalEdgeId.make("edge:pseudo"),
+              fromNodeId: GoalNodeId.make("writer:pseudo"),
+              toNodeId: GoalNodeId.make("pseudo-verifier"),
+            },
+          ],
+        },
+      ];
+      for (const graph of invalidGraphs) {
+        const error = yield* Effect.flip(
+          store.activateGraph({ goalId, expectedRevision: 0, graph }),
+        );
+        assert.equal(error.reason, "non_terminal_graph");
+        assert.match(error.detail, /verifier|completion-valid/iu);
+      }
+
+      const spoofed = { ...valid, publishedByNodeId: GoalNodeId.make("spoofed-lead") };
+      assert.match(goalGraphPublisherIssue(spoofed, rootThreadId) ?? "", /authenticated/iu);
+      const spoofedError = yield* Effect.flip(
+        store.activateGraph({ goalId, expectedRevision: 0, graph: spoofed }),
+      );
+      assert.equal(spoofedError.reason, "referential_integrity");
+
+      const leadOwned = {
+        ...valid,
+        nodes: [...valid.nodes, makeNode(rootThreadId)],
+      };
+      const leadOwnedError = yield* Effect.flip(
+        store.activateGraph({ goalId, expectedRevision: 0, graph: leadOwned }),
+      );
+      assert.equal(leadOwnedError.reason, "referential_integrity");
+
+      yield* store.activateGraph({ goalId, expectedRevision: 0, graph: valid });
+      assert.equal((yield* store.getDetail(goalId)).goal.status, "running");
+    }),
+  );
+
+  it.effect("fences graph activation by lifecycle while preserving running replacement", () =>
+    Effect.gen(function* () {
+      const store = yield* GoalProjectionStore;
+      const rootThreadId = ThreadId.make("thread:lifecycle-root");
+      const goalId = GoalId.make("goal:lifecycle-running");
+      yield* store.create({
+        id: goalId,
+        objective: "running replacement",
+        status: "planning",
+        sourceThreadId: ThreadId.make("thread:lifecycle-source"),
+        rootThreadId,
+        policy,
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: "goal/lifecycle",
+        integrationWorktreePath: "/lifecycle",
+        integrationSha: "sha:lifecycle",
+        verifiedSha: null,
+        createdAt: "2026-07-11T00:00:00.000Z",
+        updatedAt: "2026-07-11T00:00:00.000Z",
+      });
+      yield* store.activateGraph({
+        goalId,
+        expectedRevision: 0,
+        graph: makeCompletionGraph({ goalId, rootThreadId, revision: 1 }),
+      });
+      yield* store.activateGraph({
+        goalId,
+        expectedRevision: 1,
+        graph: makeCompletionGraph({ goalId, rootThreadId, revision: 2 }),
+      });
+      assert.equal((yield* store.getDetail(goalId)).goal.currentRevision, 2);
+
+      for (const lifecycleStatus of [
+        "waiting_for_source",
+        "provisioning",
+        "paused",
+        "verifying",
+        "completed",
+        "failed",
+        "cancelled",
+      ] as const) {
+        const terminalGoalId = GoalId.make(`goal:lifecycle:${lifecycleStatus}`);
+        const terminalRoot = ThreadId.make(`thread:lifecycle:${lifecycleStatus}`);
+        yield* store.create({
+          id: terminalGoalId,
+          objective: lifecycleStatus,
+          status: lifecycleStatus,
+          sourceThreadId: ThreadId.make(`source:lifecycle:${lifecycleStatus}`),
+          rootThreadId: terminalRoot,
+          policy,
+          currentGraphVersionId: null,
+          currentRevision: 0,
+          integrationBranch: null,
+          integrationWorktreePath: null,
+          integrationSha: "sha:lifecycle",
+          verifiedSha: null,
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z",
+        });
+        const error = yield* Effect.flip(
+          store.activateGraph({
+            goalId: terminalGoalId,
+            expectedRevision: 0,
+            graph: makeCompletionGraph({ goalId: terminalGoalId, rootThreadId: terminalRoot }),
+          }),
+        );
+        assert.equal(error.reason, "invalid_revision", lifecycleStatus);
+        assert.equal((yield* store.getDetail(terminalGoalId)).goal.status, lifecycleStatus);
+      }
+
+      const blockedGoalId = GoalId.make("goal:lifecycle:blocked");
+      const blockedRoot = ThreadId.make("thread:lifecycle:blocked");
+      yield* store.create({
+        id: blockedGoalId,
+        objective: "blocked recovery",
+        status: "blocked",
+        sourceThreadId: ThreadId.make("source:lifecycle:blocked"),
+        rootThreadId: blockedRoot,
+        policy,
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: null,
+        integrationWorktreePath: null,
+        integrationSha: "sha:lifecycle",
+        verifiedSha: null,
+        createdAt: "2026-07-11T00:00:00.000Z",
+        updatedAt: "2026-07-11T00:00:00.000Z",
+      });
+      yield* store.activateGraph({
+        goalId: blockedGoalId,
+        expectedRevision: 0,
+        graph: makeCompletionGraph({
+          goalId: blockedGoalId,
+          rootThreadId: blockedRoot,
+          id: "graph:lifecycle:blocked",
+        }),
+      });
+      assert.equal((yield* store.getDetail(blockedGoalId)).goal.status, "running");
+    }),
+  );
+
+  it.effect("CASes the lifecycle status captured with graph activation", () =>
+    Effect.gen(function* () {
+      const store = yield* GoalProjectionStore;
+      const goalId = GoalId.make("goal:lifecycle-cas");
+      const rootThreadId = ThreadId.make("thread:lifecycle-cas-root");
+      const goal = {
+        id: goalId,
+        objective: "lifecycle CAS",
+        status: "planning" as const,
+        sourceThreadId: ThreadId.make("thread:lifecycle-cas-source"),
+        rootThreadId,
+        policy,
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: "goal/lifecycle-cas",
+        integrationWorktreePath: "/lifecycle-cas",
+        integrationSha: "sha:lifecycle-cas",
+        verifiedSha: null,
+        createdAt: "2026-07-11T00:00:00.000Z",
+        updatedAt: "2026-07-11T00:00:00.000Z",
+      };
+      yield* store.create(goal);
+      const graph = makeCompletionGraph({
+        goalId,
+        rootThreadId,
+        id: "graph:lifecycle-cas",
+      });
+      yield* store.apply({
+        type: "goal.updated",
+        payload: {
+          ...goal,
+          status: "blocked",
+          updatedAt: "2026-07-11T00:00:01.000Z",
+        },
+      });
+      const stale = yield* Effect.flip(
+        store.apply({
+          type: "goal.graph-version-activated",
+          payload: {
+            goalId,
+            expectedRevision: 0,
+            expectedStatus: "planning",
+            graph,
+            activatedAt: "2026-07-11T00:00:02.000Z",
+          },
+        }),
+      );
+      assert.equal(stale.reason, "stale_revision");
+      assert.match(stale.detail, /current lifecycle is blocked/iu);
+      assert.equal((yield* store.getDetail(goalId)).goal.status, "blocked");
+
+      yield* store.apply({
+        type: "goal.graph-version-activated",
+        payload: {
+          goalId,
+          expectedRevision: 0,
+          expectedStatus: "blocked",
+          graph,
+          activatedAt: "2026-07-11T00:00:03.000Z",
+        },
+      });
+      assert.equal((yield* store.getDetail(goalId)).goal.status, "running");
+    }),
+  );
+
+  it.effect("accepts evidence only from a succeeded writer ancestor in the active graph", () =>
+    Effect.gen(function* () {
+      const store = yield* GoalProjectionStore;
+      const goalId = GoalId.make("goal:evidence-ancestry");
+      const rootThreadId = ThreadId.make("thread:evidence-ancestry-root");
+      yield* store.create({
+        id: goalId,
+        objective: "evidence ancestry",
+        status: "planning",
+        sourceThreadId: ThreadId.make("thread:evidence-ancestry-source"),
+        rootThreadId,
+        policy,
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: "goal/evidence-ancestry",
+        integrationWorktreePath: "/evidence-ancestry",
+        integrationSha: "sha:evidence-current",
+        verifiedSha: null,
+        createdAt: "2026-07-11T00:00:00.000Z",
+        updatedAt: "2026-07-11T00:00:00.000Z",
+      });
+      const baseGraph = makeCompletionGraph({
+        goalId,
+        rootThreadId,
+        id: "graph:evidence-ancestry",
+      });
+      const observer = makeNode("observer:evidence-ancestry");
+      const graph = { ...baseGraph, nodes: [...baseGraph.nodes, observer] };
+      yield* store.activateGraph({ goalId, expectedRevision: 0, graph });
+      const writer = baseGraph.nodes[0];
+      const verifier = baseGraph.nodes[1];
+      const attempt = (input: {
+        readonly id: string;
+        readonly node: GoalGraphNode;
+        readonly ordinal: number;
+        readonly status: "running" | "succeeded";
+      }) => ({
+        id: GoalAttemptId.make(input.id),
+        goalId,
+        graphVersionId: graph.id,
+        nodeId: input.node.id,
+        ordinal: input.ordinal,
+        status: input.status,
+        requestedRoute: input.node.routingRequest,
+        resolvedRoute: null,
+        providerSessionId: null,
+        executionThreadId: ThreadId.make(`thread:${input.id}`),
+        runId: null,
+        rootExecutionNodeId: null,
+        baseIntegrationSha: "sha:evidence-current",
+        workspacePath: `/workspace/${input.id}`,
+        leaseOwner: "test",
+        leaseExpiresAt: null,
+        usage: {
+          inputTokens: null,
+          outputTokens: null,
+          cachedTokens: null,
+          costMicros: null,
+          nativeDescendantCount: 0,
+        },
+        failureReason: null,
+        createdAt: "2026-07-11T00:00:02.000Z",
+        updatedAt: "2026-07-11T00:00:02.000Z",
+      });
+      const succeededProducer = attempt({
+        id: "attempt:producer:succeeded",
+        node: writer,
+        ordinal: 1,
+        status: "succeeded",
+      });
+      const runningProducer = attempt({
+        id: "attempt:producer:running",
+        node: writer,
+        ordinal: 2,
+        status: "running",
+      });
+      const unrelatedProducer = attempt({
+        id: "attempt:producer:unrelated",
+        node: observer,
+        ordinal: 1,
+        status: "succeeded",
+      });
+      const verifierAttempt = attempt({
+        id: "attempt:verifier",
+        node: verifier,
+        ordinal: 1,
+        status: "running",
+      });
+      for (const candidate of [
+        succeededProducer,
+        runningProducer,
+        unrelatedProducer,
+        verifierAttempt,
+      ]) {
+        yield* store.apply({ type: "goal.attempt-created", payload: candidate });
+      }
+      const logArtifact = {
+        id: GoalArtifactId.make("artifact:evidence-log"),
+        goalId,
+        nodeId: verifier.id,
+        attemptId: verifierAttempt.id,
+        kind: "log" as const,
+        uri: "artifact://evidence-log",
+        digest: "digest:evidence-log",
+        metadata: {},
+        createdAt: "2026-07-11T00:00:03.000Z",
+      };
+      yield* store.apply({ type: "goal.artifact-published", payload: logArtifact });
+      const evidence = {
+        id: GoalEvidenceId.make("evidence:ancestry"),
+        goalId,
+        nodeId: verifier.id,
+        attemptId: verifierAttempt.id,
+        integrationSha: "sha:evidence-current",
+        producerAttemptId: succeededProducer.id,
+        commands: [{ command: "vp test", exitCode: 0, logArtifactId: logArtifact.id }],
+        artifacts: [logArtifact.id],
+        verdict: "accepted" as const,
+        summary: "verified",
+        createdAt: "2026-07-11T00:00:04.000Z",
+      };
+      for (const [id, producerAttemptId] of [
+        ["evidence:running-producer", runningProducer.id],
+        ["evidence:unrelated-producer", unrelatedProducer.id],
+      ] as const) {
+        const error = yield* Effect.flip(
+          store.apply({
+            type: "goal.evidence-submitted",
+            payload: { ...evidence, id: GoalEvidenceId.make(id), producerAttemptId },
+          }),
+        );
+        assert.equal(error.reason, "independent_verification_required");
+        assert.match(error.detail, /succeeded writer producer.*ancestor/iu);
+      }
+      yield* store.apply({ type: "goal.evidence-submitted", payload: evidence });
+      assert.equal((yield* store.getDetail(goalId)).evidence[0]?.id, evidence.id);
+    }),
+  );
+
   it.effect("activates immutable graph versions with revision CAS and exact replay", () =>
     Effect.gen(function* () {
       const store = yield* GoalProjectionStore;
@@ -158,21 +570,11 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         createdAt: "2026-07-11T00:00:00.000Z",
         updatedAt: "2026-07-11T00:00:00.000Z",
       });
-      const graph = {
-        id: GoalGraphVersionId.make("goal-graph:1"),
+      const graph = makeCompletionGraph({
         goalId,
-        revision: 1,
-        publishedByNodeId: GoalNodeId.make("node:lead"),
-        nodes: [makeNode("node:lead"), makeNode("node:worker")],
-        edges: [
-          {
-            id: GoalEdgeId.make("edge:1"),
-            fromNodeId: GoalNodeId.make("node:lead"),
-            toNodeId: GoalNodeId.make("node:worker"),
-          },
-        ],
-        createdAt: "2026-07-11T00:00:01.000Z",
-      } as const;
+        rootThreadId,
+        id: "goal-graph:1",
+      });
       yield* store.activateGraph({ goalId, expectedRevision: 0, graph });
       const replayed = yield* store.getDetail(goalId);
       assert.equal(replayed.goal.currentRevision, 1);
@@ -284,20 +686,26 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         createdAt: "2026-07-11T00:00:00.000Z",
         updatedAt: "2026-07-11T00:00:00.000Z",
       });
+      const writer = {
+        ...makeNode("worker:windows"),
+        workspaceMode: "writer" as const,
+        outputContract: { kind: "commit" as const, description: "commit", requiredFields: [] },
+        policy: { ...windowsPolicy, writableRoots: ["c:/repo/packages"] },
+      };
+      const verifier = makeVerifier("verifier:windows");
       const graph = {
         id: GoalGraphVersionId.make("graph:windows"),
         goalId,
         revision: 1,
-        publishedByNodeId: GoalNodeId.make("external-root-lead"),
-        nodes: [
+        publishedByNodeId: canonicalGoalLeadPublisherId(ThreadId.make("root:windows")),
+        nodes: [writer, verifier],
+        edges: [
           {
-            ...makeNode("worker:windows"),
-            workspaceMode: "writer",
-            outputContract: { kind: "commit", description: "commit", requiredFields: [] },
-            policy: { ...windowsPolicy, writableRoots: ["c:/repo/packages"] },
+            id: GoalEdgeId.make("edge:windows"),
+            fromNodeId: writer.id,
+            toNodeId: verifier.id,
           },
         ],
-        edges: [],
         createdAt: "2026-07-11T00:00:01.000Z",
       } as const;
       yield* store.activateGraph({ goalId, expectedRevision: 0, graph });
@@ -421,15 +829,11 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         updatedAt: "2026-07-11T00:00:00.000Z",
       });
       const makeGraph = (suffix: string) =>
-        ({
-          id: GoalGraphVersionId.make(`graph:cas:${suffix}`),
+        makeCompletionGraph({
           goalId,
-          revision: 1,
-          publishedByNodeId: GoalNodeId.make("lead"),
-          nodes: [makeNode(`worker:${suffix}`)],
-          edges: [],
-          createdAt: "2026-07-11T00:00:01.000Z",
-        }) as const;
+          rootThreadId: ThreadId.make("root:cas"),
+          id: `graph:cas:${suffix}`,
+        });
       const exits = yield* Effect.all(
         [makeGraph("a"), makeGraph("b")].map((graph) =>
           Effect.exit(store.activateGraph({ goalId, expectedRevision: 0, graph })),
@@ -560,13 +964,20 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         outputContract: { kind: "commit" as const, description: "commit", requiredFields: [] },
         policy,
       };
+      const verifier = makeVerifier("verifier:records");
       const graph = {
         id: GoalGraphVersionId.make("graph:records"),
         goalId,
         revision: 1,
-        publishedByNodeId: GoalNodeId.make("lead"),
-        nodes: [node],
-        edges: [],
+        publishedByNodeId: canonicalGoalLeadPublisherId(ThreadId.make("root:records")),
+        nodes: [node, verifier],
+        edges: [
+          {
+            id: GoalEdgeId.make("edge:records"),
+            fromNodeId: node.id,
+            toNodeId: verifier.id,
+          },
+        ],
         createdAt: "2026-07-11T00:00:01.000Z",
       } as const;
       yield* store.activateGraph({ goalId, expectedRevision: 0, graph });

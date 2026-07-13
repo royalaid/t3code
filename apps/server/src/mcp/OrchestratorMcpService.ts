@@ -71,6 +71,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import { isBuiltInProviderAdapterDriverV2 } from "../orchestration-v2/builtInProviderAdapterDrivers.ts";
+import { goalGraphPublisherIssue } from "../orchestration-v2/GoalGraphSemantics.ts";
 import { subagentResultForRun } from "../orchestration-v2/SubagentProjection.ts";
 import {
   isActiveRun,
@@ -951,9 +952,11 @@ const make = Effect.gen(function* () {
       }),
     goalReplaceGraph: (scope, input) =>
       Effect.gen(function* () {
-        const { authority } = yield* loadGoal(scope, input.goalId);
+        const { authority, detail } = yield* loadGoal(scope, input.goalId);
         if (authority.kind !== "goal_lead")
           return yield* failure("capability_denied", "Only the root lead may replace the graph.");
+        const publisherIssue = goalGraphPublisherIssue(input.graph, detail.goal.rootThreadId);
+        if (publisherIssue !== null) return yield* failure("invalid_request", publisherIssue);
         return yield* dispatchGoalMutation(scope, {
           type: "goal.graph.replace",
           commandId: CommandId.make(`mcp:${scope.providerSessionId}:goal-graph:${input.graph.id}`),

@@ -28,9 +28,16 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { hasDurableCommandEvidence } from "./GoalEvidenceValidation.ts";
+import {
+  goalGraphCompletionPathIssue,
+  goalGraphPublisherIssue,
+  isGoalVerifierNode,
+  isStrictTransitiveAncestor,
+} from "./GoalGraphSemantics.ts";
 
 const MAX_GRAPH_NODES = 1_000;
 const MAX_GRAPH_EDGES = 5_000;
+type GoalProjectionApplicationSource = "live" | "trusted_replay";
 type GoalArtifactType = typeof GoalArtifact.Type;
 type GoalSummaryType = typeof GoalSummary.Type;
 
@@ -47,6 +54,7 @@ export class GoalProjectionValidationError extends Schema.TaggedErrorClass<GoalP
       "cycle",
       "structural_limit",
       "policy_expansion",
+      "non_terminal_graph",
       "stale_evidence",
       "machine_evidence_required",
       "independent_verification_required",
@@ -194,6 +202,10 @@ export function validateGoalGraph(graph: GoalGraphVersion, rootPolicy: GoalType[
 
 type GoalRow = { readonly payload_json: string };
 type PayloadRow = { readonly payload_json: string };
+type DependencyEdgeRow = {
+  readonly from_node_id: string;
+  readonly to_node_id: string;
+};
 const encodeGoal = Schema.encodeEffect(Schema.fromJsonString(Goal));
 const encodeGraph = Schema.encodeEffect(Schema.fromJsonString(GoalGraphVersionSchema));
 const encodeNode = Schema.encodeEffect(Schema.fromJsonString(GoalNodeProjection));
@@ -335,9 +347,13 @@ export interface GoalProjectionStoreShape {
   readonly activateGraph: (input: {
     readonly goalId: GoalId;
     readonly expectedRevision: number;
+    readonly expectedStatus?: GoalType["status"];
     readonly graph: GoalGraphVersion;
   }) => Effect.Effect<void, GoalProjectionValidationError>;
   readonly apply: (event: GoalWorkflowEvent) => Effect.Effect<void, GoalProjectionValidationError>;
+  readonly applyTrustedReplay: (
+    event: GoalWorkflowEvent,
+  ) => Effect.Effect<void, GoalProjectionValidationError>;
   readonly getDetail: (
     goalId: GoalId,
   ) => Effect.Effect<GoalDetailType, GoalProjectionValidationError>;
@@ -564,14 +580,21 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
 
     const activateGraph = Effect.fn("GoalProjectionStore.activateGraph")(function* (
       input: Parameters<GoalProjectionStoreShape["activateGraph"]>[0],
+      source: GoalProjectionApplicationSource = "live",
     ) {
       yield* sql.withTransaction(
         Effect.gen(function* () {
           const goal = yield* readGoal(input.goalId);
+          const expectedStatus = input.expectedStatus ?? goal.status;
           if (goal.currentRevision !== input.expectedRevision)
             return yield* new GoalProjectionValidationError({
               reason: "stale_revision",
               detail: `Expected revision ${input.expectedRevision}, current revision is ${goal.currentRevision}.`,
+            });
+          if (source === "live" && goal.status !== expectedStatus)
+            return yield* new GoalProjectionValidationError({
+              reason: "stale_revision",
+              detail: `Expected lifecycle ${expectedStatus}, current lifecycle is ${goal.status}. Re-read the goal before replacing its graph.`,
             });
           if (
             input.graph.goalId !== input.goalId ||
@@ -585,6 +608,29 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
             try: () => validateGoalGraph(input.graph, goal.policy),
             catch: (error) => error as GoalProjectionValidationError,
           });
+          if (source === "live") {
+            const publisherIssue = goalGraphPublisherIssue(input.graph, goal.rootThreadId);
+            if (publisherIssue !== null)
+              return yield* new GoalProjectionValidationError({
+                reason: "referential_integrity",
+                detail: publisherIssue,
+              });
+            const completionPathIssue = goalGraphCompletionPathIssue(input.graph);
+            if (completionPathIssue !== null)
+              return yield* new GoalProjectionValidationError({
+                reason: "non_terminal_graph",
+                detail: completionPathIssue,
+              });
+            const recoverableBlocked =
+              goal.status === "blocked" &&
+              goal.currentRevision === 0 &&
+              goal.currentGraphVersionId === null;
+            if (goal.status !== "planning" && goal.status !== "running" && !recoverableBlocked)
+              return yield* new GoalProjectionValidationError({
+                reason: "invalid_revision",
+                detail: `Goal ${goal.id} is ${goal.status}; graph activation requires planning, running replacement, or recoverable revision-zero blocked state.`,
+              });
+          }
           const nextGoal = {
             ...goal,
             status: "running" as const,
@@ -598,6 +644,15 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
             SET status='running', current_graph_version_id=${input.graph.id}, current_revision=${input.graph.revision},
               verified_sha=NULL, payload_json=${nextGoalPayload}, updated_at=${input.graph.createdAt}
             WHERE goal_id=${input.goalId} AND current_revision=${input.expectedRevision}
+              ${source === "trusted_replay" ? sql`` : sql`AND status=${expectedStatus}`}
+              ${
+                source === "trusted_replay"
+                  ? sql``
+                  : sql`AND (
+                status IN ('planning', 'running') OR
+                (status = 'blocked' AND current_revision = 0 AND current_graph_version_id IS NULL)
+              )`
+              }
             RETURNING goal_id`;
           if (claimed.length !== 1)
             return yield* new GoalProjectionValidationError({
@@ -668,7 +723,10 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
       );
     });
 
-    const apply = Effect.fn("GoalProjectionStore.apply")(function* (event: GoalWorkflowEvent) {
+    const applyEvent = Effect.fn("GoalProjectionStore.applyEvent")(function* (
+      event: GoalWorkflowEvent,
+      source: GoalProjectionApplicationSource,
+    ) {
       switch (event.type) {
         case "goal.created":
           return yield* create(event.payload);
@@ -680,11 +738,17 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         case "goal.integration-conflicted":
           return yield* persistLifecycle(event);
         case "goal.graph-version-activated":
-          return yield* activateGraph({
-            goalId: event.payload.goalId,
-            expectedRevision: event.payload.expectedRevision,
-            graph: event.payload.graph,
-          });
+          return yield* activateGraph(
+            {
+              goalId: event.payload.goalId,
+              expectedRevision: event.payload.expectedRevision,
+              ...(event.payload.expectedStatus === undefined
+                ? {}
+                : { expectedStatus: event.payload.expectedStatus }),
+              graph: event.payload.graph,
+            },
+            source,
+          );
         case "goal.node-transitioned":
         case "goal.node-cancellation-requested": {
           const existingNode = yield* requireNode(
@@ -914,6 +978,48 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
                 reason: "independent_verification_required",
                 detail: "Accepted evidence requires a distinct verifier attempt, node, and thread.",
               });
+            if (source === "live") {
+              if (
+                goal.currentGraphVersionId === null ||
+                verifierAttempt.graphVersionId !== goal.currentGraphVersionId ||
+                producerAttempt.graphVersionId !== goal.currentGraphVersionId
+              )
+                return yield* new GoalProjectionValidationError({
+                  reason: "independent_verification_required",
+                  detail:
+                    "Accepted evidence requires verifier and producer attempts from the same active graph.",
+                });
+              const graphRows = yield* sql<{
+                readonly graph_version_id: string;
+              }>`SELECT graph_version_id FROM goal_graph_versions WHERE graph_version_id=${goal.currentGraphVersionId} AND goal_id=${goal.id} LIMIT 1`;
+              if (graphRows[0] === undefined)
+                return yield* new GoalProjectionValidationError({
+                  reason: "referential_integrity",
+                  detail: `Active graph ${goal.currentGraphVersionId} does not exist.`,
+                });
+              const dependencyEdges =
+                yield* sql<DependencyEdgeRow>`SELECT from_node_id, to_node_id FROM goal_edges WHERE graph_version_id=${goal.currentGraphVersionId}`;
+              if (
+                !isGoalVerifierNode(verifierNode.node) ||
+                producerNode.node.workspaceMode !== "writer" ||
+                producerAttempt.status !== "succeeded" ||
+                !isStrictTransitiveAncestor(
+                  {
+                    edges: dependencyEdges.map((edge) => ({
+                      fromNodeId: GoalNodeId.make(edge.from_node_id),
+                      toNodeId: GoalNodeId.make(edge.to_node_id),
+                    })),
+                  },
+                  producerAttempt.nodeId,
+                  verifierAttempt.nodeId,
+                )
+              )
+                return yield* new GoalProjectionValidationError({
+                  reason: "independent_verification_required",
+                  detail:
+                    "Accepted evidence requires a qualifying verifier and a succeeded writer producer attempt that is its strict transitive ancestor in the active graph.",
+                });
+            }
           }
           for (const artifactId of new Set([
             ...event.payload.artifacts,
@@ -991,6 +1097,9 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         }
       }
     });
+
+    const apply = (event: GoalWorkflowEvent) => applyEvent(event, "live");
+    const applyTrustedReplay = (event: GoalWorkflowEvent) => applyEvent(event, "trusted_replay");
     const listPendingLaunches = Effect.gen(function* () {
       const rows =
         yield* sql<PayloadRow>`SELECT payload_json FROM goals WHERE status IN ('waiting_for_source', 'provisioning') ORDER BY created_at`;
@@ -1043,6 +1152,7 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
       create: (goal) => mapStoreError(create(goal)),
       activateGraph: (input) => mapStoreError(activateGraph(input)),
       apply: (event) => mapStoreError(apply(event)),
+      applyTrustedReplay: (event) => mapStoreError(applyTrustedReplay(event)),
       getDetail: (goalId) => mapStoreError(getDetail(goalId)),
       listPendingLaunches: mapStoreError(listPendingLaunches),
       listSchedulable: mapStoreError(listSchedulable),

@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   EventId,
+  GoalEdgeId,
   GoalGraphVersionId,
   GoalId,
   GoalNodeId,
@@ -26,6 +27,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import { canonicalGoalLeadPublisherId } from "./GoalGraphSemantics.ts";
 import { ProjectionStoreV2, layer as projectionStoreLayer } from "./ProjectionStore.ts";
 import { GoalProjectionStore, layer as goalProjectionStoreLayer } from "./GoalProjectionStore.ts";
 
@@ -127,7 +129,7 @@ it.layer(TestLayer)("ProjectionStoreV2", (it) => {
       yield* goalStore.create({
         id: goalId,
         objective: "overlay",
-        status: "running",
+        status: "planning",
         sourceThreadId: ordinaryThreadId,
         rootThreadId: goalThreadId,
         policy: goalPolicy,
@@ -140,13 +142,40 @@ it.layer(TestLayer)("ProjectionStoreV2", (it) => {
         createdAt: timestamp,
         updatedAt: timestamp,
       });
+      const readyWriter = {
+        ...goalNode("node:ready"),
+        outputContract: {
+          kind: "commit" as const,
+          description: "commit",
+          requiredFields: [],
+        },
+        workspaceMode: "writer" as const,
+        policy: goalPolicy,
+      };
+      const blockedVerifier = {
+        ...goalNode("node:blocked"),
+        outputContract: {
+          kind: "verification" as const,
+          description: "verification",
+          requiredFields: ["verdict"],
+        },
+        evidenceRequirements: [
+          { kind: "command" as const, description: "durable log", required: true },
+        ],
+      };
       const graph = {
         id: GoalGraphVersionId.make("graph:overlay"),
         goalId,
         revision: 1,
-        publishedByNodeId: GoalNodeId.make("root-lead"),
-        nodes: [goalNode("node:ready"), goalNode("node:running"), goalNode("node:blocked")],
-        edges: [],
+        publishedByNodeId: canonicalGoalLeadPublisherId(goalThreadId),
+        nodes: [readyWriter, goalNode("node:running"), blockedVerifier],
+        edges: [
+          {
+            id: GoalEdgeId.make("edge:goal-overlay:writer-verifier"),
+            fromNodeId: readyWriter.id,
+            toNodeId: blockedVerifier.id,
+          },
+        ],
         createdAt: timestamp,
       } as const;
       yield* goalStore.activateGraph({ goalId, expectedRevision: 0, graph });

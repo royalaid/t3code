@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  GoalEdgeId,
   GoalGraphVersionId,
   GoalId,
   GoalNodeId,
@@ -16,6 +17,7 @@ import * as Layer from "effect/Layer";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { EventSinkV2, layer as eventSinkLayer } from "./EventSink.ts";
 import { layer as eventStoreLayer } from "./EventStore.ts";
+import { canonicalGoalLeadPublisherId } from "./GoalGraphSemantics.ts";
 import {
   GoalProjectionStore,
   layer as goalProjectionStoreLayer,
@@ -114,6 +116,32 @@ function schedulerNode(
   };
 }
 
+function schedulerVerifierNode(id: GoalNodeId): GoalGraphNode {
+  return {
+    ...schedulerNode(id),
+    outputContract: {
+      kind: "verification",
+      description: "verify integrated result",
+      requiredFields: ["verdict"],
+    },
+    evidenceRequirements: [{ kind: "command", description: "durable test log", required: true }],
+  };
+}
+
+function completionValidSchedulerGraph(goalId: GoalId, nodes: ReadonlyArray<GoalGraphNode>) {
+  const writers = nodes.filter((node) => node.workspaceMode === "writer");
+  if (writers.length === 0) throw new Error(`Scheduler graph ${goalId} needs an explicit writer.`);
+  const verifier = schedulerVerifierNode(GoalNodeId.make(`node:verifier:${goalId}`));
+  return {
+    nodes: [...nodes, verifier],
+    edges: writers.map((writer, index) => ({
+      id: GoalEdgeId.make(`edge:${goalId}:writer-verifier:${index}`),
+      fromNodeId: writer.id,
+      toNodeId: verifier.id,
+    })),
+  };
+}
+
 function createGoalWithGraph(input: {
   readonly goals: GoalProjectionStoreShape;
   readonly goalId: GoalId;
@@ -122,13 +150,15 @@ function createGoalWithGraph(input: {
   readonly createdAt: string;
 }) {
   return Effect.gen(function* () {
+    const rootThreadId = ThreadId.make(`thread:goal:${input.goalId}`);
+    const graph = completionValidSchedulerGraph(input.goalId, input.nodes);
     yield* input.goals.create({
       id: input.goalId,
       projectId: ProjectId.make(`project:${input.goalId}`),
       objective: "schedule work",
       status: "planning",
       sourceThreadId: ThreadId.make(`thread:source:${input.goalId}`),
-      rootThreadId: ThreadId.make(`thread:goal:${input.goalId}`),
+      rootThreadId,
       policy,
       currentGraphVersionId: null,
       currentRevision: 0,
@@ -146,9 +176,9 @@ function createGoalWithGraph(input: {
         id: input.graphVersionId,
         goalId: input.goalId,
         revision: 1,
-        publishedByNodeId: GoalNodeId.make(`lead:${input.goalId}`),
-        nodes: input.nodes,
-        edges: [],
+        publishedByNodeId: canonicalGoalLeadPublisherId(rootThreadId),
+        nodes: graph.nodes,
+        edges: graph.edges,
         createdAt: input.createdAt,
       },
     });
@@ -198,20 +228,21 @@ it.layer(TestLayer)("GoalScheduler durable leasing", (it) => {
           notes: [],
         },
         outputContract: {
-          kind: "structured_result" as const,
-          description: "report",
+          kind: "commit" as const,
+          description: "commit",
           requiredFields: [],
         },
         requiredCapabilities: ["tools.shell"],
-        workspaceMode: "read_only" as const,
+        workspaceMode: "writer" as const,
         routingRequest: {
           type: "exact" as const,
           providerInstanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5.4",
         },
         evidenceRequirements: [],
-        policy: readOnlyPolicy,
+        policy,
       };
+      const verifier = schedulerVerifierNode(GoalNodeId.make("node:verifier"));
       yield* goals.activateGraph({
         goalId,
         expectedRevision: 0,
@@ -219,9 +250,15 @@ it.layer(TestLayer)("GoalScheduler durable leasing", (it) => {
           id: graphVersionId,
           goalId,
           revision: 1,
-          publishedByNodeId: GoalNodeId.make("lead"),
-          nodes: [node],
-          edges: [],
+          publishedByNodeId: canonicalGoalLeadPublisherId(rootThreadId),
+          nodes: [node, verifier],
+          edges: [
+            {
+              id: GoalEdgeId.make("edge:worker-verifier"),
+              fromNodeId: node.id,
+              toNodeId: verifier.id,
+            },
+          ],
           createdAt: "2026-07-12T00:00:01.000Z",
         },
       });
@@ -230,7 +267,10 @@ it.layer(TestLayer)("GoalScheduler durable leasing", (it) => {
       assert.equal(first.leasedAttempts.length, 1);
       const afterFirst = yield* goals.getDetail(goalId);
       assert.equal(afterFirst.goal.status, "running");
-      assert.equal(afterFirst.nodes[0]?.status, "running");
+      assert.equal(
+        afterFirst.nodes.find((candidate) => candidate.node.id === node.id)?.status,
+        "running",
+      );
       assert.equal(afterFirst.attempts[0]?.status, "leased");
       assert.equal(afterFirst.attempts[0]?.resolvedRoute?.providerInstanceId, "codex");
       assert.equal(afterFirst.attempts[0]?.baseIntegrationSha, "sha:base");
@@ -299,6 +339,9 @@ it.layer(TestLayer)("GoalScheduler durable leasing", (it) => {
         ...node,
         id: GoalNodeId.make("node:replacement"),
       };
+      const replacementVerifier = schedulerVerifierNode(
+        GoalNodeId.make("node:replacement-verifier"),
+      );
       yield* goals.activateGraph({
         goalId,
         expectedRevision: 1,
@@ -306,9 +349,15 @@ it.layer(TestLayer)("GoalScheduler durable leasing", (it) => {
           id: replacementGraphVersionId,
           goalId,
           revision: 2,
-          publishedByNodeId: GoalNodeId.make("lead:replacement"),
-          nodes: [replacementNode],
-          edges: [],
+          publishedByNodeId: canonicalGoalLeadPublisherId(rootThreadId),
+          nodes: [replacementNode, replacementVerifier],
+          edges: [
+            {
+              id: GoalEdgeId.make("edge:replacement-writer-verifier"),
+              fromNodeId: replacementNode.id,
+              toNodeId: replacementVerifier.id,
+            },
+          ],
           createdAt: "2026-07-12T00:01:00.000Z",
         },
       });
@@ -374,6 +423,7 @@ it.layer(CapacityTestLayer)("GoalScheduler global capacity", (it) => {
       const pausedNodes = [
         schedulerNode(GoalNodeId.make("node:paused-reader-a")),
         schedulerNode(GoalNodeId.make("node:paused-reader-b")),
+        schedulerNode(GoalNodeId.make("node:paused-completion-writer"), "writer"),
       ];
       yield* createGoalWithGraph({
         goals,
@@ -403,7 +453,10 @@ it.layer(CapacityTestLayer)("GoalScheduler global capacity", (it) => {
         goals,
         goalId: readyGoalId,
         graphVersionId: readyGraphVersionId,
-        nodes: [readyNode],
+        nodes: [
+          readyNode,
+          schedulerNode(GoalNodeId.make("node:ready-completion-writer"), "writer"),
+        ],
         createdAt: "2026-07-12T00:00:03.000Z",
       });
       const blockedByPausedWorkers = yield* scheduler.tick;

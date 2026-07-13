@@ -48,6 +48,7 @@ import {
   runDaemonWithOptions as runEffectWorkerDaemonWithOptions,
 } from "./EffectWorker.ts";
 import { EventSinkV2, layer as eventSinkLayer } from "./EventSink.ts";
+import { canonicalGoalLeadPublisherId } from "./GoalGraphSemantics.ts";
 import { EventStoreV2, layer as eventStoreLayer } from "./EventStore.ts";
 import { layer as idAllocatorLayer } from "./IdAllocator.ts";
 import {
@@ -138,6 +139,7 @@ it.layer(TestLayer)("orchestration V2 foundation persistence", (it) => {
   it.effect("rebuilds goal projections and detects unreadable goal state", () =>
     Effect.gen(function* () {
       const eventSink = yield* EventSinkV2;
+      const eventStore = yield* EventStoreV2;
       const goalStore = yield* GoalProjectionStore;
       const maintenance = yield* ProjectionMaintenanceV2;
       const sql = yield* SqlClient.SqlClient;
@@ -160,7 +162,7 @@ it.layer(TestLayer)("orchestration V2 foundation persistence", (it) => {
             payload: {
               id: goalId,
               objective: "rebuild",
-              status: "waiting_for_source",
+              status: "planning",
               sourceThreadId: threadId,
               rootThreadId: threadId,
               policy: {
@@ -227,8 +229,33 @@ it.layer(TestLayer)("orchestration V2 foundation persistence", (it) => {
           toolAllowlist: ["shell"],
         },
       });
-      const firstNode = makeGoalNode("node:foundation-rebuild:first");
-      const secondNode = makeGoalNode("node:foundation-rebuild:second");
+      const firstNode = {
+        ...makeGoalNode("node:foundation-rebuild:first"),
+        workspaceMode: "writer" as const,
+        outputContract: {
+          kind: "commit" as const,
+          description: "commit",
+          requiredFields: [],
+        },
+        policy: {
+          sandboxMode: "workspace-write" as const,
+          approvalPolicy: "on-request" as const,
+          writableRoots: ["/workspace"],
+          providerAllowlist: ["codex"],
+          toolAllowlist: ["shell"],
+        },
+      };
+      const secondNode = {
+        ...makeGoalNode("node:foundation-rebuild:second"),
+        outputContract: {
+          kind: "verification" as const,
+          description: "verification",
+          requiredFields: ["verdict"],
+        },
+        evidenceRequirements: [
+          { kind: "command" as const, description: "test log", required: true },
+        ],
+      };
       const edge = {
         id: GoalEdgeId.make("edge:foundation-rebuild"),
         fromNodeId: firstNode.id,
@@ -245,11 +272,12 @@ it.layer(TestLayer)("orchestration V2 foundation persistence", (it) => {
             payload: {
               goalId,
               expectedRevision: 0,
+              expectedStatus: "planning",
               graph: {
                 id: graphId,
                 goalId,
                 revision: 1,
-                publishedByNodeId: GoalNodeId.make("lead:foundation-rebuild"),
+                publishedByNodeId: canonicalGoalLeadPublisherId(threadId),
                 nodes: [firstNode, secondNode],
                 edges: [edge],
                 createdAt: timestamp,
@@ -305,6 +333,71 @@ it.layer(TestLayer)("orchestration V2 foundation persistence", (it) => {
       yield* sql`PRAGMA foreign_keys=ON`;
       assert.deepEqual((yield* maintenance.verify).inconsistentGoalIds, [goalId]);
       assert.isTrue((yield* maintenance.rebuild).valid);
+
+      const legacyThreadId = ThreadId.make("thread:foundation-legacy-goal-rebuild");
+      const legacyGoalId = GoalId.make("goal:foundation-legacy-rebuild");
+      const legacyNode = makeGoalNode("node:foundation-legacy-only");
+      yield* eventStore.append({
+        events: [
+          threadCreatedEvent({
+            id: "event:foundation-legacy-rebuild:thread",
+            thread: makeThread(legacyThreadId, now),
+            now,
+          }),
+          {
+            id: EventId.make("event:foundation-legacy-rebuild:goal"),
+            type: "goal.created",
+            threadId: legacyThreadId,
+            occurredAt: now,
+            payload: {
+              id: legacyGoalId,
+              objective: "legacy rebuild",
+              status: "planning",
+              sourceThreadId: legacyThreadId,
+              rootThreadId: legacyThreadId,
+              policy: {
+                sandboxMode: "workspace-write",
+                approvalPolicy: "on-request",
+                writableRoots: ["/workspace"],
+                providerAllowlist: ["codex"],
+                toolAllowlist: ["shell"],
+              },
+              currentGraphVersionId: null,
+              currentRevision: 0,
+              integrationBranch: null,
+              integrationWorktreePath: null,
+              integrationSha: null,
+              verifiedSha: null,
+              createdAt: timestamp,
+              updatedAt: timestamp,
+            },
+          },
+          {
+            id: EventId.make("event:foundation-legacy-rebuild:graph"),
+            type: "goal.graph-version-activated",
+            threadId: legacyThreadId,
+            occurredAt: now,
+            payload: {
+              goalId: legacyGoalId,
+              expectedRevision: 0,
+              graph: {
+                id: GoalGraphVersionId.make("graph:foundation-legacy-rebuild"),
+                goalId: legacyGoalId,
+                revision: 1,
+                publishedByNodeId: GoalNodeId.make("legacy-arbitrary-publisher"),
+                nodes: [legacyNode],
+                edges: [],
+                createdAt: timestamp,
+              },
+              activatedAt: timestamp,
+            },
+          },
+        ],
+      });
+      assert.isTrue((yield* maintenance.rebuild).valid);
+      const legacyDetail = yield* goalStore.getDetail(legacyGoalId);
+      assert.equal(legacyDetail.graphVersions[0]?.publishedByNodeId, "legacy-arbitrary-publisher");
+      assert.deepEqual(legacyDetail.graphVersions[0]?.nodes, [legacyNode]);
     }),
   );
   it.effect("paginates catch-up beyond the event-store read limit", () =>
