@@ -436,6 +436,15 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         ...existing,
         objective: event.payload.objective,
         status: event.payload.status,
+        ...(event.payload.sourceActiveRunId === undefined
+          ? {}
+          : { sourceActiveRunId: event.payload.sourceActiveRunId }),
+        ...(event.payload.pendingLaunchClaimId === undefined
+          ? {}
+          : { pendingLaunchClaimId: event.payload.pendingLaunchClaimId }),
+        ...(event.payload.sourceHandoff === undefined
+          ? {}
+          : { sourceHandoff: event.payload.sourceHandoff }),
         currentGraphVersionId:
           event.type === "goal.reopened" ? null : existing.currentGraphVersionId,
         integrationBranch: event.payload.integrationBranch,
