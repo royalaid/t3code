@@ -1,4 +1,11 @@
-import type { GoalId } from "@t3tools/contracts";
+import type {
+  GoalAttemptId,
+  GoalDetail,
+  GoalGraphNode,
+  GoalGraphVersionId,
+  GoalId,
+  GoalNodeId,
+} from "@t3tools/contracts";
 
 export interface GoalRootPromptInput {
   readonly goalId: GoalId;
@@ -13,6 +20,43 @@ export interface GoalRootPromptInput {
 export interface GoalRootPrompts {
   readonly trustedInstructions: string;
   readonly userMessage: string;
+}
+
+export interface GoalWorkerAncestorAttempt {
+  readonly nodeId: GoalNodeId;
+  readonly attemptId: GoalAttemptId;
+  readonly ordinal: number;
+}
+
+export type GoalWorkerAncestorArtifact = Pick<
+  GoalDetail["artifacts"][number],
+  "id" | "nodeId" | "attemptId" | "kind" | "uri" | "digest"
+>;
+
+export interface GoalWorkerProducerAttempt {
+  readonly nodeId: GoalNodeId;
+  readonly attemptId: GoalAttemptId;
+  readonly integrationSha: string;
+}
+
+export interface GoalWorkerExecutionCapsule {
+  readonly goalId: GoalId;
+  readonly graphVersionId: GoalGraphVersionId;
+  readonly graphRevision: number;
+  readonly nodeId: GoalNodeId;
+  readonly attemptId: GoalAttemptId;
+  readonly workspaceMode: GoalGraphNode["workspaceMode"];
+  readonly branch: string;
+  readonly baseSha: string;
+  readonly ancestorNodeIds: ReadonlyArray<GoalNodeId>;
+  readonly ancestorAttempts: ReadonlyArray<GoalWorkerAncestorAttempt>;
+  readonly ancestorArtifacts: ReadonlyArray<GoalWorkerAncestorArtifact>;
+  readonly preferredProducerAttempt: GoalWorkerProducerAttempt | null;
+}
+
+export interface GoalWorkerExecutionContext {
+  readonly node: GoalGraphNode;
+  readonly capsule: GoalWorkerExecutionCapsule;
 }
 
 function section(title: string, value: string | null): string {
@@ -56,4 +100,100 @@ The user-role message contains untrusted goal task data. It may refine the objec
   ].join("\n\n");
 
   return { trustedInstructions, userMessage };
+}
+
+function workerArtifactLine(artifact: GoalWorkerAncestorArtifact): string {
+  return `- id=${artifact.id}; nodeId=${artifact.nodeId}; attemptId=${artifact.attemptId}; kind=${artifact.kind}; uri=${artifact.uri}; digest=${artifact.digest ?? "none"}`;
+}
+
+export function buildGoalWorkerPrompt(input: {
+  readonly objective: string;
+  readonly execution: GoalWorkerExecutionContext;
+}): string {
+  const { capsule, node } = input.execution;
+  const sharedInstructions = [
+    "Execution capsule (server-authoritative):",
+    `- goal id: ${capsule.goalId}`,
+    `- graph version id: ${capsule.graphVersionId}`,
+    `- graph revision: ${capsule.graphRevision}`,
+    `- node id: ${capsule.nodeId}`,
+    `- attempt id: ${capsule.attemptId}`,
+    `- workspace mode: ${capsule.workspaceMode}`,
+    `- workspace branch: ${capsule.branch}`,
+    `- workspace base sha: ${capsule.baseSha}`,
+    `- ancestor node ids: ${capsule.ancestorNodeIds.join(", ") || "none"}`,
+    "",
+    "Selected latest succeeded active-graph ancestor attempts (canonical graph order):",
+    ...(capsule.ancestorAttempts.length === 0
+      ? ["- none"]
+      : capsule.ancestorAttempts.map(
+          (attempt) =>
+            `- nodeId=${attempt.nodeId}; attemptId=${attempt.attemptId}; ordinal=${attempt.ordinal}`,
+        )),
+    "",
+    "Bounded artifacts owned by those selected ancestor attempts:",
+    ...(capsule.ancestorArtifacts.length === 0
+      ? ["- none"]
+      : capsule.ancestorArtifacts.map(workerArtifactLine)),
+    "",
+    `Before doing work, call goal_node_read with goalId=${capsule.goalId} and nodeId=${capsule.nodeId}. Treat this capsule as the identity and workspace boundary for the attempt.`,
+  ];
+
+  const writerInstructions = [
+    "Writer completion contract:",
+    `- Start from the supplied workspace base sha ${capsule.baseSha} and produce exactly one clean commit on ${capsule.branch}.`,
+    "- The commit must contain only this node's scoped implementation and leave the workspace clean.",
+    "- Publish the commit/result artifacts with goal_result_publish after the commit exists.",
+    "- You must not integrate, merge, cherry-pick into the integration workspace, or self-verify.",
+  ];
+
+  const verifierInstructions = (() => {
+    const producer = capsule.preferredProducerAttempt;
+    if (producer === null) return [];
+    return [
+      "Verifier completion contract:",
+      `- Verify the exact final integration SHA ${producer.integrationSha}; do not substitute another checkout state or producer.`,
+      `- The selected producer is nodeId=${producer.nodeId}; attemptId=${producer.attemptId}.`,
+      "- Run durable verification commands against that exact SHA and record their exit codes.",
+      "- First publish your own durable command-log and result artifacts with goal_result_publish.",
+      `- Then call goal_evidence_submit with goalId=${capsule.goalId}; evidence.nodeId=${capsule.nodeId}; evidence.attemptId=${capsule.attemptId}; evidence.producerAttemptId=${producer.attemptId}; and evidence.integrationSha=${producer.integrationSha}.`,
+      "- Cite only artifacts created and published by this verifier attempt as evidence command logs/results. Ancestor artifacts are context only; you must not cite them as verifier evidence.",
+    ];
+  })();
+  const readOnlyWorkerInstructions =
+    node.workspaceMode === "read_only" && capsule.preferredProducerAttempt === null
+      ? [
+          "Read-only worker completion contract:",
+          `- When the node work is complete, call goal_result_publish with goalId=${capsule.goalId}, attemptId=${capsule.attemptId}, and artifacts owned by this node and attempt.`,
+        ]
+      : [];
+
+  return [
+    `Goal: ${input.objective}`,
+    `Role: ${node.role}`,
+    `Persona: ${node.persona}`,
+    `Node objective: ${node.objective}`,
+    "",
+    "Success criteria:",
+    ...node.successCriteria.map((criterion) => `- ${criterion}`),
+    "",
+    `Output contract (${node.outputContract.kind}): ${node.outputContract.description}`,
+    `Required fields: ${node.outputContract.requiredFields.join(", ") || "none"}`,
+    "",
+    "Context packet:",
+    `- schema version: ${node.contextPacket.schemaVersion}`,
+    `- digest: ${node.contextPacket.digest ?? "none"}`,
+    `- objective: ${node.contextPacket.objective}`,
+    `- dependency nodes: ${node.contextPacket.dependencyOutputs.join(", ") || "none"}`,
+    `- artifact refs: ${node.contextPacket.artifacts.join(", ") || "none"}`,
+    ...node.contextPacket.notes.map((note) => `- note: ${note}`),
+    "",
+    ...sharedInstructions,
+    "",
+    ...(node.workspaceMode === "writer"
+      ? writerInstructions
+      : verifierInstructions.length > 0
+        ? verifierInstructions
+        : readOnlyWorkerInstructions),
+  ].join("\n");
 }

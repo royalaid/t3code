@@ -1,7 +1,105 @@
-import { GoalId } from "@t3tools/contracts";
+import {
+  GoalArtifactId,
+  GoalAttemptId,
+  GoalGraphVersionId,
+  GoalId,
+  GoalNodeId,
+  ProviderInstanceId,
+  type GoalGraphNode,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildGoalRootPrompts } from "./GoalPrompts.ts";
+import {
+  buildGoalRootPrompts,
+  buildGoalWorkerPrompt,
+  type GoalWorkerExecutionCapsule,
+} from "./GoalPrompts.ts";
+
+const workerPolicy = {
+  sandboxMode: "workspace-write" as const,
+  approvalPolicy: "on-request" as const,
+  writableRoots: ["/repo"],
+  providerAllowlist: ["codex"],
+  toolAllowlist: ["shell"],
+};
+
+const workerRoute = {
+  type: "exact" as const,
+  providerInstanceId: ProviderInstanceId.make("codex"),
+  model: "gpt-5.4",
+};
+
+const workerNode = (workspaceMode: "writer" | "read_only"): GoalGraphNode => ({
+  id: GoalNodeId.make(workspaceMode === "writer" ? "node:writer" : "node:verifier"),
+  role: workspaceMode === "writer" ? "implementer" : "verifier",
+  persona: "careful engineer",
+  objective: workspaceMode === "writer" ? "implement the change" : "verify the change",
+  successCriteria: ["complete the assigned node"],
+  contextPacket: {
+    schemaVersion: 1,
+    digest: null,
+    objective: "complete the assigned node",
+    artifacts: [],
+    dependencyOutputs: [],
+    notes: [],
+  },
+  outputContract: {
+    kind: workspaceMode === "writer" ? "commit" : "verification",
+    description: workspaceMode === "writer" ? "one commit" : "durable verification",
+    requiredFields: ["summary"],
+  },
+  requiredCapabilities: ["tools.shell"],
+  workspaceMode,
+  routingRequest: workerRoute,
+  evidenceRequirements:
+    workspaceMode === "writer"
+      ? []
+      : [{ kind: "command", description: "run checks", required: true }],
+  policy: workerPolicy,
+});
+
+const workerCapsule = (workspaceMode: "writer" | "read_only"): GoalWorkerExecutionCapsule => ({
+  goalId: GoalId.make("goal:worker-prompt"),
+  graphVersionId: GoalGraphVersionId.make("graph:worker-prompt"),
+  graphRevision: 3,
+  nodeId: GoalNodeId.make(workspaceMode === "writer" ? "node:writer" : "node:verifier"),
+  attemptId: GoalAttemptId.make(workspaceMode === "writer" ? "attempt:writer" : "attempt:verifier"),
+  workspaceMode,
+  branch: workspaceMode === "writer" ? "goal-worker/attempt-writer" : "goal-read/shared",
+  baseSha: "sha:integrated-final",
+  ancestorNodeIds: workspaceMode === "writer" ? [] : [GoalNodeId.make("node:writer")],
+  ancestorAttempts:
+    workspaceMode === "writer"
+      ? []
+      : [
+          {
+            nodeId: GoalNodeId.make("node:writer"),
+            attemptId: GoalAttemptId.make("attempt:writer"),
+            ordinal: 2,
+          },
+        ],
+  ancestorArtifacts:
+    workspaceMode === "writer"
+      ? []
+      : [
+          {
+            id: GoalArtifactId.make("artifact:writer-result"),
+            nodeId: GoalNodeId.make("node:writer"),
+            attemptId: GoalAttemptId.make("attempt:writer"),
+            kind: "commit",
+            uri: "git:sha:integrated-final",
+            digest: "sha256:writer-result",
+          },
+        ],
+  preferredProducerAttempt:
+    workspaceMode === "writer"
+      ? null
+      : {
+          nodeId: GoalNodeId.make("node:writer"),
+          attemptId: GoalAttemptId.make("attempt:writer"),
+          integrationSha: "sha:integrated-final",
+        },
+});
 
 describe("goal root prompts", () => {
   it("separates the trusted coordinator contract from untrusted task data", () => {
@@ -56,5 +154,50 @@ describe("goal root prompts", () => {
     expect(trustedInstructions).toContain("goal_evidence_submit");
     expect(trustedInstructions).toContain("integration");
     expect(trustedInstructions).toContain("delegate_task");
+  });
+});
+
+describe("goal worker prompts", () => {
+  it("gives a writer its bounded identities and one-clean-commit completion contract", () => {
+    const prompt = buildGoalWorkerPrompt({
+      objective: "ship the requested behavior",
+      execution: {
+        node: workerNode("writer"),
+        capsule: workerCapsule("writer"),
+      },
+    });
+
+    expect(prompt).toContain("goal:worker-prompt");
+    expect(prompt).toContain("graph:worker-prompt");
+    expect(prompt).toContain("graph revision: 3");
+    expect(prompt).toContain("node:writer");
+    expect(prompt).toContain("attempt:writer");
+    expect(prompt).toContain("goal-worker/attempt-writer");
+    expect(prompt).toMatch(/goal_node_read[\s\S]*goal_result_publish/u);
+    expect(prompt).toContain("exactly one clean commit");
+    expect(prompt).toContain("workspace base sha: sha:integrated-final");
+    expect(prompt).toContain("must not integrate");
+    expect(prompt).not.toContain("goal_evidence_submit");
+  });
+
+  it("gives a verifier the exact producer and forbids ancestor artifacts as evidence", () => {
+    const prompt = buildGoalWorkerPrompt({
+      objective: "ship the requested behavior",
+      execution: {
+        node: workerNode("read_only"),
+        capsule: workerCapsule("read_only"),
+      },
+    });
+
+    expect(prompt).toContain("attempt:verifier");
+    expect(prompt).toContain("attempt:writer");
+    expect(prompt).toContain("artifact:writer-result");
+    expect(prompt).toContain("sha:integrated-final");
+    expect(prompt).toMatch(
+      /goal_node_read[\s\S]*durable verification commands[\s\S]*goal_result_publish[\s\S]*goal_evidence_submit/u,
+    );
+    expect(prompt).toContain("publish your own durable command-log and result artifacts");
+    expect(prompt).toContain("Ancestor artifacts are context only");
+    expect(prompt).toContain("must not cite them as verifier evidence");
   });
 });

@@ -4,6 +4,7 @@ import {
   type GoalAttemptId,
   type GoalDetail,
   type GoalGraphNode,
+  type GoalNodeId,
   type GoalNodeStatus,
   MessageId,
   type OrchestrationV2DomainEvent,
@@ -16,6 +17,8 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { EventSinkV2 } from "./EventSink.ts";
+import { isGoalVerifierNode, transitiveAncestorNodeIds } from "./GoalGraphSemantics.ts";
+import { buildGoalWorkerPrompt, type GoalWorkerExecutionContext } from "./GoalPrompts.ts";
 import { GoalProjectionStore, validateGoalNodeWorkspace } from "./GoalProjectionStore.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
 import {
@@ -25,40 +28,260 @@ import {
 } from "./GoalWorkspaceService.ts";
 import { ThreadManagementService } from "./ThreadManagementService.ts";
 
-export function goalWorkerPrompt(input: {
-  readonly goal: GoalDetail["goal"];
-  readonly node: GoalGraphNode;
-}): string {
-  return [
-    `Goal: ${input.goal.objective}`,
-    `Role: ${input.node.role}`,
-    `Persona: ${input.node.persona}`,
-    `Node objective: ${input.node.objective}`,
-    "",
-    "Success criteria:",
-    ...input.node.successCriteria.map((criterion) => `- ${criterion}`),
-    "",
-    `Output contract (${input.node.outputContract.kind}): ${input.node.outputContract.description}`,
-    `Required fields: ${input.node.outputContract.requiredFields.join(", ") || "none"}`,
-    "",
-    "Context packet:",
-    `- schema version: ${input.node.contextPacket.schemaVersion}`,
-    `- digest: ${input.node.contextPacket.digest ?? "none"}`,
-    `- objective: ${input.node.contextPacket.objective}`,
-    `- dependency nodes: ${input.node.contextPacket.dependencyOutputs.join(", ") || "none"}`,
-    `- artifact refs: ${input.node.contextPacket.artifacts.join(", ") || "none"}`,
-    ...input.node.contextPacket.notes.map((note) => `- note: ${note}`),
-  ].join("\n");
-}
+const GoalAttemptExecutionReason = Schema.Literals([
+  "stale_graph",
+  "attempt_binding_mismatch",
+  "workspace_binding_mismatch",
+  "verification_sha_mismatch",
+  "ancestor_attempt_missing",
+  "producer_context_missing",
+  "producer_context_ambiguous",
+]);
+type GoalAttemptExecutionReason = typeof GoalAttemptExecutionReason.Type;
 
 export class GoalAttemptExecutionError extends Schema.TaggedErrorClass<GoalAttemptExecutionError>()(
   "GoalAttemptExecutionError",
   {
     operation: Schema.String,
     attemptId: Schema.optional(Schema.String),
+    reason: Schema.optional(GoalAttemptExecutionReason),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
+
+const isGoalAttemptExecutionError = Schema.is(GoalAttemptExecutionError);
+
+function executionContractError(input: {
+  readonly reason: GoalAttemptExecutionReason;
+  readonly operation: string;
+  readonly attemptId: GoalAttemptId;
+  readonly cause: string;
+}): GoalAttemptExecutionError {
+  return new GoalAttemptExecutionError(input);
+}
+
+function throwExecutionContractError(input: {
+  readonly reason: GoalAttemptExecutionReason;
+  readonly operation: string;
+  readonly attemptId: GoalAttemptId;
+  readonly cause: string;
+}): never {
+  throw executionContractError(input);
+}
+
+export function buildGoalWorkerExecutionCapsule(input: {
+  readonly detail: GoalDetail;
+  readonly attemptId: GoalAttemptId;
+  readonly workspace: GoalPreparedWorkspace;
+}): GoalWorkerExecutionContext {
+  const { detail, attemptId, workspace } = input;
+  const attempt = detail.attempts.find((candidate) => candidate.id === attemptId);
+  if (attempt === undefined) {
+    return throwExecutionContractError({
+      reason: "attempt_binding_mismatch",
+      operation: "validate-fresh-attempt",
+      attemptId,
+      cause: "The bound attempt is absent from the fresh goal projection.",
+    });
+  }
+  const graph = detail.graphVersions.find(
+    (candidate) => candidate.id === detail.goal.currentGraphVersionId,
+  );
+  if (
+    graph === undefined ||
+    graph.id !== attempt.graphVersionId ||
+    graph.revision !== detail.goal.currentRevision
+  ) {
+    return throwExecutionContractError({
+      reason: "stale_graph",
+      operation: "validate-fresh-graph",
+      attemptId,
+      cause: "The attempt no longer belongs to the current graph revision.",
+    });
+  }
+  const graphNode = graph.nodes.find((candidate) => candidate.id === attempt.nodeId);
+  const nodeProjection = detail.nodes.find(
+    (candidate) => candidate.graphVersionId === graph.id && candidate.node.id === attempt.nodeId,
+  );
+  if (
+    attempt.status !== "launching" ||
+    graphNode === undefined ||
+    nodeProjection === undefined ||
+    nodeProjection.node.id !== attempt.nodeId ||
+    nodeProjection.activeAttemptId !== attempt.id ||
+    nodeProjection.status !== "running"
+  ) {
+    return throwExecutionContractError({
+      reason: "attempt_binding_mismatch",
+      operation: "validate-fresh-attempt",
+      attemptId,
+      cause:
+        "The fresh projection does not show this launching attempt as the active node binding.",
+    });
+  }
+  const workspaceBindingIssue = goalAttemptWorkspaceBindingError({
+    node: graphNode,
+    attemptId,
+    workspace,
+    integrationWorktreePath: detail.goal.integrationWorktreePath,
+  });
+  if (
+    workspaceBindingIssue !== null ||
+    attempt.workspacePath !== workspace.path ||
+    attempt.baseIntegrationSha !== workspace.baseSha
+  ) {
+    return throwExecutionContractError({
+      reason: "workspace_binding_mismatch",
+      operation: "validate-fresh-workspace",
+      attemptId,
+      cause:
+        workspaceBindingIssue ??
+        "The prepared workspace no longer matches the attempt's durable path and base SHA.",
+    });
+  }
+  if (isGoalVerifierNode(graphNode) && detail.goal.integrationSha !== workspace.baseSha) {
+    return throwExecutionContractError({
+      reason: "verification_sha_mismatch",
+      operation: "validate-verification-sha",
+      attemptId,
+      cause: "A verifier must launch against the current final integration SHA.",
+    });
+  }
+
+  const ancestorIds = transitiveAncestorNodeIds(graph, graphNode.id);
+  const ancestorNodes = graph.nodes.filter((candidate) => ancestorIds.has(candidate.id));
+  const latestSucceededAttempts = new Map<GoalNodeId, GoalDetail["attempts"][number]>();
+  for (const candidate of detail.attempts) {
+    if (
+      candidate.graphVersionId !== graph.id ||
+      candidate.status !== "succeeded" ||
+      !ancestorIds.has(candidate.nodeId)
+    ) {
+      continue;
+    }
+    const current = latestSucceededAttempts.get(candidate.nodeId);
+    if (
+      current === undefined ||
+      candidate.ordinal > current.ordinal ||
+      (candidate.ordinal === current.ordinal &&
+        String(candidate.id).localeCompare(String(current.id)) > 0)
+    ) {
+      latestSucceededAttempts.set(candidate.nodeId, candidate);
+    }
+  }
+  const ancestorAttempts = ancestorNodes.map((ancestorNode) => {
+    const selected = latestSucceededAttempts.get(ancestorNode.id);
+    if (selected === undefined) {
+      return throwExecutionContractError({
+        reason: "ancestor_attempt_missing",
+        operation: "select-ancestor-attempt",
+        attemptId,
+        cause: `Ancestor node ${ancestorNode.id} has no succeeded attempt in the active graph.`,
+      });
+    }
+    return {
+      node: ancestorNode,
+      attempt: selected,
+    };
+  });
+  const selectedAttemptsByNode = new Map(
+    ancestorAttempts.map(({ node: ancestorNode, attempt: selected }) => [
+      ancestorNode.id,
+      selected,
+    ]),
+  );
+  const ancestorArtifacts = detail.artifacts
+    .filter((artifact) => selectedAttemptsByNode.get(artifact.nodeId)?.id === artifact.attemptId)
+    .toSorted(
+      (left, right) =>
+        left.createdAt.localeCompare(right.createdAt) ||
+        String(left.id).localeCompare(String(right.id)),
+    )
+    .map((artifact) => ({
+      id: artifact.id,
+      nodeId: artifact.nodeId,
+      attemptId: artifact.attemptId,
+      kind: artifact.kind,
+      uri: artifact.uri,
+      digest: artifact.digest,
+    }));
+
+  const integratedWriterAttemptsByNode = new Map<GoalNodeId, Set<GoalAttemptId>>();
+  for (const record of detail.writerCommits) {
+    if (
+      record.graphVersionId !== graph.id ||
+      record.state !== "integrated" ||
+      record.integrationAfterSha !== workspace.baseSha
+    ) {
+      continue;
+    }
+    const attemptIds = integratedWriterAttemptsByNode.get(record.nodeId);
+    if (attemptIds === undefined) {
+      integratedWriterAttemptsByNode.set(record.nodeId, new Set([record.attemptId]));
+    } else {
+      attemptIds.add(record.attemptId);
+    }
+  }
+  const producerCandidates = isGoalVerifierNode(graphNode)
+    ? ancestorAttempts.filter(
+        ({ node: ancestorNode, attempt: selected }) =>
+          ancestorNode.workspaceMode === "writer" &&
+          integratedWriterAttemptsByNode.get(ancestorNode.id)?.has(selected.id) === true,
+      )
+    : [];
+  const seenProducerAttempts = new Set<GoalAttemptId>();
+  const distinctProducerCandidates = producerCandidates.filter(({ attempt: candidate }) => {
+    if (seenProducerAttempts.has(candidate.id)) return false;
+    seenProducerAttempts.add(candidate.id);
+    return true;
+  });
+  if (isGoalVerifierNode(graphNode) && distinctProducerCandidates.length === 0) {
+    return throwExecutionContractError({
+      reason: "producer_context_missing",
+      operation: "select-producer-context",
+      attemptId,
+      cause: "No succeeded ancestor writer integrated the verifier workspace base SHA.",
+    });
+  }
+  if (distinctProducerCandidates.length > 1) {
+    return throwExecutionContractError({
+      reason: "producer_context_ambiguous",
+      operation: "select-producer-context",
+      attemptId,
+      cause: "Multiple succeeded ancestor writers claim the verifier workspace base SHA.",
+    });
+  }
+  const producer = distinctProducerCandidates[0];
+
+  return {
+    node: graphNode,
+    capsule: {
+      goalId: detail.goal.id,
+      graphVersionId: graph.id,
+      graphRevision: graph.revision,
+      nodeId: graphNode.id,
+      attemptId: attempt.id,
+      workspaceMode: graphNode.workspaceMode,
+      branch: workspace.branch,
+      baseSha: workspace.baseSha,
+      ancestorNodeIds: ancestorNodes.map((ancestorNode) => ancestorNode.id),
+      ancestorAttempts: ancestorAttempts.map(({ node: ancestorNode, attempt: selected }) => ({
+        nodeId: ancestorNode.id,
+        attemptId: selected.id,
+        ordinal: selected.ordinal,
+      })),
+      ancestorArtifacts,
+      preferredProducerAttempt:
+        producer === undefined
+          ? null
+          : {
+              nodeId: producer.node.id,
+              attemptId: producer.attempt.id,
+              integrationSha: workspace.baseSha,
+            },
+    },
+  };
+}
 
 export class GoalAttemptExecutionService extends Context.Service<
   GoalAttemptExecutionService,
@@ -170,6 +393,7 @@ export const layer = Layer.effect(
             .getDetail(input.goalId)
             .pipe(Effect.mapError(failure("refresh-launch-fence", input.attemptId)));
           const freshAttempt = fresh.attempts.find((candidate) => candidate.id === input.attemptId);
+          if (fresh.goal.currentGraphVersionId !== attempt.graphVersionId) return false;
           const freshNode = fresh.nodes.find(
             (candidate) =>
               candidate.graphVersionId === attempt.graphVersionId &&
@@ -185,6 +409,10 @@ export const layer = Layer.effect(
       // Do not create a mutable writer worktree for an attempt that lost its
       // goal-level cancellation race before we reached the workspace boundary.
       if (!(yield* launchStillFenced())) return;
+      const projectId = detail.goal.projectId;
+      if (projectId === undefined) {
+        return yield* failure("resolve-project", input.attemptId)("Goal has no project identity.");
+      }
       const workspace = yield* workspaces
         .prepareAttempt(input)
         .pipe(Effect.mapError(failure("resolve-workspace", input.attemptId)));
@@ -200,10 +428,6 @@ export const layer = Layer.effect(
       // for Cancel Goal to win. Fence again before changing durable attempt
       // ownership from leased to launching.
       if (!(yield* launchStillFenced())) return;
-      const projectId = detail.goal.projectId;
-      if (projectId === undefined) {
-        return yield* failure("resolve-project", input.attemptId)("Goal has no project identity.");
-      }
       const executionThreadId = ThreadId.make(`goal-worker:${input.attemptId}`);
       const modelSelection = {
         instanceId: resolvedRoute.providerInstanceId,
@@ -260,12 +484,30 @@ export const layer = Layer.effect(
         attempt = threadBound;
       }
       if (attempt.executionThreadId !== executionThreadId) {
-        return yield* failure(
-          "bind-thread",
-          input.attemptId,
-        )("Attempt is bound to a different execution thread.");
+        return yield* executionContractError({
+          reason: "attempt_binding_mismatch",
+          operation: "bind-thread",
+          attemptId: input.attemptId,
+          cause: "Attempt is bound to a different execution thread.",
+        });
       }
       if (attempt.runId !== null) return;
+      const freshDetail = yield* goals
+        .getDetail(input.goalId)
+        .pipe(Effect.mapError(failure("refresh-execution-capsule", input.attemptId)));
+      if (freshDetail.goal.status !== "running") return;
+      const execution = yield* Effect.try({
+        try: () =>
+          buildGoalWorkerExecutionCapsule({
+            detail: freshDetail,
+            attemptId: input.attemptId,
+            workspace,
+          }),
+        catch: (cause) =>
+          isGoalAttemptExecutionError(cause)
+            ? cause
+            : failure("build-execution-capsule", input.attemptId)(cause),
+      });
       if (!(yield* launchStillFenced())) return;
       yield* threads
         .dispatch({
@@ -273,13 +515,13 @@ export const layer = Layer.effect(
           commandId: CommandId.make(`goal-attempt-thread:${input.attemptId}`),
           threadId: executionThreadId,
           projectId,
-          title: `${projection.node.role}: ${projection.node.objective}`.slice(0, 512),
+          title: `${execution.node.role}: ${execution.node.objective}`.slice(0, 512),
           modelSelection,
           runtimeMode:
-            projection.node.workspaceMode === "read_only"
+            execution.node.workspaceMode === "read_only"
               ? "approval-required"
               : "auto-accept-edits",
-          interactionMode: detail.goal.rootInteractionMode ?? "default",
+          interactionMode: freshDetail.goal.rootInteractionMode ?? "default",
           branch: workspace.branch,
           worktreePath: workspace.path,
           createdBy: "system",
@@ -293,7 +535,10 @@ export const layer = Layer.effect(
           commandId: CommandId.make(`goal-attempt-message:${input.attemptId}`),
           threadId: executionThreadId,
           messageId: MessageId.make(`goal-worker-message:${input.attemptId}`),
-          text: goalWorkerPrompt({ goal: detail.goal, node: projection.node }),
+          text: buildGoalWorkerPrompt({
+            objective: freshDetail.goal.objective,
+            execution,
+          }),
           attachments: [],
           modelSelection: {
             instanceId: resolvedRoute.providerInstanceId,
