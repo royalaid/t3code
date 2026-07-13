@@ -351,6 +351,7 @@ export const layer = Layer.effect(
                     Effect.tap(() =>
                       Effect.logError("Goal pending launch failed", {
                         goalId: detail.goal.id,
+                        detail: String(cause).slice(0, 4_000),
                         cause,
                       }),
                     ),
@@ -371,7 +372,11 @@ export const layer = Layer.effect(
     yield* events.stream().pipe(
       Stream.filter(
         (stored: OrchestrationV2StoredEvent) =>
-          stored.event.type === "run.updated" && TERMINAL.has(stored.event.payload.status),
+          // A newly created goal with no active source run has no other launch
+          // trigger: without reacting to goal.created it would wait for an
+          // unrelated terminal run or a server restart.
+          stored.event.type === "goal.created" ||
+          (stored.event.type === "run.updated" && TERMINAL.has(stored.event.payload.status)),
       ),
       Stream.map((stored) => {
         const event = stored.event;
@@ -383,7 +388,7 @@ export const layer = Layer.effect(
             }
           : null;
       }),
-      Stream.runForEach((event) => (event === null ? Effect.void : process(event))),
+      Stream.runForEach((event) => process(event)),
       Effect.catch((cause) => Effect.logError("Goal launch event consumer failed", { cause })),
       Effect.forkScoped,
     );
