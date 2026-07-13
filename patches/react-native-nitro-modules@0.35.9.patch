@@ -1,5 +1,17 @@
+diff --git a/android/build.gradle b/android/build.gradle
+index 6721e9cbf7a1de3bc819904bf3bef2562aac374a..e771b696cef76e548717ca09232cd612228ed2bc 100644
+--- a/android/build.gradle
++++ b/android/build.gradle
+@@ -69,6 +69,7 @@ android {
+ 
+   externalNativeBuild {
+     cmake {
++      buildStagingDirectory new File(rootProject.rootDir, ".cxx/nitro-modules")
+       path "CMakeLists.txt"
+     }
+   }
 diff --git a/package.json b/package.json
-index 4e4366fb9d05a6c250acfc62e79487475d8ac05b..200e4680d77cbb4f14d22eb986efde1275a0d3e8 100644
+index d0b5b2e51fbc8dc0a729fa984c14cb750f840e73..26bbd9a2729b79cb7f08d20ca5210cf28cb99a55 100644
 --- a/package.json
 +++ b/package.json
 @@ -88,6 +88,11 @@
