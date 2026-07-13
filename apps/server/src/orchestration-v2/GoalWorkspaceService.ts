@@ -245,14 +245,24 @@ export const layer = Layer.effect(
           input.attemptId,
         )("Goal repository root is unavailable.");
       const branch = goalBranchName("read", `${input.goalId}:${input.baseSha}`);
-      const worktree = yield* ensureWorktree({
-        repositoryRoot,
-        baseSha: input.baseSha,
-        branch,
-        baseRefName: input.detail.goal.integrationBranch ?? "HEAD",
-      }).pipe(
-        Effect.mapError(workspaceError("create-read-only-worktree", input.goalId, input.attemptId)),
-      );
+      // Serialized per goal: concurrent launch triggers (startup rescan plus the
+      // settlement event stream) would otherwise race the same `worktree add -b`
+      // and lose with "reference already exists".
+      const worktree = yield* serial
+        .withLock(
+          input.goalId,
+          ensureWorktree({
+            repositoryRoot,
+            baseSha: input.baseSha,
+            branch,
+            baseRefName: input.detail.goal.integrationBranch ?? "HEAD",
+          }),
+        )
+        .pipe(
+          Effect.mapError(
+            workspaceError("create-read-only-worktree", input.goalId, input.attemptId),
+          ),
+        );
       if (worktree.head !== input.baseSha)
         return yield* workspaceError(
           "reconcile-read-only-worktree",
