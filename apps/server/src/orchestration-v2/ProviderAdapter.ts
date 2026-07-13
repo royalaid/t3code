@@ -59,6 +59,13 @@ export const ProviderAdapterV2RuntimePolicy = Schema.Struct({
 });
 export type ProviderAdapterV2RuntimePolicy = typeof ProviderAdapterV2RuntimePolicy.Type;
 
+export const ProviderAdapterV2TrustedInstructionDelivery = Schema.Literals([
+  "system_prompt",
+  "developer_instructions",
+]);
+export type ProviderAdapterV2TrustedInstructionDelivery =
+  typeof ProviderAdapterV2TrustedInstructionDelivery.Type;
+
 export const ProviderAdapterV2TurnMessage = Schema.Struct({
   messageId: MessageId,
   text: Schema.String,
@@ -275,6 +282,17 @@ export class ProviderAdapterTurnStartError extends Schema.TaggedErrorClass<Provi
   }
 }
 
+export class ProviderAdapterTrustedInstructionsUnsupportedError extends Schema.TaggedErrorClass<ProviderAdapterTrustedInstructionsUnsupportedError>()(
+  "ProviderAdapterTrustedInstructionsUnsupportedError",
+  {
+    driver: ProviderDriverKind,
+  },
+) {
+  override get message(): string {
+    return `${this.driver} cannot start a goal-root turn because it does not support trusted instructions.`;
+  }
+}
+
 export class ProviderAdapterSteerRunUnsupportedError extends Schema.TaggedErrorClass<ProviderAdapterSteerRunUnsupportedError>()(
   "ProviderAdapterSteerRunUnsupportedError",
   {
@@ -363,6 +381,7 @@ export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterReadThreadSnapshotError,
   ProviderAdapterRollbackThreadError,
   ProviderAdapterForkThreadError,
+  ProviderAdapterTrustedInstructionsUnsupportedError,
   ProviderAdapterTurnStartError,
   ProviderAdapterSteerRunUnsupportedError,
   ProviderAdapterSteerRunError,
@@ -401,6 +420,8 @@ export interface ProviderAdapterV2TurnInput {
   readonly message: ProviderAdapterV2TurnMessage;
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
+  /** Server-owned control-plane text delivered outside the user message role. */
+  readonly trustedInstructions?: string;
 }
 
 export interface ProviderAdapterV2SteerInput {
@@ -516,6 +537,8 @@ export interface ProviderAdapterV2SessionRuntime {
 export interface ProviderAdapterV2Shape {
   readonly instanceId: ProviderInstanceId;
   readonly driver: ProviderDriverKind;
+  /** Omitted by providers that cannot deliver server-owned trusted instructions. */
+  readonly trustedInstructionDelivery?: ProviderAdapterV2TrustedInstructionDelivery;
   readonly getCapabilities: () => Effect.Effect<
     OrchestrationV2ProviderCapabilities,
     ProviderAdapterV2Error

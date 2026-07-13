@@ -31,7 +31,11 @@ import { ServerSettingsService } from "../serverSettings.ts";
 import { CheckpointServiceV2 } from "./CheckpointService.ts";
 import { EventSinkV2 } from "./EventSink.ts";
 import { layer as idAllocatorLayer } from "./IdAllocator.ts";
-import type { ProviderAdapterV2Event, ProviderAdapterV2SessionRuntime } from "./ProviderAdapter.ts";
+import type {
+  ProviderAdapterV2Event,
+  ProviderAdapterV2SessionRuntime,
+  ProviderAdapterV2TurnInput,
+} from "./ProviderAdapter.ts";
 import { ProviderEventIngestorV2 } from "./ProviderEventIngestor.ts";
 import {
   finalProviderThreadStatus,
@@ -251,6 +255,70 @@ it.effect("rechecks run ownership immediately before calling the provider", () =
 
     assert.equal(yield* Ref.get(guardCalls), 2);
     assert.equal(yield* Ref.get(providerStarts), 0);
+  }).pipe(Effect.provide(RunExecutionTestLayer)),
+);
+
+it.effect("delivers durable run trusted instructions to the provider turn", () =>
+  Effect.gen(function* () {
+    const runExecution = yield* RunExecutionServiceV2;
+    const capturedTurn = yield* Ref.make<ProviderAdapterV2TurnInput | null>(null);
+    const threadId = ThreadId.make("thread:run-execution-trusted-instructions");
+    const runId = RunId.make("run:run-execution-trusted-instructions");
+    const attemptId = RunAttemptId.make("attempt:run-execution-trusted-instructions");
+    const providerThreadId = ProviderThreadId.make(
+      "provider-thread:run-execution-trusted-instructions",
+    );
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const rootNodeId = NodeId.make("node:run-execution-trusted-instructions");
+    const run = {
+      id: runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId,
+      trustedInstructions: "TRUSTED_GOAL_ROOT_CONTRACT",
+    } as OrchestrationV2Run;
+    const providerThread = {
+      id: providerThreadId,
+      driver,
+    } as OrchestrationV2ProviderThread;
+    const session = {
+      events: Stream.never,
+      startTurn: (input: ProviderAdapterV2TurnInput) => Ref.set(capturedTurn, input),
+    } as unknown as ProviderAdapterV2SessionRuntime;
+
+    yield* runExecution.startRootRun({
+      commandId: CommandId.make("command:run-execution-trusted-instructions"),
+      appThread: { id: threadId } as OrchestrationV2AppThread,
+      providerSessionId: ProviderSessionId.make("session:run-execution-trusted-instructions"),
+      session,
+      run,
+      rootNode: { id: rootNodeId } as OrchestrationV2ExecutionNode,
+      checkpointScope: {
+        id: CheckpointScopeId.make("checkpoint-scope:run-execution-trusted-instructions"),
+      } as OrchestrationV2CheckpointScope,
+      providerThread,
+      attempt: { id: attemptId, providerTurnId: null } as OrchestrationV2RunAttempt,
+      attemptId,
+      providerTurnOrdinal: 1,
+      message: {
+        messageId: MessageId.make("message:run-execution-trusted-instructions"),
+        text: "UNTRUSTED_TASK_DATA",
+        attachments: [],
+        createdBy: "system",
+        creationSource: "server",
+      },
+      modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
+      runtimePolicy: {
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      },
+    });
+
+    const turn = yield* Ref.get(capturedTurn);
+    assert.isNotNull(turn);
+    assert.equal(turn?.trustedInstructions, "TRUSTED_GOAL_ROOT_CONTRACT");
+    assert.equal(turn?.message.text, "UNTRUSTED_TASK_DATA");
   }).pipe(Effect.provide(RunExecutionTestLayer)),
 );
 

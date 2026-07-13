@@ -61,6 +61,7 @@ const driver = ProviderDriverKind.make("codex");
 const orchestrationAdapter = {
   instanceId: modelSelection.instanceId,
   driver,
+  trustedInstructionDelivery: "developer_instructions",
   getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
   planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
   openSession: () => Effect.die("sessions are not used by lifecycle tests"),
@@ -79,10 +80,38 @@ const providerInstance = {
   textGeneration: {} as ProviderInstance["textGeneration"],
 } satisfies ProviderInstance;
 
+function withoutTrustedInstructionDelivery(adapter: ProviderAdapterV2Shape) {
+  const { trustedInstructionDelivery, ...unsupported } = adapter;
+  void trustedInstructionDelivery;
+  return unsupported;
+}
+
+const unsupportedOrchestrationAdapter: ProviderAdapterV2Shape = {
+  ...withoutTrustedInstructionDelivery(orchestrationAdapter),
+  instanceId: ProviderInstanceId.make("unsupported-trusted-instructions"),
+  driver: ProviderDriverKind.make("unsupported"),
+};
+
+const unsupportedProviderInstance = {
+  ...providerInstance,
+  instanceId: unsupportedOrchestrationAdapter.instanceId,
+  driverKind: unsupportedOrchestrationAdapter.driver,
+  continuationIdentity: {
+    driverKind: unsupportedOrchestrationAdapter.driver,
+    continuationKey: "unsupported:test",
+  },
+  displayName: "Unsupported trusted-instruction test",
+  orchestrationAdapter: unsupportedOrchestrationAdapter,
+} satisfies ProviderInstance;
+const providerInstances: ReadonlyArray<ProviderInstance> = [
+  providerInstance,
+  unsupportedProviderInstance,
+];
+
 const TestProviderInstanceRegistry = Layer.succeed(ProviderInstanceRegistry, {
   getInstance: (instanceId) =>
-    Effect.succeed(instanceId === providerInstance.instanceId ? providerInstance : undefined),
-  listInstances: Effect.succeed([providerInstance]),
+    Effect.succeed(providerInstances.find((instance) => instance.instanceId === instanceId)),
+  listInstances: Effect.succeed(providerInstances),
   listUnavailable: Effect.succeed([]),
   streamChanges: Stream.empty,
   subscribeChanges: Effect.never,
@@ -405,6 +434,124 @@ it.layer(SharedApplicationDataPlaneTestLayer)("pending provider interruption", (
 });
 
 it.layer(SharedApplicationDataPlaneTestLayer)("goal launch invariants", (it) => {
+  it.effect("persists server-owned goal-root trusted instructions outside the user message", () =>
+    Effect.gen(function* () {
+      const applicationEngine = yield* OrchestrationEngineService;
+      const orchestrator = yield* OrchestratorV2;
+      const projectId = ProjectId.make("runtime-layer-goal-trusted-project");
+      const sourceThreadId = ThreadId.make("runtime-layer-goal-trusted-source");
+      const rootThreadId = ThreadId.make("runtime-layer-goal-trusted-root");
+      yield* applicationEngine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("runtime-layer-goal-trusted-project-create"),
+        projectId,
+        title: "Goal trusted instructions project",
+        workspaceRoot: process.cwd(),
+        defaultModelSelection: modelSelection,
+        scripts: [],
+        createdAt: "2026-07-13T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-goal-trusted-source-create"),
+        threadId: sourceThreadId,
+        projectId,
+        title: "Source",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: "main",
+        worktreePath: process.cwd(),
+      });
+      yield* orchestrator.dispatch({
+        type: "goal.launch",
+        commandId: CommandId.make("runtime-layer-goal-trusted-launch"),
+        threadId: sourceThreadId,
+        rootThreadId,
+        objective: "Implement the trusted prompt transport",
+        messageId: MessageId.make("runtime-layer-goal-trusted-goal-message"),
+        attachments: [],
+        selectedContextText: [],
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const created = yield* orchestrator.getThreadProjection(rootThreadId);
+      const goalId = created.goal!.goal.id;
+      const claimId = `goal-root-launch:${goalId}`;
+      yield* orchestrator.dispatch({
+        type: "goal.pending-launch.claim",
+        commandId: CommandId.make("runtime-layer-goal-trusted-claim"),
+        threadId: rootThreadId,
+        goalId,
+        claimId,
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "system",
+        creationSource: "server",
+        commandId: CommandId.make("runtime-layer-goal-trusted-message"),
+        threadId: rootThreadId,
+        messageId: MessageId.make("runtime-layer-goal-trusted-message"),
+        text: "UNTRUSTED_TASK_DATA",
+        attachments: [],
+        modelSelection,
+        trustedInstructions: "TRUSTED_GOAL_ROOT_CONTRACT",
+        dispatchMode: { type: "defer_start" },
+        goalLaunchClaim: { goalId, claimId },
+      });
+
+      const launched = yield* orchestrator.getThreadProjection(rootThreadId);
+      assert.equal(launched.runs[0]?.trustedInstructions, "TRUSTED_GOAL_ROOT_CONTRACT");
+      assert.equal(launched.messages[0]?.text, "UNTRUSTED_TASK_DATA");
+      assert.notInclude(launched.messages[0]?.text ?? "", "TRUSTED_GOAL_ROOT_CONTRACT");
+
+      const rejected = yield* orchestrator
+        .dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make("runtime-layer-goal-trusted-client-rejected"),
+          threadId: sourceThreadId,
+          messageId: MessageId.make("runtime-layer-goal-trusted-client-rejected"),
+          text: "ordinary user message",
+          attachments: [],
+          modelSelection,
+          trustedInstructions: "CLIENT_CONTROL_PLANE_INJECTION",
+          dispatchMode: { type: "start_immediately" },
+        })
+        .pipe(Effect.flip);
+      assert.match(String(rejected.cause), /server-owned goal-root/iu);
+      assert.deepEqual((yield* orchestrator.getThreadProjection(sourceThreadId)).runs, []);
+
+      const unsupported = yield* orchestrator
+        .dispatch({
+          type: "message.dispatch",
+          createdBy: "system",
+          creationSource: "server",
+          commandId: CommandId.make("runtime-layer-goal-trusted-unsupported"),
+          threadId: rootThreadId,
+          messageId: MessageId.make("runtime-layer-goal-trusted-unsupported"),
+          text: "UNTRUSTED_TASK_DATA",
+          attachments: [],
+          modelSelection: {
+            instanceId: unsupportedProviderInstance.instanceId,
+            model: "unsupported-model",
+          },
+          trustedInstructions: "TRUSTED_GOAL_ROOT_CONTRACT",
+          dispatchMode: { type: "defer_start" },
+          goalLaunchClaim: { goalId, claimId },
+        })
+        .pipe(Effect.flip);
+      assert.equal(unsupported._tag, "OrchestratorProviderAdapterError");
+      if (unsupported._tag === "OrchestratorProviderAdapterError") {
+        assert.match(String(unsupported.cause), /trusted instructions/iu);
+      }
+      assert.lengthOf((yield* orchestrator.getThreadProjection(rootThreadId)).runs, 1);
+    }),
+  );
+
   it.effect("atomically rejects a colliding client-selected goal root id", () =>
     Effect.gen(function* () {
       const applicationEngine = yield* OrchestrationEngineService;

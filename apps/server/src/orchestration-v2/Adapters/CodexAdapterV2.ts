@@ -511,11 +511,21 @@ function codexRuntimeModeTurnDefaults(runtimeMode: RuntimeMode): {
   }
 }
 
+function codexDeveloperInstructionsForTurn(
+  interactionMode: ProviderAdapterV2RuntimePolicy["interactionMode"],
+  trustedInstructions: string | undefined,
+): string | undefined {
+  if (interactionMode !== "plan") return trustedInstructions;
+  if (trustedInstructions === undefined) return CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS;
+  return `${CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS}\n\n${trustedInstructions}`;
+}
+
 export function buildCodexTurnStartParams(input: {
   readonly nativeThreadId: string;
   readonly codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>;
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
   readonly modelSelection: ModelSelection;
+  readonly trustedInstructions?: string;
 }) {
   return Effect.gen(function* () {
     const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
@@ -534,17 +544,21 @@ export function buildCodexTurnStartParams(input: {
     const effort =
       selectedEffort === undefined ? undefined : yield* decodeTurnReasoningEffort(selectedEffort);
     const serviceTier = getCodexServiceTierOptionValue(input.modelSelection);
+    const developerInstructions = codexDeveloperInstructionsForTurn(
+      input.runtimePolicy.interactionMode,
+      input.trustedInstructions,
+    );
     const collaborationMode: CodexSchema.ClientRequest__CollaborationMode | undefined =
-      input.runtimePolicy.interactionMode === "plan"
-        ? {
-            mode: "plan",
+      developerInstructions === undefined
+        ? undefined
+        : {
+            mode: input.runtimePolicy.interactionMode === "plan" ? "plan" : "default",
             settings: {
               model: input.modelSelection.model,
               reasoning_effort: effort ?? "medium",
-              developer_instructions: CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
+              developer_instructions: developerInstructions,
             },
-          }
-        : undefined;
+          };
 
     return yield* decodeCodexTurnStartParamsWithCollaborationMode({
       threadId: input.nativeThreadId,
@@ -1246,6 +1260,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
   return ProviderAdapterV2.of({
     instanceId: adapterOptions.instanceId,
     driver: CODEX_PROVIDER,
+    trustedInstructionDelivery: "developer_instructions",
     getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
     planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
     openSession: (input) =>
@@ -3618,6 +3633,9 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                 codexInput,
                 runtimePolicy: turnInput.runtimePolicy,
                 modelSelection: turnInput.modelSelection,
+                ...(turnInput.trustedInstructions === undefined
+                  ? {}
+                  : { trustedInstructions: turnInput.trustedInstructions }),
               });
               yield* Ref.update(pendingRootTurns, (current) => {
                 const updated = new Map(current);

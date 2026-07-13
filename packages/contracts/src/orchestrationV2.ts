@@ -359,6 +359,8 @@ export const OrchestrationV2Run = Schema.Struct({
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
   checkpointId: Schema.NullOr(CheckpointId),
   contextHandoffId: Schema.NullOr(ContextHandoffId),
+  /** Server-owned control-plane text for provider-native trusted instruction channels. */
+  trustedInstructions: Schema.optional(Schema.String),
   sourcePlanRef: Schema.optional(
     Schema.Struct({
       threadId: ThreadId,
@@ -1864,6 +1866,7 @@ export const OrchestrationV2Command = Schema.Union([
     attachments: Schema.Array(ChatAttachment),
     modelSelection: Schema.optional(ModelSelection),
     sourcePlanRef: Schema.optional(Schema.Struct({ threadId: ThreadId, planId: PlanId })),
+    trustedInstructions: Schema.optional(Schema.String),
     goalLaunchClaim: Schema.optional(
       Schema.Struct({ goalId: GoalId, claimId: TrimmedNonEmptyString }),
     ),

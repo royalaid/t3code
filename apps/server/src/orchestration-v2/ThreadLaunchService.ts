@@ -50,6 +50,7 @@ export interface ThreadLaunchInitialMessage {
   readonly messageId?: MessageId;
   readonly text: string;
   readonly attachments: ReadonlyArray<ChatAttachment>;
+  readonly trustedInstructions?: string;
 }
 
 export interface ThreadLaunchInput {
@@ -541,6 +542,9 @@ export const make = Effect.gen(function* () {
               ...(input.goalLaunchClaim === undefined
                 ? {}
                 : { goalLaunchClaim: input.goalLaunchClaim }),
+              ...(input.initialMessage.trustedInstructions === undefined
+                ? {}
+                : { trustedInstructions: input.initialMessage.trustedInstructions }),
               createdBy: input.createdBy,
               creationSource: input.creationSource,
             })

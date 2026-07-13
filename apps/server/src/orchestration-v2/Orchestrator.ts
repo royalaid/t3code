@@ -49,7 +49,10 @@ import { GoalProjectionStore } from "./GoalProjectionStore.ts";
 import { makeKeyedSerialExecutor } from "./KeyedSerialExecutor.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { applyToProjection, emptyProjection, ProjectionStoreV2 } from "./ProjectionStore.ts";
-import type { ProviderAdapterV2Shape } from "./ProviderAdapter.ts";
+import {
+  ProviderAdapterTrustedInstructionsUnsupportedError,
+  type ProviderAdapterV2Shape,
+} from "./ProviderAdapter.ts";
 import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
@@ -2095,6 +2098,40 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       }
       const modelSelection = command.modelSelection ?? projection.thread.modelSelection;
+      let trustedInstructionsAdapter: ProviderAdapterV2Shape | undefined;
+      if (command.trustedInstructions !== undefined) {
+        if (
+          command.goalLaunchClaim === undefined ||
+          command.createdBy !== "system" ||
+          command.creationSource !== "server"
+        ) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "Trusted instructions are restricted to server-owned goal-root launches.",
+          });
+        }
+        const adapter = yield* providerAdapters.get(modelSelection.instanceId).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestratorProviderAdapterError({
+                commandId: command.commandId,
+                providerInstanceId: modelSelection.instanceId,
+                cause,
+              }),
+          ),
+        );
+        if (adapter.trustedInstructionDelivery === undefined) {
+          return yield* new OrchestratorProviderAdapterError({
+            commandId: command.commandId,
+            providerInstanceId: modelSelection.instanceId,
+            cause: new ProviderAdapterTrustedInstructionsUnsupportedError({
+              driver: adapter.driver,
+            }),
+          });
+        }
+        trustedInstructionsAdapter = adapter;
+      }
       const dispatchMode = command.dispatchMode;
       const sourcePlanProjection =
         command.sourcePlanRef === undefined
@@ -2272,6 +2309,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           completedAt: null,
           checkpointId: null,
           contextHandoffId: null,
+          ...(command.trustedInstructions === undefined
+            ? {}
+            : { trustedInstructions: command.trustedInstructions }),
           ...(command.sourcePlanRef === undefined ? {} : { sourcePlanRef: command.sourcePlanRef }),
         };
         const attempt: OrchestrationV2RunAttempt = {
@@ -2438,16 +2478,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         pendingMergeBackTransfer === undefined &&
         !isProviderSwitch
       ) {
-        const adapter = yield* providerAdapters.get(modelSelection.instanceId).pipe(
-          Effect.mapError(
-            (cause) =>
-              new OrchestratorProviderAdapterError({
-                commandId: command.commandId,
-                providerInstanceId: modelSelection.instanceId,
-                cause,
-              }),
-          ),
-        );
+        const adapter =
+          trustedInstructionsAdapter ??
+          (yield* providerAdapters.get(modelSelection.instanceId).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestratorProviderAdapterError({
+                  commandId: command.commandId,
+                  providerInstanceId: modelSelection.instanceId,
+                  cause,
+                }),
+            ),
+          ));
         const providerSessionId =
           activeProviderThread?.providerSessionId ??
           (yield* mapDispatchError(command)(
@@ -2532,6 +2574,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           completedAt: null,
           checkpointId: null,
           contextHandoffId: null,
+          ...(command.trustedInstructions === undefined
+            ? {}
+            : { trustedInstructions: command.trustedInstructions }),
           ...(command.sourcePlanRef === undefined ? {} : { sourcePlanRef: command.sourcePlanRef }),
         };
         const attempt: OrchestrationV2RunAttempt = {
@@ -2762,16 +2807,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       }
 
-      const adapter = yield* providerAdapters.get(modelSelection.instanceId).pipe(
-        Effect.mapError(
-          (cause) =>
-            new OrchestratorProviderAdapterError({
-              commandId: command.commandId,
-              providerInstanceId: modelSelection.instanceId,
-              cause,
-            }),
-        ),
-      );
+      const adapter =
+        trustedInstructionsAdapter ??
+        (yield* providerAdapters.get(modelSelection.instanceId).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestratorProviderAdapterError({
+                commandId: command.commandId,
+                providerInstanceId: modelSelection.instanceId,
+                cause,
+              }),
+          ),
+        ));
       const targetProviderThread = isProviderSwitch
         ? rootProviderThreadsForProvider(projection, modelSelection.instanceId)[0]
         : activeProviderThread;
@@ -3156,6 +3203,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         checkpointId: null,
         contextHandoffId:
           portableForkHandoff?.id ?? providerSwitchHandoff?.id ?? mergeBackHandoff?.id ?? null,
+        ...(command.trustedInstructions === undefined
+          ? {}
+          : { trustedInstructions: command.trustedInstructions }),
         ...(command.sourcePlanRef === undefined ? {} : { sourcePlanRef: command.sourcePlanRef }),
       };
       const attempt: OrchestrationV2RunAttempt = {

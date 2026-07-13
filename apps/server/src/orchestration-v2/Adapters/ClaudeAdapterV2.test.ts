@@ -124,6 +124,33 @@ function makeClaudeTestTurnInput(input: {
 }
 
 describe("ClaudeAdapterV2 runtime query policy", () => {
+  it("appends trusted instructions to Claude Code's system prompt", () => {
+    const options = makeClaudeQueryOptions({
+      modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+      nativeThreadId: "native-trusted-instructions",
+      resume: false,
+      cwd: "/workspace",
+      trustedInstructions: "TRUSTED_GOAL_ROOT_CONTRACT",
+    });
+
+    assert.deepEqual(options.systemPrompt, {
+      type: "preset",
+      preset: "claude_code",
+      append: "TRUSTED_GOAL_ROOT_CONTRACT",
+    });
+  });
+
+  it("leaves the Claude system prompt unchanged for ordinary turns", () => {
+    const options = makeClaudeQueryOptions({
+      modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+      nativeThreadId: "native-ordinary-turn",
+      resume: false,
+      cwd: "/workspace",
+    });
+
+    assert.equal(options.systemPrompt, undefined);
+  });
+
   it("maps canonical read-only never policy to Claude dontAsk with read-only tools", () => {
     const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(
       ProviderAdapterV2RuntimePolicy.make({

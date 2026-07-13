@@ -768,6 +768,9 @@ export const layer: Layer.Layer<
               message: input.message,
               modelSelection: input.modelSelection,
               runtimePolicy: input.runtimePolicy,
+              ...(input.run.trustedInstructions === undefined
+                ? {}
+                : { trustedInstructions: input.run.trustedInstructions }),
             })
             .pipe(
               Effect.catchCause((cause) =>

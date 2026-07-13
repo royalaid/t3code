@@ -123,6 +123,52 @@ describe("CodexAdapterV2 assistant message streaming", () => {
 });
 
 describe("CodexAdapterV2 runtime policy", () => {
+  it.effect("maps trusted instructions to Codex developer instructions", () =>
+    Effect.gen(function* () {
+      const params = yield* buildCodexTurnStartParams({
+        nativeThreadId: "native-trusted-instructions",
+        codexInput: [{ type: "text", text: "UNTRUSTED_TASK_DATA" }],
+        runtimePolicy: {
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          cwd: "/workspace",
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5.4",
+        },
+        trustedInstructions: "TRUSTED_GOAL_ROOT_CONTRACT",
+      });
+
+      assert.equal(params.collaborationMode?.mode, "default");
+      assert.equal(
+        params.collaborationMode?.settings.developer_instructions,
+        "TRUSTED_GOAL_ROOT_CONTRACT",
+      );
+      assert.deepEqual(params.input, [{ type: "text", text: "UNTRUSTED_TASK_DATA" }]);
+    }),
+  );
+
+  it.effect("leaves Codex collaboration mode absent for ordinary default turns", () =>
+    Effect.gen(function* () {
+      const params = yield* buildCodexTurnStartParams({
+        nativeThreadId: "native-ordinary-turn",
+        codexInput: [{ type: "text", text: "ordinary" }],
+        runtimePolicy: {
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          cwd: "/workspace",
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5.4",
+        },
+      });
+
+      assert.equal(params.collaborationMode, undefined);
+    }),
+  );
+
   it.effect("derives concrete Codex turn policies from every T3 runtime mode", () =>
     Effect.gen(function* () {
       const build = (runtimeMode: "approval-required" | "auto-accept-edits" | "full-access") =>

@@ -14,6 +14,7 @@ import * as Path from "effect/Path";
 
 import { EventSinkV2 } from "./EventSink.ts";
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
+import { buildGoalRootPrompts } from "./GoalPrompts.ts";
 import {
   goalBranchName,
   GoalWorkspaceService,
@@ -248,6 +249,15 @@ export const layer = Layer.effect(
         worktreePath: source.thread.worktreePath,
         checkpoints: source.checkpoints,
       });
+      const prompts = buildGoalRootPrompts({
+        goalId: current.goal.id,
+        objective: handoff.objective,
+        sourceSummary: handoff.sourceSummary,
+        projectInstructions: handoff.projectInstructions,
+        branchState: handoff.branchState,
+        relevantCheckpoints: handoff.relevantCheckpoints,
+        selectedContextText: handoff.selectedContextText,
+      });
       // Re-check after nontrivial reads and immediately before provisioning a
       // retained integration worktree. A cancelled pending launch must not
       // create repository state merely because it was claimed earlier.
@@ -303,8 +313,9 @@ export const layer = Layer.effect(
           branch: rootLeadWorkspace.branch,
         },
         initialMessage: {
-          text: `Goal objective:\n${current.goal.objective}\n\nSource summary:\n${handoff.sourceSummary ?? "The source thread has no conversation history."}\n\nProject instructions:\n${handoff.projectInstructions.join("\n\n") || "No project instruction file was found."}\n\nBranch state:\n${handoff.branchState ?? "Unknown"}\n\nRelevant checkpoints:\n${handoff.relevantCheckpoints.join("\n") || "None"}\n\nSelected context:\n${handoff.selectedContextText.join("\n\n") || "None"}`,
+          text: prompts.userMessage,
           attachments: handoff.attachments,
+          trustedInstructions: prompts.trustedInstructions,
         },
         goalLaunchClaim: { goalId: current.goal.id, claimId },
         createdBy: "system",

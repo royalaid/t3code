@@ -631,6 +631,7 @@ export function makeClaudeQueryOptions(input: {
   readonly permissionMode?: PermissionMode;
   readonly canUseTool?: CanUseTool;
   readonly allowDangerouslySkipPermissions?: boolean;
+  readonly trustedInstructions?: string;
 }): ClaudeAgentSdkQueryOptions {
   const compiledSelection = compileClaudeModelSelection(input.modelSelection);
   const extraArgs =
@@ -673,6 +674,14 @@ export function makeClaudeQueryOptions(input: {
       : {}),
     ...(input.environment === undefined ? {} : { env: input.environment }),
     ...(input.mcpServers === undefined ? {} : { mcpServers: input.mcpServers }),
+    ...(input.trustedInstructions === undefined
+      ? {}
+      : {
+          systemPrompt: {
+            ...CLAUDE_CODE_PRESET_TOOLS,
+            append: input.trustedInstructions,
+          },
+        }),
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
   };
   return input.cwd === null ? options : { ...options, cwd: input.cwd };
@@ -1833,6 +1842,7 @@ export function makeClaudeAdapterV2(
   return ProviderAdapterV2.of({
     instanceId: adapterOptions.instanceId,
     driver: CLAUDE_PROVIDER,
+    trustedInstructionDelivery: "system_prompt",
     getCapabilities: () => Effect.succeed(ClaudeProviderCapabilitiesV2),
     planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
     openSession: Effect.fn("ClaudeAdapterV2.openSession")(
@@ -3080,6 +3090,9 @@ export function makeClaudeAdapterV2(
                 ? {}
                 : { allowDangerouslySkipPermissions: queryPolicy.allowDangerouslySkipPermissions }),
               ...(shouldInstallClaudePermissionCallback(queryPolicy) ? { canUseTool } : {}),
+              ...(turnInput.trustedInstructions === undefined
+                ? {}
+                : { trustedInstructions: turnInput.trustedInstructions }),
             }),
           });
           const closed = yield* Deferred.make<void, never>();
