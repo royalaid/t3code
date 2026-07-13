@@ -1,0 +1,12 @@
+diff --git a/android/build.gradle b/android/build.gradle
+index 0515ddb1dc4f371edffaf9c31463af7898cfb579..f6bcce7cbea26a714d1ee2d459b0101c23bf8ee5 100644
+--- a/android/build.gradle
++++ b/android/build.gradle
+@@ -63,6 +63,7 @@ android {
+ 
+   externalNativeBuild {
+     cmake {
++      buildStagingDirectory new File(rootProject.rootDir, ".cxx/nitro-markdown")
+       path "CMakeLists.txt"
+     }
+   }
