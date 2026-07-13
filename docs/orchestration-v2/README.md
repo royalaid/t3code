@@ -17,6 +17,7 @@ V2 is designed around the real provider behavior observed in the Codex app-serve
 - [Provider Capability System](./provider-capability-system.md)
 - [Testing Strategy](./testing-strategy.md)
 - [Dynamic Goal Workflows](./goal-workflows.md)
+- [Dynamic Goal Workflows: Context And Handoff](./goal-workflows-context.md)
 
 ## Primary Goals
 
