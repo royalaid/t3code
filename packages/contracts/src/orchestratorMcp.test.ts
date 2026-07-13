@@ -5,6 +5,7 @@ import {
   OrchestratorMcpCreateThreadsInput,
   OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpDelegateTaskResult,
+  GoalMcpNodeCancelInput,
   OrchestratorMcpThreadInterruptInput,
   OrchestratorMcpThreadListInput,
   OrchestratorMcpThreadReadInput,
@@ -16,6 +17,7 @@ import {
 const decodeCreateThreadsInput = Schema.decodeUnknownSync(OrchestratorMcpCreateThreadsInput);
 const decodeDelegateTaskInput = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskInput);
 const decodeDelegateTaskResult = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskResult);
+const decodeGoalNodeCancelInput = Schema.decodeUnknownSync(GoalMcpNodeCancelInput);
 const decodeThreadInterruptInput = Schema.decodeUnknownSync(OrchestratorMcpThreadInterruptInput);
 const decodeThreadListInput = Schema.decodeUnknownSync(OrchestratorMcpThreadListInput);
 const decodeThreadReadInput = Schema.decodeUnknownSync(OrchestratorMcpThreadReadInput);
@@ -115,5 +117,22 @@ describe("orchestrator MCP contracts", () => {
         reason: "Loop converged.",
       }).reason,
     ).toBe("Loop converged.");
+  });
+
+  it("requires an explicit immutable graph target for lead node cancellation", () => {
+    expect(
+      decodeGoalNodeCancelInput({
+        goalId: "goal:1",
+        graphVersionId: "goal-graph:historical",
+        nodeId: "goal-node:worker",
+        disposition: "superseded",
+      }),
+    ).toMatchObject({
+      graphVersionId: "goal-graph:historical",
+      disposition: "superseded",
+    });
+    expect(() =>
+      decodeGoalNodeCancelInput({ goalId: "goal:1", nodeId: "goal-node:worker" }),
+    ).toThrow();
   });
 });

@@ -47,6 +47,32 @@ export function planGoalRecovery(input: {
 }): GoalRecoveryPlan {
   const now = timestamp(input.now);
   const actions: GoalRecoveryAction[] = [];
+  const observedAgents =
+    input.attempts.length +
+    input.attempts.reduce((total, attempt) => total + attempt.usage.nativeDescendantCount, 0);
+  if (observedAgents > GOAL_AGENT_BACKSTOP) {
+    const owner = input.attempts
+      .filter((attempt) => attempt.usage.nativeDescendantCount > 0)
+      .toSorted(
+        (left, right) => right.usage.nativeDescendantCount - left.usage.nativeDescendantCount,
+      )[0];
+    if (owner !== undefined) {
+      return {
+        actions: [
+          {
+            type: "native_descendant_overage",
+            attemptId: owner.id,
+            observed: observedAgents,
+            limit: GOAL_AGENT_BACKSTOP,
+          },
+        ],
+        // A native-descendant violation must dominate all other recovery work:
+        // retrying or reclaiming a lease could otherwise launch work after the
+        // goal has been paused for the same violation.
+        pauseNewLaunches: true,
+      };
+    }
+  }
   const latestByNode = new Map<string, GoalAttempt>();
   for (const attempt of input.attempts) {
     const key = retryKey(attempt);
@@ -83,24 +109,6 @@ export function planGoalRecovery(input: {
       actions.push({
         type: attempt.ordinal < 2 ? "retry" : "retry_exhausted",
         attemptId: attempt.id,
-      });
-    }
-  }
-  const observedAgents =
-    input.attempts.length +
-    input.attempts.reduce((total, attempt) => total + attempt.usage.nativeDescendantCount, 0);
-  if (observedAgents > GOAL_AGENT_BACKSTOP) {
-    const owner = input.attempts
-      .filter((attempt) => attempt.usage.nativeDescendantCount > 0)
-      .toSorted(
-        (left, right) => right.usage.nativeDescendantCount - left.usage.nativeDescendantCount,
-      )[0];
-    if (owner !== undefined) {
-      actions.push({
-        type: "native_descendant_overage",
-        attemptId: owner.id,
-        observed: observedAgents,
-        limit: GOAL_AGENT_BACKSTOP,
       });
     }
   }

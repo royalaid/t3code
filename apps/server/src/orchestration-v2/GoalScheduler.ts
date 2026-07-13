@@ -85,11 +85,39 @@ function createdAgentCount(detail: GoalDetail): number {
   );
 }
 
+function workspaceModeForAttempt(
+  detail: GoalDetail,
+  attempt: GoalAttempt,
+): GoalNodeProjection["node"]["workspaceMode"] | null {
+  return (
+    detail.nodes.find(
+      (projection) =>
+        projection.graphVersionId === attempt.graphVersionId &&
+        projection.node.id === attempt.nodeId,
+    )?.node.workspaceMode ?? null
+  );
+}
+
 export function planGoalScheduling(input: {
   readonly goals: ReadonlyArray<GoalDetail>;
   readonly workerCapacity: number;
   readonly writerCapacity: number;
 }): GoalSchedulingPlan {
+  // Goal lifecycle gates new work only. An in-flight provider attempt owns a
+  // global worker slot until it reaches a terminal state, even if Queue,
+  // Steer, Stop, a conflict, or a replacement graph pauses its goal.
+  const activeAttempts = input.goals.flatMap((detail) =>
+    detail.attempts
+      .filter((attempt) => ACTIVE_ATTEMPT_STATUSES.has(attempt.status))
+      .map((attempt) => ({ detail, attempt })),
+  );
+  const activeWriterAttempts = activeAttempts.filter(({ detail, attempt }) => {
+    const workspaceMode = workspaceModeForAttempt(detail, attempt);
+    // Goal graph/attempt referential integrity normally makes this impossible,
+    // but fail closed if a partially recovered projection cannot identify the
+    // writer mode: undercounting could violate the global writer semaphore.
+    return workspaceMode !== "read_only";
+  });
   const orderedGoals = input.goals
     .filter((detail) => SCHEDULABLE_GOAL_STATUSES.has(detail.goal.status))
     .toSorted((left, right) => {
@@ -100,26 +128,16 @@ export function planGoalScheduling(input: {
         ? left.goal.createdAt.localeCompare(right.goal.createdAt)
         : activeDifference;
     });
-  const activeAttempts = orderedGoals.flatMap((detail) =>
-    detail.attempts.filter((attempt) => ACTIVE_ATTEMPT_STATUSES.has(attempt.status)),
-  );
-  const activeWriterAttempts = orderedGoals.reduce((count, detail) => {
-    const nodes = new Map(
-      currentNodes(detail).map((projection) => [projection.node.id, projection]),
-    );
-    return (
-      count +
-      detail.attempts.filter(
-        (attempt) =>
-          ACTIVE_ATTEMPT_STATUSES.has(attempt.status) &&
-          nodes.get(attempt.nodeId)?.node.workspaceMode === "writer",
-      ).length
-    );
-  }, 0);
   let remainingWorkers = Math.max(0, input.workerCapacity - activeAttempts.length);
-  let remainingWriters = Math.max(0, input.writerCapacity - activeWriterAttempts);
+  let remainingWriters = Math.max(0, input.writerCapacity - activeWriterAttempts.length);
   const transitions: GoalSchedulerTransition[] = [];
   const warnings: GoalSchedulerWarning[] = [];
+  const remainingAgentBudget = new Map(
+    orderedGoals.map((detail) => [
+      detail.goal.id,
+      Math.max(0, GOAL_AGENT_LIFETIME_LIMIT - createdAgentCount(detail)),
+    ]),
+  );
   const candidatesByGoal = orderedGoals.map((detail) => {
     const nodes = currentNodes(detail);
     const statusByNode = new Map(
@@ -156,18 +174,6 @@ export function planGoalScheduling(input: {
       if (!dependencies.every((dependency) => statusByNode.get(dependency) === "succeeded")) {
         return [];
       }
-      if (createdAgents >= GOAL_AGENT_LIFETIME_LIMIT) {
-        transitions.push({
-          goalId: detail.goal.id,
-          graphVersionId: projection.graphVersionId,
-          nodeId: projection.node.id,
-          status: "queued",
-          reason: "resource_backstop",
-          queuePosition: null,
-          dependencyNodeId: null,
-        });
-        return [];
-      }
       return [{ goal: detail, node: projection }];
     });
   });
@@ -180,6 +186,19 @@ export function planGoalScheduling(input: {
   }> = [];
   for (const launch of fairCandidates) {
     const isWriter = launch.node.node.workspaceMode === "writer";
+    const remainingForGoal = remainingAgentBudget.get(launch.goal.goal.id) ?? 0;
+    if (remainingForGoal <= 0) {
+      transitions.push({
+        goalId: launch.goal.goal.id,
+        graphVersionId: launch.node.graphVersionId,
+        nodeId: launch.node.node.id,
+        status: "queued",
+        reason: "resource_backstop",
+        queuePosition: null,
+        dependencyNodeId: null,
+      });
+      continue;
+    }
     if (remainingWorkers <= 0) {
       queued.push({ launch, reason: "capacity" });
       continue;
@@ -189,6 +208,7 @@ export function planGoalScheduling(input: {
       continue;
     }
     launches.push(launch);
+    remainingAgentBudget.set(launch.goal.goal.id, remainingForGoal - 1);
     remainingWorkers -= 1;
     if (isWriter) remainingWriters -= 1;
   }

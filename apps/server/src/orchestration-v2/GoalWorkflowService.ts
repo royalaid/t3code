@@ -26,6 +26,8 @@ import { IdAllocatorV2 } from "./IdAllocator.ts";
 import { ThreadManagementService } from "./ThreadManagementService.ts";
 
 const ACTIVE_RUN_STATUSES = new Set(["preparing", "queued", "starting", "running", "waiting"]);
+const ACTIVE_ATTEMPT_STATUSES = new Set(["leased", "launching", "running", "stalled"]);
+const NODE_CANCELLATION_STATUSES = new Set(["cancelled", "superseded"]);
 const ATTEMPT_ACTIVITY_EVENTS = new Set<OrchestrationV2DomainEvent["type"]>([
   "run.updated",
   "node.updated",
@@ -74,7 +76,6 @@ export const layer = Layer.effect(
           candidate.node.id === attempt.nodeId,
       );
       if (node === undefined) return;
-      if (action.type === "native_descendant_overage") return;
       const launchEffect =
         action.type === "reconcile_required"
           ? yield* outbox
@@ -86,9 +87,11 @@ export const layer = Layer.effect(
       const now = yield* DateTime.now;
       const timestamp = DateTime.formatIso(now);
       const commandId = CommandId.make(
-        launchStillPending
-          ? `goal-recovery:lease-refresh:${attempt.id}:${attempt.leaseExpiresAt ?? "none"}`
-          : `goal-recovery:${action.type}:${attempt.id}`,
+        action.type === "native_descendant_overage"
+          ? `goal-recovery:native-descendant-overage:${attempt.id}:${action.observed}`
+          : launchStillPending
+            ? `goal-recovery:lease-refresh:${attempt.id}:${attempt.leaseExpiresAt ?? "none"}`
+            : `goal-recovery:${action.type}:${attempt.id}`,
       );
       const makeEvent = Effect.fn("GoalWorkflowService.recoveryEvent")(function* (
         type: OrchestrationV2DomainEvent["type"],
@@ -105,6 +108,58 @@ export const layer = Layer.effect(
           occurredAt: now,
         } as OrchestrationV2DomainEvent;
       });
+      if (action.type === "native_descendant_overage") {
+        const committed = yield* eventSink
+          .commitGoalAttemptCommand({
+            commandId,
+            threadId: detail.goal.rootThreadId,
+            commandType: "goal.recovery.native_descendant_overage",
+            acceptedAt: now,
+            goalId: detail.goal.id,
+            graphVersionId: attempt.graphVersionId,
+            nodeId: attempt.nodeId,
+            attemptId: attempt.id,
+            expectedStatuses: [attempt.status],
+            events: [
+              yield* makeEvent("goal.failure-recorded", {
+                id: GoalEvidenceId.make(`goal-native-overage:${attempt.id}:${action.observed}`),
+                goalId: detail.goal.id,
+                graphVersionId: attempt.graphVersionId,
+                nodeId: attempt.nodeId,
+                attemptId: attempt.id,
+                reason: {
+                  type: "native_descendant_overage",
+                  limit: action.limit,
+                  observed: action.observed,
+                },
+                recoveryState: "unresolved",
+                blocker: "Native descendant lifetime backstop exceeded.",
+                occurredAt: timestamp,
+              }),
+              yield* makeEvent("goal.updated", {
+                ...detail.goal,
+                status: "paused",
+                updatedAt: timestamp,
+              }),
+            ],
+            effects: [],
+          })
+          .pipe(Effect.mapError(workflowError("persist-native-overage")));
+        if (committed.committed && attempt.executionThreadId !== null && attempt.runId !== null) {
+          yield* threads
+            .dispatch({
+              type: "run.interrupt",
+              createdBy: "system",
+              creationSource: "server",
+              commandId: CommandId.make(`goal-native-overage-interrupt:${attempt.id}`),
+              threadId: attempt.executionThreadId,
+              runId: attempt.runId,
+              reason: "Native descendant lifetime backstop exceeded.",
+            })
+            .pipe(Effect.mapError(workflowError("interrupt-native-overage")));
+        }
+        return;
+      }
       const retrying = action.type === "retry";
       const blocked =
         action.type === "retry_exhausted" ||
@@ -222,9 +277,10 @@ export const layer = Layer.effect(
           candidate.node.id === attempt.nodeId,
       );
       if (node === undefined) return;
+      const nodeCancelled = NODE_CANCELLATION_STATUSES.has(node.status);
       let status: GoalAttempt["status"] = attempt.status;
       if (domainEvent.type === "run.updated" && domainEvent.payload.id === attempt.runId) {
-        status = ACTIVE_RUN_STATUSES.has(domainEvent.payload.status)
+        const observedStatus = ACTIVE_RUN_STATUSES.has(domainEvent.payload.status)
           ? "running"
           : domainEvent.payload.status === "completed"
             ? "succeeded"
@@ -234,6 +290,18 @@ export const layer = Layer.effect(
               : domainEvent.payload.status === "failed"
                 ? "failed"
                 : attempt.status;
+        // A cancellation is a durable workflow decision. Provider events may
+        // arrive after the interrupt request (including a late successful
+        // completion), but they must only terminalize the owning attempt and
+        // never revive the node into processing/succeeded.
+        status =
+          nodeCancelled &&
+          (attempt.status === "cancelled" ||
+            observedStatus === "succeeded" ||
+            observedStatus === "failed" ||
+            observedStatus === "cancelled")
+            ? "cancelled"
+            : observedStatus;
       }
       const workerProjection = yield* threads
         .getThreadProjection(domainEvent.threadId)
@@ -276,8 +344,9 @@ export const layer = Layer.effect(
       });
       const attemptEvent = yield* makeEvent("goal.attempt-transitioned", updated);
       const terminal = new Set(["succeeded", "failed", "cancelled"]).has(status);
-      const nextNodeStatus =
-        status === "succeeded"
+      const nextNodeStatus = nodeCancelled
+        ? node.status
+        : status === "succeeded"
           ? "processing"
           : status === "failed"
             ? "failed"
@@ -290,7 +359,11 @@ export const layer = Layer.effect(
               ...node,
               status: nextNodeStatus,
               activeAttemptId: null,
-              blocker: status === "failed" ? updated.failureReason : null,
+              blocker: nodeCancelled
+                ? node.blocker
+                : status === "failed"
+                  ? updated.failureReason
+                  : null,
               updatedAt: timestamp,
             }),
           ]
@@ -303,7 +376,7 @@ export const layer = Layer.effect(
           0,
         ) +
         nativeDescendantCount;
-      const overage = totalAgents > 1_000;
+      const overage = !nodeCancelled && totalAgents > 1_000;
       const overageEvents = overage
         ? [
             yield* makeEvent("goal.failure-recorded", {
@@ -352,6 +425,171 @@ export const layer = Layer.effect(
           })
           .pipe(Effect.mapError(workflowError("interrupt-overage")));
       }
+    });
+
+    const cancelNodeAttempt = Effect.fn("GoalWorkflowService.cancelNodeAttempt")(function* (
+      domainEvent: OrchestrationV2DomainEvent,
+    ) {
+      if (domainEvent.type !== "goal.node-cancellation-requested") return;
+      const detail = yield* goals
+        .getDetail(domainEvent.payload.goalId)
+        .pipe(Effect.mapError(workflowError("read-cancelled-node-goal")));
+      const node = detail.nodes.find(
+        (candidate) =>
+          candidate.graphVersionId === domainEvent.payload.graphVersionId &&
+          candidate.node.id === domainEvent.payload.node.id,
+      );
+      if (node === undefined || !NODE_CANCELLATION_STATUSES.has(node.status)) return;
+      const attempt =
+        (node.activeAttemptId === null
+          ? undefined
+          : detail.attempts.find((candidate) => candidate.id === node.activeAttemptId)) ??
+        detail.attempts
+          .filter(
+            (candidate) =>
+              candidate.graphVersionId === node.graphVersionId && candidate.nodeId === node.node.id,
+          )
+          .findLast((candidate) => ACTIVE_ATTEMPT_STATUSES.has(candidate.status));
+      if (attempt === undefined || !ACTIVE_ATTEMPT_STATUSES.has(attempt.status)) return;
+
+      // A worker thread can have created its durable run between the launch
+      // fence and the run-binding projection update. Reconcile that tiny
+      // window before treating the attempt as unbound so the interruption is
+      // still a normal durable `run.interrupt` command.
+      if (attempt.executionThreadId !== null && attempt.runId === null) {
+        const worker = yield* Effect.option(
+          threads
+            .getThreadProjection(attempt.executionThreadId)
+            .pipe(Effect.mapError(workflowError("read-cancelled-node-worker"))),
+        );
+        const run = Option.isNone(worker)
+          ? undefined
+          : worker.value.runs.findLast((candidate) => ACTIVE_RUN_STATUSES.has(candidate.status));
+        if (run !== undefined) {
+          const now = yield* DateTime.now;
+          const timestamp = DateTime.formatIso(now);
+          const commandId = CommandId.make(`goal-node-cancel-bind-run:${attempt.id}:${run.id}`);
+          const eventId = yield* ids.allocate
+            .event({ threadId: detail.goal.rootThreadId, commandId })
+            .pipe(Effect.mapError(workflowError("allocate-node-cancel-run-bind-event")));
+          const boundAttempt: GoalAttempt = {
+            ...attempt,
+            status: "running",
+            runId: run.id,
+            leaseExpiresAt: null,
+            updatedAt: timestamp,
+          };
+          const committed = yield* eventSink
+            .commitGoalAttemptCommand({
+              commandId,
+              threadId: detail.goal.rootThreadId,
+              commandType: "goal.node-cancel.bind-observed-run",
+              acceptedAt: now,
+              goalId: detail.goal.id,
+              graphVersionId: attempt.graphVersionId,
+              nodeId: attempt.nodeId,
+              attemptId: attempt.id,
+              expectedStatuses: [attempt.status],
+              events: [
+                {
+                  id: eventId,
+                  threadId: detail.goal.rootThreadId,
+                  type: "goal.attempt-transitioned",
+                  payload: boundAttempt,
+                  occurredAt: now,
+                },
+              ],
+              effects: [],
+            })
+            .pipe(Effect.mapError(workflowError("bind-observed-cancelled-node-run")));
+          if (committed.committed)
+            yield* threads
+              .dispatch({
+                type: "run.interrupt",
+                createdBy: "system",
+                creationSource: "server",
+                commandId: CommandId.make(`goal-node-cancel-interrupt:${attempt.id}:${run.id}`),
+                threadId: attempt.executionThreadId,
+                runId: run.id,
+                reason: node.blocker ?? `Node ${node.status} by root lead.`,
+              })
+              .pipe(Effect.mapError(workflowError("interrupt-observed-cancelled-node-run")));
+          return;
+        }
+      }
+
+      // A leased/launching attempt has no provider run to interrupt. Mark it
+      // terminal under an attempt CAS so an already-queued launch effect sees
+      // the cancellation fence and becomes a no-op.
+      if (attempt.executionThreadId === null || attempt.runId === null) {
+        const now = yield* DateTime.now;
+        const timestamp = DateTime.formatIso(now);
+        const commandId = CommandId.make(
+          `goal-node-cancel-terminalize:${attempt.id}:${node.status}`,
+        );
+        const attemptEventId = yield* ids.allocate
+          .event({ threadId: detail.goal.rootThreadId, commandId })
+          .pipe(Effect.mapError(workflowError("allocate-node-cancel-attempt-event")));
+        const nodeEventId = yield* ids.allocate
+          .event({ threadId: detail.goal.rootThreadId, commandId })
+          .pipe(Effect.mapError(workflowError("allocate-node-cancel-node-event")));
+        const cancelledAttempt: GoalAttempt = {
+          ...attempt,
+          status: "cancelled",
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          failureReason: `node_${node.status}`,
+          updatedAt: timestamp,
+        };
+        const committed = yield* eventSink
+          .commitGoalAttemptCommand({
+            commandId,
+            threadId: detail.goal.rootThreadId,
+            commandType: "goal.node-cancel.terminalize-unbound",
+            acceptedAt: now,
+            goalId: detail.goal.id,
+            graphVersionId: attempt.graphVersionId,
+            nodeId: attempt.nodeId,
+            attemptId: attempt.id,
+            expectedStatuses: [attempt.status],
+            events: [
+              {
+                id: attemptEventId,
+                threadId: detail.goal.rootThreadId,
+                type: "goal.attempt-transitioned",
+                payload: cancelledAttempt,
+                occurredAt: now,
+              },
+              {
+                id: nodeEventId,
+                threadId: detail.goal.rootThreadId,
+                type: "goal.node-transitioned",
+                payload: {
+                  ...node,
+                  activeAttemptId: null,
+                  updatedAt: timestamp,
+                },
+                occurredAt: now,
+              },
+            ],
+            effects: [],
+          })
+          .pipe(Effect.mapError(workflowError("terminalize-cancelled-unbound-attempt")));
+        if (!committed.committed) return;
+        return;
+      }
+
+      yield* threads
+        .dispatch({
+          type: "run.interrupt",
+          createdBy: "system",
+          creationSource: "server",
+          commandId: CommandId.make(`goal-node-cancel-interrupt:${attempt.id}:${node.status}`),
+          threadId: attempt.executionThreadId,
+          runId: attempt.runId,
+          reason: node.blocker ?? `Node ${node.status} by root lead.`,
+        })
+        .pipe(Effect.mapError(workflowError("interrupt-cancelled-node")));
     });
 
     const cancelGoalRuns = Effect.fn("GoalWorkflowService.cancelGoalRuns")(function* (
@@ -438,6 +676,7 @@ export const layer = Layer.effect(
     const observe = eventSink.stream().pipe(
       Stream.runForEach((stored) =>
         cancelGoalRuns(stored.event).pipe(
+          Effect.andThen(cancelNodeAttempt(stored.event)),
           Effect.andThen(pauseForRootControl(stored.event)),
           Effect.andThen(updateAttempt(stored.event)),
           Effect.andThen(stored.event.type.startsWith("goal.") ? reconcile : Effect.void),

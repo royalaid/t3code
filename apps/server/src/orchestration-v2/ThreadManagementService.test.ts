@@ -40,11 +40,11 @@ it("stamps authoritative provenance on commands that create threads or messages"
   });
 });
 
-it("leaves commands that do not create durable authored content unchanged", () => {
+it("overwrites forged provenance on a root Stop command", () => {
   const command: OrchestrationV2Command = {
     type: "run.interrupt",
-    createdBy: "user",
-    creationSource: "web",
+    createdBy: "agent",
+    creationSource: "mcp",
     commandId: CommandId.make("command:thread-management:interrupt"),
     threadId: ThreadId.make("thread:thread-management:interrupt"),
     runId: RunId.make("run:thread-management:interrupt"),
@@ -55,5 +55,8 @@ it("leaves commands that do not create durable authored content unchanged", () =
       createdBy: "user",
       creationSource: "web",
     }),
-  ).toBe(command);
+  ).toMatchObject({
+    createdBy: "user",
+    creationSource: "web",
+  });
 });

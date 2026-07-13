@@ -14,7 +14,11 @@ import * as Path from "effect/Path";
 
 import { EventSinkV2 } from "./EventSink.ts";
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
-import { GoalWorkspaceService } from "./GoalWorkspaceService.ts";
+import {
+  goalBranchName,
+  GoalWorkspaceService,
+  type GoalPreparedWorkspace,
+} from "./GoalWorkspaceService.ts";
 import { ThreadLaunchService } from "./ThreadLaunchService.ts";
 import { ThreadManagementService } from "./ThreadManagementService.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -27,6 +31,34 @@ type SettlementEvent = {
 };
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "interrupted", "rolled_back"]);
+
+/**
+ * The root lead only plans and steers the durable workflow. Keep its provider
+ * session in the narrowest cross-provider runtime mode so it cannot make
+ * unattended repository edits outside server-controlled writer attempts.
+ */
+export const GOAL_ROOT_LEAD_RUNTIME_MODE = "approval-required" as const;
+
+export function goalRootLeadWorkspaceBindingError(input: {
+  readonly goalId: GoalDetail["goal"]["id"];
+  readonly integrationWorktreePath: string | null;
+  readonly integrationBranch: string | null;
+  readonly workspace: GoalPreparedWorkspace;
+}): string | null {
+  if (input.integrationWorktreePath === null || input.integrationBranch === null)
+    return "Goal integration workspace must be provisioned before launching the root lead.";
+  if (
+    input.workspace.path === input.integrationWorktreePath ||
+    input.workspace.branch === input.integrationBranch
+  )
+    return "The root lead must not receive the retained integration workspace.";
+  if (!input.workspace.sharedReadOnly)
+    return "The root lead must receive a shared read-only workspace.";
+  const expectedBranch = goalBranchName("read", `${input.goalId}:${input.workspace.baseSha}`);
+  return input.workspace.branch === expectedBranch
+    ? null
+    : "The root lead must receive the goal's deterministic read-only workspace.";
+}
 
 export function shouldFinalizeGoalAfterEvent(
   sourceActiveRunId: RunId | string | null,
@@ -45,6 +77,18 @@ export function sourceRunIsSettled(
   if (sourceActiveRunId === null) return true;
   const run = runs.find((candidate) => candidate.id === sourceActiveRunId);
   return run !== undefined && TERMINAL.has(run.status);
+}
+
+/**
+ * A pending-root launch may proceed only while it owns the exact durable
+ * provisioning claim. This check is intentionally cheap and repeatable so
+ * cancellation can win at every external side-effect boundary.
+ */
+export function goalPendingLaunchClaimIsCurrent(
+  goal: GoalDetail["goal"],
+  claimId: string,
+): boolean {
+  return goal.status === "provisioning" && goal.pendingLaunchClaimId === claimId;
 }
 
 export function makeGoalLaunchCoordinator<
@@ -175,8 +219,11 @@ export const layer = Layer.effect(
         return;
       }
       const claimed = yield* goals.getDetail(current.goal.id);
-      if (claimed.goal.status !== "provisioning" || claimed.goal.pendingLaunchClaimId !== claimId)
-        return;
+      if (!goalPendingLaunchClaimIsCurrent(claimed.goal, claimId)) return;
+      const claimStillCurrent = Effect.fn("GoalLaunchService.claimStillCurrent")(function* () {
+        const fresh = yield* goals.getDetail(current.goal.id);
+        return goalPendingLaunchClaimIsCurrent(fresh.goal, claimId);
+      });
       const source = yield* threads.getThreadProjection(current.goal.sourceThreadId);
       const project = Option.isSome(projectSnapshots)
         ? yield* projectSnapshots.value
@@ -201,12 +248,41 @@ export const layer = Layer.effect(
         worktreePath: source.thread.worktreePath,
         checkpoints: source.checkpoints,
       });
+      // Re-check after nontrivial reads and immediately before provisioning a
+      // retained integration worktree. A cancelled pending launch must not
+      // create repository state merely because it was claimed earlier.
+      if (!(yield* claimStillCurrent())) return;
       const provisioned = yield* workspaces.provision(current.goal.id);
+      // Provisioning can race a user cancellation. Never bind or start the
+      // root provider turn unless this precise claim still owns the goal.
+      if (!(yield* claimStillCurrent())) return;
       const integrationWorktreePath = provisioned.goal.integrationWorktreePath;
       const integrationBranch = provisioned.goal.integrationBranch;
       if (integrationWorktreePath === null || integrationBranch === null) {
         return yield* Effect.die("Goal integration workspace was not provisioned.");
       }
+      const rootLeadWorkspace = yield* workspaces.prepareRootLead(current.goal.id);
+      const rootLeadWorkspaceError = goalRootLeadWorkspaceBindingError({
+        goalId: current.goal.id,
+        integrationWorktreePath,
+        integrationBranch,
+        workspace: rootLeadWorkspace,
+      });
+      if (rootLeadWorkspaceError !== null) return yield* Effect.die(rootLeadWorkspaceError);
+      // The root thread was created with the source thread's runtime mode so
+      // that source provenance is preserved. Narrow it before the first
+      // provider run; ThreadLaunchService's reusable-thread path does not
+      // update runtime mode itself.
+      yield* threads.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make(`goal-root-runtime-policy:${current.goal.id}`),
+        threadId: current.goal.rootThreadId,
+        runtimeMode: GOAL_ROOT_LEAD_RUNTIME_MODE,
+      });
+      // `ThreadLaunchService` carries the same claim into its durable initial
+      // message dispatch. This pre-flight check avoids even scheduling that
+      // launch if Cancel Goal won while the read-only workspace was prepared.
+      if (!(yield* claimStillCurrent())) return;
       yield* launches.launch({
         commandId: CommandId.make(`goal-root-launch:${current.goal.id}`),
         threadId: current.goal.rootThreadId,
@@ -217,15 +293,14 @@ export const layer = Layer.effect(
         modelSelection:
           current.goal.rootModelSelection ??
           (yield* Effect.die("Goal is missing its root model selection.")),
-        runtimeMode:
-          current.goal.rootRuntimeMode ?? (yield* Effect.die("Goal is missing its runtime mode.")),
+        runtimeMode: GOAL_ROOT_LEAD_RUNTIME_MODE,
         interactionMode:
           current.goal.rootInteractionMode ??
           (yield* Effect.die("Goal is missing its interaction mode.")),
         workspaceStrategy: {
           type: "existing_worktree",
-          worktreePath: integrationWorktreePath,
-          branch: integrationBranch,
+          worktreePath: rootLeadWorkspace.path,
+          branch: rootLeadWorkspace.branch,
         },
         initialMessage: {
           text: `Goal objective:\n${current.goal.objective}\n\nSource summary:\n${handoff.sourceSummary ?? "The source thread has no conversation history."}\n\nProject instructions:\n${handoff.projectInstructions.join("\n\n") || "No project instruction file was found."}\n\nBranch state:\n${handoff.branchState ?? "Unknown"}\n\nRelevant checkpoints:\n${handoff.relevantCheckpoints.join("\n") || "None"}\n\nSelected context:\n${handoff.selectedContextText.join("\n\n") || "None"}`,
@@ -235,6 +310,7 @@ export const layer = Layer.effect(
         createdBy: "system",
         creationSource: "server",
       });
+      if (!(yield* claimStillCurrent())) return;
       yield* threads.dispatch({
         type: "goal.pending-launch.complete",
         commandId: CommandId.make(`goal-pending-launch-complete:${current.goal.id}`),

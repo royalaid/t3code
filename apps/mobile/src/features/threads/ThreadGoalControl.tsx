@@ -16,6 +16,7 @@ export function ThreadGoalControl(props: {
   const scoped = useThreadProjection(props);
   const detail = scoped?.projection.goal;
   const cancelGoal = useAtomCommand(threadEnvironment.cancelGoal, "cancel goal");
+  const reopenGoal = useAtomCommand(threadEnvironment.reopenGoal, "reopen goal");
   const [expanded, setExpanded] = useState(false);
   const iconColor = useThemeColor("--color-icon-subtle");
   const nodes = useMemo(
@@ -42,6 +43,27 @@ export function ThreadGoalControl(props: {
                 threadId: props.threadId,
                 goalId: detail.goal.id,
                 reason: "Cancelled from mobile goal controls.",
+                creationSource: "mobile",
+              },
+            });
+          },
+        },
+      ],
+    );
+  const reopen = () =>
+    Alert.alert(
+      "Reopen Goal?",
+      "The prior completion evidence stays in history. The lead must publish a new workflow revision and obtain a new verification verdict.",
+      [
+        { text: "Keep completed", style: "cancel" },
+        {
+          text: "Reopen Goal",
+          onPress: () => {
+            void reopenGoal({
+              environmentId: props.environmentId,
+              input: {
+                threadId: props.threadId,
+                goalId: detail.goal.id,
                 creationSource: "mobile",
               },
             });
@@ -131,7 +153,16 @@ export function ThreadGoalControl(props: {
             }{" "}
             accepted current-SHA verdicts
           </Text>
-          {!terminal ? (
+          {detail.goal.status === "completed" ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Reopen Goal"
+              onPress={reopen}
+              className="min-h-10 items-center justify-center rounded-xl border border-neutral-300/70 bg-subtle dark:border-white/[0.12]"
+            >
+              <Text className="font-t3-medium text-xs text-foreground">Reopen Goal</Text>
+            </Pressable>
+          ) : !terminal ? (
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Cancel Goal"

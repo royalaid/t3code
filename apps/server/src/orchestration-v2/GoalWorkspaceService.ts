@@ -15,7 +15,7 @@ import * as Schema from "effect/Schema";
 
 import { GitVcsDriver } from "../vcs/GitVcsDriver.ts";
 import { EventSinkV2 } from "./EventSink.ts";
-import { GoalProjectionStore } from "./GoalProjectionStore.ts";
+import { GoalProjectionStore, validateGoalNodeWorkspace } from "./GoalProjectionStore.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
 import { makeKeyedSerialExecutor } from "./KeyedSerialExecutor.ts";
 
@@ -75,6 +75,14 @@ export class GoalWorkspaceService extends Context.Service<
   GoalWorkspaceService,
   {
     readonly provision: (goalId: GoalId) => Effect.Effect<GoalDetail, GoalWorkspaceError>;
+    /**
+     * The root lead plans and coordinates the graph. It gets the same shared
+     * read-only checkout as read-only workers, never the retained integration
+     * worktree that the server uses for commit assembly.
+     */
+    readonly prepareRootLead: (
+      goalId: GoalId,
+    ) => Effect.Effect<GoalPreparedWorkspace, GoalWorkspaceError>;
     readonly prepareAttempt: (input: {
       readonly goalId: GoalId;
       readonly attemptId: GoalAttemptId;
@@ -221,6 +229,57 @@ export const layer = Layer.effect(
       );
     });
 
+    const prepareSharedReadOnlyWorkspace = Effect.fn(
+      "GoalWorkspaceService.prepareSharedReadOnlyWorkspace",
+    )(function* (input: {
+      readonly detail: GoalDetail;
+      readonly goalId: GoalId;
+      readonly baseSha: string;
+      readonly attemptId?: GoalAttemptId;
+    }) {
+      const repositoryRoot = input.detail.goal.repositoryRoot;
+      if (repositoryRoot === undefined)
+        return yield* workspaceError(
+          "resolve-read-only-workspace",
+          input.goalId,
+          input.attemptId,
+        )("Goal repository root is unavailable.");
+      const branch = goalBranchName("read", `${input.goalId}:${input.baseSha}`);
+      const worktree = yield* ensureWorktree({
+        repositoryRoot,
+        baseSha: input.baseSha,
+        branch,
+        baseRefName: input.detail.goal.integrationBranch ?? "HEAD",
+      }).pipe(
+        Effect.mapError(workspaceError("create-read-only-worktree", input.goalId, input.attemptId)),
+      );
+      if (worktree.head !== input.baseSha)
+        return yield* workspaceError(
+          "reconcile-read-only-worktree",
+          input.goalId,
+          input.attemptId,
+        )(`Read-only workspace is at ${worktree.head}, expected ${input.baseSha}.`);
+      return {
+        path: worktree.path,
+        branch,
+        baseSha: input.baseSha,
+        sharedReadOnly: true,
+      } satisfies GoalPreparedWorkspace;
+    });
+
+    const prepareRootLead = Effect.fn("GoalWorkspaceService.prepareRootLead")(function* (
+      goalId: GoalId,
+    ) {
+      const detail = yield* provision(goalId);
+      const baseSha = detail.goal.integrationSha;
+      if (baseSha === null)
+        return yield* workspaceError(
+          "resolve-root-lead-base",
+          goalId,
+        )("Goal integration SHA is unavailable.");
+      return yield* prepareSharedReadOnlyWorkspace({ detail, goalId, baseSha });
+    });
+
     const prepareAttempt = Effect.fn("GoalWorkspaceService.prepareAttempt")(function* (input: {
       readonly goalId: GoalId;
       readonly attemptId: GoalAttemptId;
@@ -244,6 +303,17 @@ export const layer = Layer.effect(
           input.goalId,
           input.attemptId,
         )("Goal attempt node does not exist.");
+      yield* Effect.try({
+        try: () => validateGoalNodeWorkspace(node.node),
+        catch: workspaceError("validate-workspace-mode", input.goalId, input.attemptId),
+      });
+      const workspaceMode = node.node.workspaceMode;
+      if (workspaceMode === "integration")
+        return yield* workspaceError(
+          "reserve-integration-workspace",
+          input.goalId,
+          input.attemptId,
+        )("Goal integration worktrees are reserved for server-controlled assembly.");
       const repositoryRoot = detail.goal.repositoryRoot;
       const integrationPath = detail.goal.integrationWorktreePath;
       const baseSha = attempt.baseIntegrationSha ?? detail.goal.integrationSha;
@@ -253,18 +323,15 @@ export const layer = Layer.effect(
           input.goalId,
           input.attemptId,
         )("Goal integration workspace or attempt base SHA is unavailable.");
-      if (node.node.workspaceMode === "integration") {
-        return {
-          path: integrationPath,
-          branch: detail.goal.integrationBranch!,
+      if (workspaceMode === "read_only") {
+        return yield* prepareSharedReadOnlyWorkspace({
+          detail,
+          goalId: input.goalId,
           baseSha,
-          sharedReadOnly: false,
-        };
+          attemptId: input.attemptId,
+        });
       }
-      const branch =
-        node.node.workspaceMode === "writer"
-          ? goalBranchName("worker", input.attemptId)
-          : goalBranchName("read", `${input.goalId}:${baseSha}`);
+      const branch = goalBranchName("worker", input.attemptId);
       const worktree = yield* ensureWorktree({
         repositoryRoot,
         baseSha,
@@ -283,10 +350,10 @@ export const layer = Layer.effect(
         path: worktree.path,
         branch,
         baseSha,
-        sharedReadOnly: node.node.workspaceMode === "read_only",
+        sharedReadOnly: false,
       };
     });
 
-    return GoalWorkspaceService.of({ provision, prepareAttempt });
+    return GoalWorkspaceService.of({ provision, prepareRootLead, prepareAttempt });
   }),
 );

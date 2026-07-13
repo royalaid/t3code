@@ -1,7 +1,10 @@
 import {
   type ChatAttachment,
   CommandId,
+  type GoalAttempt,
+  type GoalDetail,
   GoalId,
+  type GoalNodeProjection,
   type ModelSelection,
   OrchestrationV2Command,
   type OrchestrationV2AppThread,
@@ -438,6 +441,55 @@ export function goalThreadAcceptsHumanOperation(
   creationSource: "web" | "mobile" | "mcp" | "provider" | "server",
 ): boolean {
   return bindingKind !== "worker" || creationSource === "server";
+}
+
+/**
+ * Compute the attempt/node transitions that must accompany Cancel Goal before
+ * provider work exists. These transitions are committed in the same durable
+ * command transaction as `goal.cancelled`, which makes a previously claimed
+ * launch effect a no-op instead of a retryable path to a new provider run.
+ */
+export function planUnboundGoalAttemptCancellation(input: {
+  readonly detail: GoalDetail;
+  readonly updatedAt: string;
+}): ReadonlyArray<{
+  readonly attempt: GoalAttempt;
+  readonly node: GoalNodeProjection | null;
+}> {
+  return input.detail.attempts.flatMap((attempt) => {
+    if ((attempt.status !== "leased" && attempt.status !== "launching") || attempt.runId !== null)
+      return [];
+    const existingNode = input.detail.nodes.find(
+      (candidate) =>
+        candidate.graphVersionId === attempt.graphVersionId && candidate.node.id === attempt.nodeId,
+    );
+    const node =
+      existingNode === undefined || existingNode.activeAttemptId !== attempt.id
+        ? null
+        : {
+            ...existingNode,
+            status:
+              existingNode.status === "cancelled" || existingNode.status === "superseded"
+                ? existingNode.status
+                : ("cancelled" as const),
+            activeAttemptId: null,
+            blocker: "Goal cancelled by the user.",
+            updatedAt: input.updatedAt,
+          };
+    return [
+      {
+        attempt: {
+          ...attempt,
+          status: "cancelled" as const,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          failureReason: "goal_cancelled_before_provider_start",
+          updatedAt: input.updatedAt,
+        },
+        node,
+      },
+    ];
+  });
 }
 
 const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(function* () {
@@ -5028,6 +5080,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
     const now = DateTime.formatIso(yield* DateTime.now);
     switch (command.type) {
+      case "goal.reopen":
+        if (detail.goal.status !== "completed") {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: `Goal ${command.goalId} is ${detail.goal.status}; only completed goals may reopen.`,
+          });
+        }
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "goal.reopened",
+          threadId: command.threadId,
+          occurredAt: yield* DateTime.now,
+          payload: {
+            ...detail.goal,
+            status: "planning",
+            currentGraphVersionId: null,
+            verifiedSha: null,
+            updatedAt: now,
+          },
+        });
+        return;
       case "goal.graph.replace":
         yield* emit(
           events,
@@ -5045,7 +5121,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
         return;
       case "goal.pending-launch.cancel":
-      case "goal.cancel":
+      case "goal.cancel": {
+        const terminalized = planUnboundGoalAttemptCancellation({
+          detail,
+          updatedAt: now,
+        });
         yield* emit(
           events,
           command,
@@ -5055,7 +5135,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           occurredAt: yield* DateTime.now,
           payload: { ...detail.goal, status: "cancelled", updatedAt: now },
         });
+        for (const transition of terminalized) {
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "goal.attempt-transitioned",
+            threadId: command.threadId,
+            occurredAt: yield* DateTime.now,
+            payload: transition.attempt,
+          });
+          if (transition.node !== null) {
+            yield* emit(
+              events,
+              command,
+            )({
+              type: "goal.node-transitioned",
+              threadId: command.threadId,
+              occurredAt: yield* DateTime.now,
+              payload: transition.node,
+            });
+          }
+        }
         return;
+      }
       case "goal.pending-launch.claim":
         if (detail.goal.status !== "waiting_for_source") return;
         yield* emit(
@@ -5112,8 +5215,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
         return;
       case "goal.node.cancel": {
-        const node = detail.nodes.find((candidate) => candidate.node.id === command.nodeId);
-        if (node === undefined) return yield* dispatchUnsupported(command);
+        const node = detail.nodes.find(
+          (candidate) =>
+            candidate.graphVersionId === command.graphVersionId &&
+            candidate.node.id === command.nodeId,
+        );
+        if (node === undefined)
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: `stale_active_run_target: Node ${command.nodeId} is not present in graph version ${command.graphVersionId}.`,
+          });
+        if (
+          node.status === "processing" ||
+          node.node.workspaceMode === "integration" ||
+          ["succeeded", "failed", "cancelled", "superseded"].includes(node.status)
+        )
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: `stale_active_run_target: Node ${command.nodeId} is ${node.status} and no longer has a cancellable provider attempt.`,
+          });
         yield* emit(
           events,
           command,
@@ -5121,7 +5243,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           type: "goal.node-cancellation-requested",
           threadId: command.threadId,
           occurredAt: yield* DateTime.now,
-          payload: { ...node, blocker: command.reason ?? "Cancellation requested", updatedAt: now },
+          payload: {
+            ...node,
+            // Keep activeAttemptId until the bound provider run reaches a
+            // terminal state. This prevents a late completion from becoming
+            // an unowned attempt while still fencing new scheduling now.
+            status: command.disposition,
+            blocker: command.reason ?? `${command.disposition} by root lead`,
+            updatedAt: now,
+          },
         });
         return;
       }
@@ -5150,7 +5280,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
         return;
       case "goal.create":
-      case "goal.reopen":
         return yield* dispatchUnsupported(command);
     }
   });
@@ -5347,6 +5476,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "goal.result.publish":
       case "goal.evidence.publish":
         yield* dispatchGoalCommand(command, events);
+        if (command.type === "goal.cancel" || command.type === "goal.pending-launch.cancel") {
+          // Every goal attempt launch effect is rooted at the dedicated goal
+          // thread. Cancel it in the same outbox transaction as the durable
+          // lifecycle/attempt transitions so it cannot be retried later.
+          cancelUnsettledEffects = {
+            effectTypes: ["goal-attempt.launch"],
+            reason: "Goal cancelled by the user.",
+          };
+        }
         break;
       case "thread.create":
         yield* dispatchThreadCreate(command, events);
@@ -5499,6 +5637,51 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     );
 
     const acceptedAt = plan.events.at(-1)?.occurredAt ?? (yield* DateTime.now);
+    if (command.type === "goal.node.cancel") {
+      const committed = yield* eventSink
+        .commitGoalNodeCommand({
+          commandId: command.commandId,
+          threadId: commandThreadId(command),
+          commandType: command.type,
+          acceptedAt,
+          goalId: command.goalId,
+          graphVersionId: command.graphVersionId,
+          nodeId: command.nodeId,
+          // A root lead may stop work at any nonterminal provider/scheduler
+          // phase. Processing is rejected before this CAS because integration
+          // is server-owned and has no interruptible provider target.
+          expectedStatuses: ["pending", "ready", "queued", "running", "blocked"],
+          events: plan.events,
+          effects: plan.effects,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause,
+              }),
+          ),
+        );
+      if (committed.stale)
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `stale_active_run_target: Node ${command.nodeId} changed before cancellation could be committed.`,
+        });
+      const sequence = committed.storedEvents.at(-1)?.sequence;
+      if (sequence === undefined)
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Goal node cancellation committed without a durable event sequence.",
+        });
+      return {
+        sequence,
+        storedEvents: committed.storedEvents,
+      } satisfies OrchestratorV2DispatchResult;
+    }
     const committed = yield* eventSink
       .commitCommand({
         commandId: command.commandId,

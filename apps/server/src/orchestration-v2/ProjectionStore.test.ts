@@ -49,6 +49,11 @@ const goalPolicy = {
   providerAllowlist: ["codex"],
   toolAllowlist: ["shell"],
 };
+const readOnlyGoalPolicy = {
+  ...goalPolicy,
+  sandboxMode: "read-only" as const,
+  writableRoots: [],
+};
 const goalNode = (id: string) => ({
   id: GoalNodeId.make(id),
   role: id,
@@ -73,7 +78,7 @@ const goalNode = (id: string) => ({
     costClass: "standard" as const,
   },
   evidenceRequirements: [],
-  policy: goalPolicy,
+  policy: readOnlyGoalPolicy,
 });
 
 it.layer(TestLayer)("ProjectionStoreV2", (it) => {

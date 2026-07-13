@@ -48,6 +48,13 @@ export const ProviderAdapterV2RuntimePolicy = Schema.Struct({
   cwd: Schema.NullOr(Schema.String),
   approvalPolicy: Schema.optional(Schema.Unknown),
   sandboxPolicy: Schema.optional(Schema.Unknown),
+  /**
+   * Provider-neutral tool authority carried alongside the provider-specific
+   * sandbox/approval payload. Goal startup preserves it for provider/runtime
+   * telemetry; a restricted list is rejected before launch unless an adapter
+   * supplies a native enforcement mapping.
+   */
+  toolAllowlist: Schema.optional(Schema.Array(Schema.String)),
   reasoningEffort: Schema.optional(Schema.String),
 });
 export type ProviderAdapterV2RuntimePolicy = typeof ProviderAdapterV2RuntimePolicy.Type;

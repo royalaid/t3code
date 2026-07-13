@@ -8,6 +8,7 @@ import {
   GoalId,
   GoalNodeId,
   ThreadId,
+  type GoalGraphNode,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -29,6 +30,7 @@ const policy = {
   providerAllowlist: ["codex"],
   toolAllowlist: ["shell"],
 };
+const readOnlyPolicy = { ...policy, sandboxMode: "read-only" as const, writableRoots: [] };
 const makeNode = (id: string) => ({
   id: GoalNodeId.make(id),
   role: id,
@@ -53,7 +55,7 @@ const makeNode = (id: string) => ({
     costClass: "standard" as const,
   },
   evidenceRequirements: [],
-  policy,
+  policy: readOnlyPolicy,
 });
 
 it("allows approval narrowing and rejects approval authority expansion", () => {
@@ -65,7 +67,7 @@ it("allows approval narrowing and rejects approval authority expansion", () => {
     nodes: [
       {
         ...makeNode("worker"),
-        policy: { ...policy, approvalPolicy },
+        policy: { ...readOnlyPolicy, approvalPolicy },
       },
     ],
     edges: [],
@@ -90,6 +92,48 @@ it("allows approval narrowing and rejects approval authority expansion", () => {
       approvalPolicy: "untrusted",
     }),
   ).toThrow(GoalProjectionValidationError);
+});
+
+it("rejects graph workspace modes that could bypass isolated writer integration", () => {
+  const graph = (id: string, node: GoalGraphNode) => ({
+    id: GoalGraphVersionId.make(`graph:workspace:${id}`),
+    goalId: GoalId.make("goal:workspace"),
+    revision: 1,
+    publishedByNodeId: GoalNodeId.make("lead"),
+    nodes: [node],
+    edges: [],
+    createdAt: "2026-07-11T00:00:00.000Z",
+  });
+  expect(() =>
+    validateGoalGraph(graph("read-only-write", { ...makeNode("read-only-write"), policy }), policy),
+  ).toThrow(GoalProjectionValidationError);
+  expect(() =>
+    validateGoalGraph(
+      graph("writer-read-only", {
+        ...makeNode("writer-read-only"),
+        workspaceMode: "writer",
+        outputContract: { kind: "commit", description: "commit", requiredFields: [] },
+        policy: readOnlyPolicy,
+      }),
+      policy,
+    ),
+  ).toThrow(GoalProjectionValidationError);
+  expect(() =>
+    validateGoalGraph(
+      graph("integration", {
+        ...makeNode("integration"),
+        workspaceMode: "integration",
+        policy,
+      }),
+      policy,
+    ),
+  ).toThrow(GoalProjectionValidationError);
+  expect(() =>
+    validateGoalGraph(
+      graph("read-only", { ...makeNode("read-only"), policy: readOnlyPolicy }),
+      policy,
+    ),
+  ).not.toThrow();
 });
 
 it.layer(TestLayer)("GoalProjectionStore", (it) => {
@@ -248,6 +292,8 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         nodes: [
           {
             ...makeNode("worker:windows"),
+            workspaceMode: "writer",
+            outputContract: { kind: "commit", description: "commit", requiredFields: [] },
             policy: { ...windowsPolicy, writableRoots: ["c:/repo/packages"] },
           },
         ],
@@ -293,6 +339,8 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
               nodes: [
                 {
                   ...makeNode("worker:prefix"),
+                  workspaceMode: "writer",
+                  outputContract: { kind: "commit", description: "commit", requiredFields: [] },
                   policy: { ...windowsPolicy, writableRoots: [writableRoot] },
                 },
               ],
@@ -338,6 +386,8 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
             nodes: [
               {
                 ...makeNode("worker:posix"),
+                workspaceMode: "writer",
+                outputContract: { kind: "commit", description: "commit", requiredFields: [] },
                 policy: { ...policy, writableRoots: ["/repo/../outside"] },
               },
             ],
@@ -443,6 +493,47 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
       }),
   );
 
+  it.effect("reopens a completed goal without reusing its active graph or verification", () =>
+    Effect.gen(function* () {
+      const store = yield* GoalProjectionStore;
+      const goalId = GoalId.make("goal:reopen");
+      const graphVersionId = GoalGraphVersionId.make("graph:reopen:1");
+      const completed = {
+        id: goalId,
+        objective: "reopen",
+        status: "completed" as const,
+        sourceThreadId: ThreadId.make("source:reopen"),
+        rootThreadId: ThreadId.make("root:reopen"),
+        policy,
+        currentGraphVersionId: graphVersionId,
+        currentRevision: 1,
+        integrationBranch: "goal/reopen",
+        integrationWorktreePath: "/goal/reopen",
+        integrationSha: "sha:reopen",
+        verifiedSha: "sha:reopen",
+        createdAt: "2026-07-11T00:00:00.000Z",
+        updatedAt: "2026-07-11T00:00:00.000Z",
+      };
+      yield* store.create(completed);
+      yield* store.apply({
+        type: "goal.reopened",
+        payload: {
+          ...completed,
+          status: "planning",
+          currentGraphVersionId: null,
+          verifiedSha: null,
+          updatedAt: "2026-07-11T00:01:00.000Z",
+        },
+      });
+      const reopened = (yield* store.getDetail(goalId)).goal;
+      assert.equal(reopened.status, "planning");
+      assert.isNull(reopened.currentGraphVersionId);
+      assert.equal(reopened.currentRevision, 1);
+      assert.equal(reopened.integrationSha, "sha:reopen");
+      assert.isNull(reopened.verifiedSha);
+    }),
+  );
+
   it.effect("persists graph-owned attempts, writer commits, and structured failures", () =>
     Effect.gen(function* () {
       const store = yield* GoalProjectionStore;
@@ -463,7 +554,12 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         createdAt: "2026-07-11T00:00:00.000Z",
         updatedAt: "2026-07-11T00:00:00.000Z",
       });
-      const node = makeNode("worker:records");
+      const node = {
+        ...makeNode("worker:records"),
+        workspaceMode: "writer" as const,
+        outputContract: { kind: "commit" as const, description: "commit", requiredFields: [] },
+        policy,
+      };
       const graph = {
         id: GoalGraphVersionId.make("graph:records"),
         goalId,
@@ -517,23 +613,50 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         )).reason,
         "referential_integrity",
       );
+      const writerCommit = {
+        id: GoalArtifactId.make("commit-record:1"),
+        goalId,
+        graphVersionId: graph.id,
+        nodeId: node.id,
+        attemptId,
+        baseSha: "sha:base",
+        commitSha: "sha:commit",
+        cleanSingleCommit: true,
+        integrationBeforeSha: "sha:base",
+        integrationAfterSha: "sha:after",
+        state: "integrated" as const,
+        createdAt: "2026-07-11T00:00:03.000Z",
+        updatedAt: "2026-07-11T00:00:04.000Z",
+      };
+      assert.equal(
+        (yield* Effect.flip(
+          store.apply({
+            type: "goal.writer-commit-recorded",
+            payload: {
+              ...writerCommit,
+              id: GoalArtifactId.make("commit-record:unclean"),
+              cleanSingleCommit: false,
+            },
+          }),
+        )).reason,
+        "referential_integrity",
+      );
+      assert.equal(
+        (yield* Effect.flip(
+          store.apply({
+            type: "goal.writer-commit-recorded",
+            payload: {
+              ...writerCommit,
+              id: GoalArtifactId.make("commit-record:wrong-base"),
+              baseSha: "sha:wrong-base",
+            },
+          }),
+        )).reason,
+        "referential_integrity",
+      );
       yield* store.apply({
         type: "goal.writer-commit-recorded",
-        payload: {
-          id: GoalArtifactId.make("commit-record:1"),
-          goalId,
-          graphVersionId: graph.id,
-          nodeId: node.id,
-          attemptId,
-          baseSha: "sha:base",
-          commitSha: "sha:commit",
-          cleanSingleCommit: true,
-          integrationBeforeSha: "sha:base",
-          integrationAfterSha: "sha:after",
-          state: "integrated",
-          createdAt: "2026-07-11T00:00:03.000Z",
-          updatedAt: "2026-07-11T00:00:04.000Z",
-        },
+        payload: writerCommit,
       });
       yield* store.apply({
         type: "goal.failure-recorded",
@@ -605,7 +728,21 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         (yield* Effect.flip(
           store.apply({
             type: "goal.verdict-recorded",
-            payload: { ...evidence, integrationSha: "sha:different", verdict: "accepted" },
+            payload: { ...evidence, verdict: "accepted" },
+          }),
+        )).reason,
+        "machine_evidence_required",
+      );
+      assert.equal(
+        (yield* Effect.flip(
+          store.apply({
+            type: "goal.verdict-recorded",
+            payload: {
+              ...evidence,
+              integrationSha: "sha:different",
+              commands: [{ command: "vp test", exitCode: 0, logArtifactId: artifact.id }],
+              verdict: "accepted",
+            },
           }),
         )).reason,
         "stale_evidence",
@@ -710,6 +847,44 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
           }),
         )).reason,
         "referential_integrity",
+      );
+      yield* store.apply({
+        type: "goal.node-cancellation-requested",
+        payload: {
+          goalId,
+          graphVersionId: graph.id,
+          node,
+          status: "cancelled",
+          activeAttemptId: attemptId,
+          blocker: "superseded by a newer plan",
+          updatedAt: "2026-07-11T00:00:10.000Z",
+        },
+      });
+      assert.equal(
+        (yield* Effect.flip(
+          store.apply({
+            type: "goal.artifact-published",
+            payload: {
+              ...artifact,
+              id: GoalArtifactId.make("artifact:late-after-cancel"),
+              createdAt: "2026-07-11T00:00:11.000Z",
+            },
+          }),
+        )).reason,
+        "stale_active_run_target",
+      );
+      assert.equal(
+        (yield* Effect.flip(
+          store.apply({
+            type: "goal.evidence-submitted",
+            payload: {
+              ...evidence,
+              id: GoalEvidenceId.make("evidence:late-after-cancel"),
+              createdAt: "2026-07-11T00:00:11.000Z",
+            },
+          }),
+        )).reason,
+        "stale_active_run_target",
       );
       const detail = yield* store.getDetail(goalId);
       assert.equal(detail.attempts[0]?.graphVersionId, graph.id);

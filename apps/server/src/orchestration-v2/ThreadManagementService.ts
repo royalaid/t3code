@@ -47,6 +47,10 @@ export function withCreationProvenance(
     case "thread.fork":
     case "thread.merge_back":
     case "delegated_task.request":
+    case "goal.launch":
+    case "run.interrupt":
+    case "queued-message.promote-to-steer":
+    case "queued-run.reorder":
       return { ...command, ...provenance };
     default:
       return command;

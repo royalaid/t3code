@@ -4,6 +4,7 @@ import {
   type GoalAttemptId,
   type GoalDetail,
   type GoalGraphNode,
+  type GoalNodeStatus,
   MessageId,
   type OrchestrationV2DomainEvent,
   ThreadId,
@@ -15,9 +16,13 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { EventSinkV2 } from "./EventSink.ts";
-import { GoalProjectionStore } from "./GoalProjectionStore.ts";
+import { GoalProjectionStore, validateGoalNodeWorkspace } from "./GoalProjectionStore.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
-import { GoalWorkspaceService } from "./GoalWorkspaceService.ts";
+import {
+  goalBranchName,
+  GoalWorkspaceService,
+  type GoalPreparedWorkspace,
+} from "./GoalWorkspaceService.ts";
 import { ThreadManagementService } from "./ThreadManagementService.ts";
 
 export function goalWorkerPrompt(input: {
@@ -65,6 +70,51 @@ export class GoalAttemptExecutionService extends Context.Service<
   }
 >()("t3/orchestration-v2/GoalAttemptExecutionService") {}
 
+export function goalAttemptWorkspaceBindingError(input: {
+  readonly node: GoalGraphNode;
+  readonly attemptId: GoalAttemptId;
+  readonly workspace: GoalPreparedWorkspace;
+  readonly integrationWorktreePath: string | null;
+}): string | null {
+  if (input.node.workspaceMode === "integration")
+    return "Goal integration worktrees are reserved for server-controlled assembly.";
+  if (
+    input.integrationWorktreePath !== null &&
+    input.workspace.path === input.integrationWorktreePath
+  )
+    return "Worker attempts must not receive the retained integration worktree.";
+  if (input.node.workspaceMode === "read_only")
+    return input.workspace.sharedReadOnly
+      ? null
+      : "Read-only nodes must receive a shared read-only workspace.";
+  if (input.workspace.sharedReadOnly)
+    return "Writer nodes must receive a mutable isolated writer workspace.";
+  return input.workspace.branch === goalBranchName("worker", input.attemptId)
+    ? null
+    : "Writer nodes must receive their attempt-specific writer branch.";
+}
+
+/**
+ * A provider start is permitted only while the goal is actively executing and
+ * the exact leased attempt still owns a live, non-superseded node. This is
+ * deliberately re-evaluated around every durable/external launch boundary:
+ * cancelling a goal is terminal even if an outbox worker claimed its launch
+ * effect a moment earlier.
+ */
+export function goalAttemptLaunchIsFenced(input: {
+  readonly goalStatus: GoalDetail["goal"]["status"];
+  readonly attemptStatus: GoalAttempt["status"] | undefined;
+  readonly nodeStatus: GoalNodeStatus | undefined;
+}): boolean {
+  return (
+    input.goalStatus === "running" &&
+    (input.attemptStatus === "leased" || input.attemptStatus === "launching") &&
+    input.nodeStatus !== undefined &&
+    input.nodeStatus !== "cancelled" &&
+    input.nodeStatus !== "superseded"
+  );
+}
+
 const failure = (operation: string, attemptId?: GoalAttemptId) => (cause: unknown) =>
   new GoalAttemptExecutionError({
     operation,
@@ -95,6 +145,7 @@ export const layer = Layer.effect(
         return yield* failure("read-attempt", input.attemptId)("Attempt does not exist.");
       }
       if (persistedAttempt.status !== "leased" && persistedAttempt.status !== "launching") return;
+      if (detail.goal.status !== "running") return;
       if (persistedAttempt.resolvedRoute === null) {
         return yield* failure("resolve-route", input.attemptId)("Attempt has no resolved route.");
       }
@@ -108,9 +159,47 @@ export const layer = Layer.effect(
       if (projection === undefined) {
         return yield* failure("read-node", input.attemptId)("Attempt node does not exist.");
       }
+      if (projection.status === "cancelled" || projection.status === "superseded") return;
+      yield* Effect.try({
+        try: () => validateGoalNodeWorkspace(projection.node),
+        catch: failure("validate-workspace-mode", input.attemptId),
+      });
+      const launchStillFenced = Effect.fn("GoalAttemptExecutionService.launchStillFenced")(
+        function* () {
+          const fresh = yield* goals
+            .getDetail(input.goalId)
+            .pipe(Effect.mapError(failure("refresh-launch-fence", input.attemptId)));
+          const freshAttempt = fresh.attempts.find((candidate) => candidate.id === input.attemptId);
+          const freshNode = fresh.nodes.find(
+            (candidate) =>
+              candidate.graphVersionId === attempt.graphVersionId &&
+              candidate.node.id === attempt.nodeId,
+          );
+          return goalAttemptLaunchIsFenced({
+            goalStatus: fresh.goal.status,
+            attemptStatus: freshAttempt?.status,
+            nodeStatus: freshNode?.status,
+          });
+        },
+      );
+      // Do not create a mutable writer worktree for an attempt that lost its
+      // goal-level cancellation race before we reached the workspace boundary.
+      if (!(yield* launchStillFenced())) return;
       const workspace = yield* workspaces
         .prepareAttempt(input)
         .pipe(Effect.mapError(failure("resolve-workspace", input.attemptId)));
+      const workspaceBindingError = goalAttemptWorkspaceBindingError({
+        node: projection.node,
+        attemptId: input.attemptId,
+        workspace,
+        integrationWorktreePath: detail.goal.integrationWorktreePath,
+      });
+      if (workspaceBindingError !== null)
+        return yield* failure("validate-workspace-binding", input.attemptId)(workspaceBindingError);
+      // Workspace creation is an external side effect and may take long enough
+      // for Cancel Goal to win. Fence again before changing durable attempt
+      // ownership from leased to launching.
+      if (!(yield* launchStillFenced())) return;
       const projectId = detail.goal.projectId;
       if (projectId === undefined) {
         return yield* failure("resolve-project", input.attemptId)("Goal has no project identity.");
@@ -120,31 +209,11 @@ export const layer = Layer.effect(
         instanceId: resolvedRoute.providerInstanceId,
         model: resolvedRoute.model,
       };
-      yield* threads
-        .dispatch({
-          type: "thread.create",
-          commandId: CommandId.make(`goal-attempt-thread:${input.attemptId}`),
-          threadId: executionThreadId,
-          projectId,
-          title: `${projection.node.role}: ${projection.node.objective}`.slice(0, 512),
-          modelSelection,
-          runtimeMode:
-            projection.node.policy.sandboxMode === "read-only"
-              ? "approval-required"
-              : projection.node.policy.sandboxMode === "workspace-write"
-                ? "auto-accept-edits"
-                : "full-access",
-          interactionMode: detail.goal.rootInteractionMode ?? "default",
-          branch: workspace.branch,
-          worktreePath: workspace.path,
-          createdBy: "system",
-          creationSource: "server",
-        })
-        .pipe(Effect.mapError(failure("create-thread", input.attemptId)));
       const persistAttempt = Effect.fn("GoalAttemptExecutionService.persistAttempt")(function* (
         updated: GoalAttempt,
         phase: "thread-bound" | "run-bound",
         expectedStatus: GoalAttempt["status"],
+        expectedNodeStatuses?: ReadonlyArray<GoalNodeStatus>,
       ) {
         const now = yield* DateTime.now;
         const commandId = CommandId.make(`goal-attempt-${phase}:${input.attemptId}`);
@@ -169,6 +238,7 @@ export const layer = Layer.effect(
             nodeId: attempt.nodeId,
             attemptId: attempt.id,
             expectedStatuses: [expectedStatus],
+            ...(expectedNodeStatuses === undefined ? {} : { expectedNodeStatuses }),
             events: [transition],
             effects: [],
           })
@@ -185,7 +255,8 @@ export const layer = Layer.effect(
           leaseExpiresAt: DateTime.formatIso(DateTime.add(now, { minutes: 10 })),
           updatedAt: DateTime.formatIso(now),
         };
-        yield* persistAttempt(threadBound, "thread-bound", "leased");
+        const committed = yield* persistAttempt(threadBound, "thread-bound", "leased", ["running"]);
+        if (!committed.committed) return;
         attempt = threadBound;
       }
       if (attempt.executionThreadId !== executionThreadId) {
@@ -195,6 +266,27 @@ export const layer = Layer.effect(
         )("Attempt is bound to a different execution thread.");
       }
       if (attempt.runId !== null) return;
+      if (!(yield* launchStillFenced())) return;
+      yield* threads
+        .dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`goal-attempt-thread:${input.attemptId}`),
+          threadId: executionThreadId,
+          projectId,
+          title: `${projection.node.role}: ${projection.node.objective}`.slice(0, 512),
+          modelSelection,
+          runtimeMode:
+            projection.node.workspaceMode === "read_only"
+              ? "approval-required"
+              : "auto-accept-edits",
+          interactionMode: detail.goal.rootInteractionMode ?? "default",
+          branch: workspace.branch,
+          worktreePath: workspace.path,
+          createdBy: "system",
+          creationSource: "server",
+        })
+        .pipe(Effect.mapError(failure("create-thread", input.attemptId)));
+      if (!(yield* launchStillFenced())) return;
       yield* threads
         .dispatch({
           type: "message.dispatch",
@@ -222,6 +314,24 @@ export const layer = Layer.effect(
           input.attemptId,
         )("Worker thread launched without a durable run.");
       }
+      // If cancellation committed in the narrow interval around the message
+      // transaction, the worker run may exist before its attempt can be
+      // durably bound. Compensate immediately rather than leaving a provider
+      // turn alive without an owning active goal attempt.
+      if (!(yield* launchStillFenced())) {
+        yield* threads
+          .dispatch({
+            type: "run.interrupt",
+            commandId: CommandId.make(`goal-attempt-cancel-race-interrupt:${input.attemptId}`),
+            threadId: executionThreadId,
+            runId: run.id,
+            reason: "Goal cancelled before the worker launch could be bound.",
+            createdBy: "system",
+            creationSource: "server",
+          })
+          .pipe(Effect.mapError(failure("interrupt-cancel-race", input.attemptId)));
+        return;
+      }
       const now = yield* DateTime.now;
       const updated: GoalAttempt = {
         ...attempt,
@@ -231,7 +341,7 @@ export const layer = Layer.effect(
         leaseExpiresAt: DateTime.formatIso(DateTime.add(now, { minutes: 10 })),
         updatedAt: DateTime.formatIso(now),
       };
-      yield* persistAttempt(updated, "run-bound", "launching");
+      yield* persistAttempt(updated, "run-bound", "launching", ["running"]);
     });
     return GoalAttemptExecutionService.of({ launch });
   }),

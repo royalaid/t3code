@@ -119,6 +119,7 @@ const providerTurnStartServiceProvided = providerTurnStartServiceLayer.pipe(
     Layer.mergeAll(
       contextHandoffServiceProvided,
       eventSinkProvided,
+      goalProjectionStoreLayer,
       idAllocatorLayer,
       projectionStoreLayer,
       providerSessionManagerProvided,
@@ -279,6 +280,7 @@ const scheduledTaskProvided = scheduledTaskServiceLayer.pipe(
 );
 
 export const OrchestrationV2LayerLive = Layer.mergeAll(
+  goalProjectionStoreLayer,
   orchestratorProvided,
   threadManagementProvided,
   effectWorkerProvided,

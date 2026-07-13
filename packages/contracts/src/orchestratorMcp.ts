@@ -4,6 +4,7 @@ import {
   ContextTransferId,
   GoalAttemptId,
   GoalEvidenceId,
+  GoalGraphVersionId,
   GoalId,
   GoalNodeId,
   IsoDateTime,
@@ -470,7 +471,10 @@ export const GoalMcpNodeReadResult = GoalNodeProjection;
 export type GoalMcpNodeReadResult = typeof GoalMcpNodeReadResult.Type;
 export const GoalMcpNodeCancelInput = Schema.Struct({
   goalId: GoalId,
+  /** Explicitly select an immutable graph version; never infer current. */
+  graphVersionId: GoalGraphVersionId,
   nodeId: GoalNodeId,
+  disposition: Schema.optional(Schema.Literals(["cancelled", "superseded"])),
   reason: Schema.optional(Schema.String),
 });
 export type GoalMcpNodeCancelInput = typeof GoalMcpNodeCancelInput.Type;
@@ -514,6 +518,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedErrorClass<Orchestrator
       "goal_scope_mismatch",
       "stale_goal_session",
       "stale_revision",
+      "stale_active_run_target",
     ]),
     message: Schema.String,
   },

@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 
 import {
   Goal,
+  GoalEvidence,
   GoalGraphVersion,
   GoalSourceHandoff,
   GoalWorkflowCommand,
@@ -11,6 +12,7 @@ import {
 } from "./goalWorkflow.ts";
 
 const decodeGoal = Schema.decodeUnknownSync(Goal);
+const decodeGoalEvidence = Schema.decodeUnknownSync(GoalEvidence);
 const decodeGoalGraphVersion = Schema.decodeUnknownSync(GoalGraphVersion);
 const decodeGoalWorkflowCommand = Schema.decodeUnknownSync(GoalWorkflowCommand);
 const decodeGoalWorkflowEvent = Schema.decodeUnknownSync(GoalWorkflowEvent);
@@ -102,6 +104,28 @@ describe("goal workflow contracts", () => {
     ).toBe("goal.graph.replace");
   });
 
+  it("requires node cancellation to target an immutable graph version and disposition", () => {
+    const command = decodeGoalWorkflowCommand({
+      type: "goal.node.cancel",
+      commandId: "command:node-cancel",
+      threadId: "thread:goal",
+      goalId: "goal:1",
+      graphVersionId: "goal-graph:historical",
+      nodeId: "goal-node:worker",
+      disposition: "superseded",
+    });
+    expect(command).toMatchObject({
+      graphVersionId: "goal-graph:historical",
+      disposition: "superseded",
+    });
+    expect(() =>
+      decodeGoalWorkflowCommand({
+        ...command,
+        graphVersionId: undefined,
+      }),
+    ).toThrow();
+  });
+
   it("decodes goal lifecycle events and policy constraints", () => {
     expect(decodeGoalWorkflowPolicy(policy).writableRoots).toEqual(["/repo"]);
     expect(
@@ -151,5 +175,26 @@ describe("goal workflow contracts", () => {
     expect(() =>
       decodeGoalSourceHandoff({ ...valid, relevantCheckpoints: Array(33).fill("checkpoint") }),
     ).toThrow();
+  });
+
+  it("requires accepted evidence to record at least one machine command", () => {
+    const acceptedEvidence = {
+      id: "evidence:accepted",
+      goalId: "goal:1",
+      nodeId: "node:verifier",
+      attemptId: "attempt:verifier",
+      integrationSha: "sha:current",
+      producerAttemptId: "attempt:producer",
+      commands: [{ command: "vp test", exitCode: 0, logArtifactId: "artifact:verification-log" }],
+      artifacts: ["artifact:verification-log"],
+      verdict: "accepted",
+      summary: "Verification passed.",
+      createdAt: "2026-07-11T00:00:00.000Z",
+    } as const;
+    expect(decodeGoalEvidence(acceptedEvidence).verdict).toBe("accepted");
+    expect(() => decodeGoalEvidence({ ...acceptedEvidence, commands: [] })).toThrow();
+    expect(
+      decodeGoalEvidence({ ...acceptedEvidence, verdict: "inconclusive", commands: [] }).commands,
+    ).toEqual([]);
   });
 });

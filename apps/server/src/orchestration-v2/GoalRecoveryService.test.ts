@@ -128,4 +128,25 @@ describe("planGoalRecovery", () => {
       expect.objectContaining({ type: "native_descendant_overage", observed: 1_002 }),
     );
   });
+
+  it("prioritizes native-descendant overage over retry and lease recovery actions", () => {
+    const result = planGoalRecovery({
+      attempts: [
+        attempt({
+          status: "leased",
+          leaseExpiresAt: "2026-07-12T00:02:00.000Z",
+          usage: { ...attempt().usage, nativeDescendantCount: 1_001 },
+        }),
+      ],
+      now: "2026-07-12T00:03:00.000Z",
+    });
+    expect(result.actions).toEqual([
+      expect.objectContaining({
+        type: "native_descendant_overage",
+        attemptId: "attempt:1",
+        observed: 1_002,
+      }),
+    ]);
+    expect(result.pauseNewLaunches).toBe(true);
+  });
 });

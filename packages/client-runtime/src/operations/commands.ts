@@ -138,6 +138,10 @@ export interface CancelGoalInput extends ThreadCommandInput {
   readonly reason?: string;
 }
 
+export interface ReopenGoalInput extends ThreadCommandInput {
+  readonly goalId: GoalId;
+}
+
 export interface ProvisionGoalSourceInput extends CreateThreadInput {
   readonly reuseExistingThread?: boolean;
   readonly workspaceStrategy:
@@ -562,6 +566,17 @@ export const cancelGoal = Effect.fn("EnvironmentCommands.cancelGoal")(function* 
     threadId: input.threadId,
     goalId: input.goalId,
     ...(input.reason === undefined ? {} : { reason: input.reason }),
+  });
+});
+
+export const reopenGoal = Effect.fn("EnvironmentCommands.reopenGoal")(function* (
+  input: ReopenGoalInput,
+) {
+  return yield* dispatch({
+    type: "goal.reopen",
+    commandId: yield* allocateCommandId(input),
+    threadId: input.threadId,
+    goalId: input.goalId,
   });
 });
 

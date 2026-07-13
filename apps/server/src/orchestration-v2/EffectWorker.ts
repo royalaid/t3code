@@ -13,7 +13,10 @@ import { EffectOutboxV2, type OrchestrationEffectV2 } from "./EffectOutbox.ts";
 import { CheckpointRollbackServiceV2 } from "./CheckpointRollbackService.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderTurnControlServiceV2 } from "./ProviderTurnControlService.ts";
-import { ProviderTurnStartServiceV2 } from "./ProviderTurnStartService.ts";
+import {
+  ProviderTurnStartServiceV2,
+  terminalGoalPolicyFailureForProviderTurnStart,
+} from "./ProviderTurnStartService.ts";
 import { RuntimeRequestServiceV2 } from "./RuntimeRequestService.ts";
 import { GoalAttemptExecutionService } from "./GoalAttemptExecutionService.ts";
 
@@ -25,6 +28,36 @@ export class OrchestrationEffectExecutionError extends Schema.TaggedErrorClass<O
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
+const isOrchestrationEffectExecutionError = Schema.is(OrchestrationEffectExecutionError);
+
+/**
+ * A provider-start effect normally retries infrastructure failures. A rejected
+ * restricted tool allowlist is durable policy state, not infrastructure, so
+ * fail it once with a structured outbox error for lead recovery.
+ */
+export function terminalGoalPolicyFailureForEffectCause(cause: Cause.Cause<unknown>) {
+  for (const reason of cause.reasons) {
+    if (!Cause.isFailReason(reason) || !isOrchestrationEffectExecutionError(reason.error)) {
+      continue;
+    }
+    const policyFailure = terminalGoalPolicyFailureForProviderTurnStart(reason.error.cause);
+    if (policyFailure !== undefined) return policyFailure;
+  }
+  return undefined;
+}
+
+export function goalPolicyFailureOutboxError(input: {
+  readonly reason: string;
+  readonly detail: string;
+  readonly toolAllowlist?: ReadonlyArray<string>;
+}): string {
+  return JSON.stringify({
+    type: "goal_policy_rejected",
+    reason: input.reason,
+    detail: input.detail,
+    ...(input.toolAllowlist === undefined ? {} : { toolAllowlist: [...input.toolAllowlist] }),
+  });
+}
 
 export interface OrchestrationEffectExecutorV2Shape {
   readonly execute: (
@@ -371,7 +404,20 @@ export const layerWithOptions = (
           return true;
         }
 
-        const error = Cause.pretty(exit.cause);
+        const policyFailure =
+          effect.request.type === "provider-turn.start"
+            ? terminalGoalPolicyFailureForEffectCause(exit.cause)
+            : undefined;
+        const error =
+          policyFailure === undefined
+            ? Cause.pretty(exit.cause)
+            : goalPolicyFailureOutboxError({
+                reason: policyFailure.reason,
+                detail: policyFailure.detail,
+                ...(policyFailure.toolAllowlist === undefined
+                  ? {}
+                  : { toolAllowlist: policyFailure.toolAllowlist }),
+              });
         yield* Effect.logWarning("Orchestration effect execution failed", {
           effectId: effect.id,
           effectType: effect.request.type,
@@ -379,6 +425,7 @@ export const layerWithOptions = (
           error,
         });
         const updated =
+          policyFailure !== undefined ||
           effect.attemptCount >= orchestrationEffectAttemptLimit(effect.request.type, maxAttempts)
             ? yield* outbox.fail({ effectId: effect.id, workerId, error })
             : yield* outbox.retry({

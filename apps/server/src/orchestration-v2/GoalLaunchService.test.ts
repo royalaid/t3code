@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vite-plus/test";
+import { GoalId } from "@t3tools/contracts";
 
 import {
+  GOAL_ROOT_LEAD_RUNTIME_MODE,
   buildGoalSourceHandoff,
+  goalPendingLaunchClaimIsCurrent,
+  goalRootLeadWorkspaceBindingError,
   makeGoalLaunchCoordinator,
   shouldFinalizeGoalAfterEvent,
   sourceRunIsSettled,
 } from "./GoalLaunchService.ts";
+import { goalBranchName } from "./GoalWorkspaceService.ts";
 
 describe("goal source handoff", () => {
   it("derives summary, branch, checkpoints, and instructions from settled server state", () => {
@@ -75,6 +80,21 @@ describe("GoalLaunchService settlement gate", () => {
     );
     expect(sourceRunIsSettled("run:source", [{ id: "run:source", status: "running" }])).toBe(false);
   });
+
+  it("requires the exact provisioning claim before root worktree side effects", () => {
+    expect(
+      goalPendingLaunchClaimIsCurrent(
+        { status: "provisioning", pendingLaunchClaimId: "claim:current" } as never,
+        "claim:current",
+      ),
+    ).toBe(true);
+    expect(
+      goalPendingLaunchClaimIsCurrent(
+        { status: "cancelled", pendingLaunchClaimId: "claim:current" } as never,
+        "claim:current",
+      ),
+    ).toBe(false);
+  });
   it("finalizes an idle source immediately", () => {
     expect(shouldFinalizeGoalAfterEvent(null, null)).toBe(true);
   });
@@ -95,6 +115,47 @@ describe("GoalLaunchService settlement gate", () => {
         status: "completed",
       }),
     ).toBe(true);
+  });
+});
+
+describe("GoalLaunchService root lead isolation", () => {
+  const goalId = GoalId.make("goal:root-lead-isolation");
+  const workspace = {
+    path: "C:/worktrees/goal-read",
+    branch: goalBranchName("read", `${goalId}:sha:integration`),
+    baseSha: "sha:integration",
+    sharedReadOnly: true,
+  };
+
+  it("narrows the lead to an isolated shared read-only checkout", () => {
+    expect(GOAL_ROOT_LEAD_RUNTIME_MODE).toBe("approval-required");
+    expect(
+      goalRootLeadWorkspaceBindingError({
+        goalId,
+        integrationWorktreePath: "C:/worktrees/goal-integration",
+        integrationBranch: "goal/integration",
+        workspace,
+      }),
+    ).toBeNull();
+  });
+
+  it("rejects the retained integration checkout and mutable root workspaces", () => {
+    expect(
+      goalRootLeadWorkspaceBindingError({
+        goalId,
+        integrationWorktreePath: "C:/worktrees/goal-integration",
+        integrationBranch: "goal/integration",
+        workspace: { ...workspace, path: "C:/worktrees/goal-integration" },
+      }),
+    ).toBe("The root lead must not receive the retained integration workspace.");
+    expect(
+      goalRootLeadWorkspaceBindingError({
+        goalId,
+        integrationWorktreePath: "C:/worktrees/goal-integration",
+        integrationBranch: "goal/integration",
+        workspace: { ...workspace, sharedReadOnly: false },
+      }),
+    ).toBe("The root lead must receive a shared read-only workspace.");
   });
 });
 
@@ -162,5 +223,27 @@ describe("GoalLaunchService durable rescan coordinator", () => {
     });
     await coordinator.rescan(null);
     expect(launched).toEqual([]);
+  });
+
+  it("does not provision or launch when cancellation wins after a successful claim", async () => {
+    let status: "waiting_for_source" | "provisioning" | "cancelled" = "waiting_for_source";
+    let provisioned = 0;
+    const coordinator = makeGoalLaunchCoordinator({
+      listPending: async () => [{ goalId: "goal:claim-race", sourceActiveRunId: null }],
+      claim: async () => {
+        status = "provisioning";
+        // Model Cancel Goal committing after claim but before the service is
+        // permitted to create its retained integration workspace.
+        status = "cancelled";
+        return true;
+      },
+      recheckClaim: async () => status === "provisioning",
+      finalize: async () => {
+        provisioned += 1;
+      },
+    });
+
+    await coordinator.rescan(null);
+    expect(provisioned).toBe(0);
   });
 });

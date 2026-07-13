@@ -205,6 +205,16 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isStaleActiveRunTarget(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "cause" in error &&
+    typeof error.cause === "string" &&
+    error.cause.startsWith("stale_active_run_target:")
+  );
+}
+
 /**
  * Workspace strategy for a scheduled task created/updated over MCP: bound runs
  * post into the existing thread (the strategy is unused, keep root); unbound
@@ -666,7 +676,14 @@ const make = Effect.gen(function* () {
   ) {
     yield* threadManagement
       .dispatch(command)
-      .pipe(Effect.mapError((error) => failure("orchestration_error", errorMessage(error))));
+      .pipe(
+        Effect.mapError((error) =>
+          failure(
+            isStaleActiveRunTarget(error) ? "stale_active_run_target" : "orchestration_error",
+            errorMessage(error),
+          ),
+        ),
+      );
     return { accepted: true as const };
   });
 
@@ -959,20 +976,40 @@ const make = Effect.gen(function* () {
       }),
     goalNodeCancel: (scope, input) =>
       Effect.gen(function* () {
-        const { authority } = yield* loadGoal(scope, input.goalId);
+        const { authority, detail } = yield* loadGoal(scope, input.goalId);
         if (authority.kind !== "goal_lead")
           return yield* failure(
             "capability_denied",
             "Only the root lead may request node cancellation.",
           );
+        const node = detail.nodes.find(
+          (candidate) =>
+            candidate.graphVersionId === input.graphVersionId && candidate.node.id === input.nodeId,
+        );
+        if (node === undefined)
+          return yield* failure(
+            "goal_not_found",
+            `Node ${input.nodeId} was not found in graph version ${input.graphVersionId}.`,
+          );
+        if (
+          node.status === "processing" ||
+          node.node.workspaceMode === "integration" ||
+          ["succeeded", "failed", "cancelled", "superseded"].includes(node.status)
+        )
+          return yield* failure(
+            "stale_active_run_target",
+            `Node ${input.nodeId} is ${node.status} and no longer has a cancellable provider attempt.`,
+          );
         return yield* dispatchGoalMutation(scope, {
           type: "goal.node.cancel",
           commandId: CommandId.make(
-            `mcp:${scope.providerSessionId}:goal-node-cancel:${input.nodeId}`,
+            `mcp:${scope.providerSessionId}:goal-node-cancel:${input.graphVersionId}:${input.nodeId}:${input.disposition ?? "cancelled"}`,
           ),
           threadId: scope.threadId,
           goalId: input.goalId,
+          graphVersionId: input.graphVersionId,
           nodeId: input.nodeId,
+          disposition: input.disposition ?? "cancelled",
           ...(input.reason === undefined ? {} : { reason: input.reason }),
         });
       }),
@@ -993,6 +1030,16 @@ const make = Effect.gen(function* () {
           return yield* failure(
             "capability_denied",
             "Attempt does not belong to the credential's owning node.",
+          );
+        const node = detail.nodes.find(
+          (candidate) =>
+            candidate.graphVersionId === attempt.graphVersionId &&
+            candidate.node.id === attempt.nodeId,
+        );
+        if (node?.status === "cancelled" || node?.status === "superseded")
+          return yield* failure(
+            "stale_active_run_target",
+            `Node ${attempt.nodeId} was ${node.status}; late result publication is not accepted.`,
           );
         const ownershipIssue = validateGoalWorkerBinding({
           authority,
@@ -1045,6 +1092,16 @@ const make = Effect.gen(function* () {
           return yield* failure(
             "capability_denied",
             "Evidence attempt does not belong to the credential's owning node.",
+          );
+        const node = detail.nodes.find(
+          (candidate) =>
+            candidate.graphVersionId === attempt.graphVersionId &&
+            candidate.node.id === attempt.nodeId,
+        );
+        if (node?.status === "cancelled" || node?.status === "superseded")
+          return yield* failure(
+            "stale_active_run_target",
+            `Node ${attempt.nodeId} was ${node.status}; late evidence publication is not accepted.`,
           );
         const ownershipIssue = validateGoalWorkerBinding({
           authority,

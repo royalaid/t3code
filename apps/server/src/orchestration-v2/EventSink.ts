@@ -136,6 +136,11 @@ export interface EventSinkV2Shape {
     readonly nodeId: GoalNodeId;
     readonly attemptId: GoalAttemptId;
     readonly expectedStatuses: ReadonlyArray<GoalAttemptStatus>;
+    /**
+     * Launches additionally fence the owning node. Terminal reconciliation is
+     * intentionally allowed to operate after a node is cancelled/superseded.
+     */
+    readonly expectedNodeStatuses?: ReadonlyArray<GoalNodeStatus>;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<PendingOrchestrationEffectV2>;
   }) => Effect.Effect<
@@ -518,12 +523,9 @@ const baseLayer: Layer.Layer<
         input,
         sql<{ readonly status: string }>`
           SELECT n.status
-          FROM goals g
-          JOIN goal_nodes n
-            ON n.goal_id = g.goal_id
-            AND n.graph_version_id = g.current_graph_version_id
-          WHERE g.goal_id = ${input.goalId}
-            AND g.current_graph_version_id = ${input.graphVersionId}
+          FROM goal_nodes n
+          WHERE n.goal_id = ${input.goalId}
+            AND n.graph_version_id = ${input.graphVersionId}
             AND n.node_id = ${input.nodeId}
           LIMIT 1
         `.pipe(
@@ -540,21 +542,25 @@ const baseLayer: Layer.Layer<
     )(function* (input: Parameters<EventSinkV2Shape["commitGoalAttemptCommand"]>[0]) {
       return yield* commitGoalCasCommandEffect(
         input,
-        sql<{ readonly status: string }>`
-          SELECT a.status
-          FROM goals g
-          JOIN goal_attempts a
-            ON a.goal_id = g.goal_id
-            AND a.graph_version_id = g.current_graph_version_id
-          WHERE g.goal_id = ${input.goalId}
-            AND g.current_graph_version_id = ${input.graphVersionId}
+        sql<{ readonly attempt_status: string; readonly node_status: string }>`
+          SELECT a.status AS attempt_status, n.status AS node_status
+          FROM goal_attempts a
+          JOIN goal_nodes n
+            ON n.goal_id = a.goal_id
+            AND n.graph_version_id = a.graph_version_id
+            AND n.node_id = a.node_id
+          WHERE a.goal_id = ${input.goalId}
+            AND a.graph_version_id = ${input.graphVersionId}
             AND a.node_id = ${input.nodeId}
             AND a.attempt_id = ${input.attemptId}
           LIMIT 1
         `.pipe(
           Effect.map(
             (rows) =>
-              rows[0] !== undefined && input.expectedStatuses.includes(rows[0].status as never),
+              rows[0] !== undefined &&
+              input.expectedStatuses.includes(rows[0].attempt_status as never) &&
+              (input.expectedNodeStatuses === undefined ||
+                input.expectedNodeStatuses.includes(rows[0].node_status as never)),
           ),
         ),
       );

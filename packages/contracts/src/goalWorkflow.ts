@@ -235,25 +235,37 @@ export const GoalArtifact = Schema.Struct({
   metadata: Schema.Record(Schema.String, Schema.Unknown),
   createdAt: GoalTimestamp,
 });
-export const GoalEvidence = Schema.Struct({
+export const GoalEvidenceCommand = Schema.Struct({
+  command: TrimmedNonEmptyString,
+  exitCode: Schema.Int,
+  logArtifactId: Schema.NullOr(GoalArtifactId),
+});
+export type GoalEvidenceCommand = typeof GoalEvidenceCommand.Type;
+
+const GoalEvidenceBaseFields = {
   id: GoalEvidenceId,
   goalId: GoalId,
   nodeId: GoalNodeId,
   attemptId: GoalAttemptId,
   integrationSha: TrimmedNonEmptyString,
   producerAttemptId: GoalAttemptId,
-  commands: Schema.Array(
-    Schema.Struct({
-      command: TrimmedNonEmptyString,
-      exitCode: Schema.Int,
-      logArtifactId: Schema.NullOr(GoalArtifactId),
-    }),
-  ),
   artifacts: Schema.Array(GoalArtifactId),
-  verdict: Schema.Literals(["accepted", "rejected", "inconclusive"]),
   summary: Schema.String,
   createdAt: GoalTimestamp,
+} as const;
+export const GoalAcceptedEvidence = Schema.Struct({
+  ...GoalEvidenceBaseFields,
+  commands: Schema.Array(GoalEvidenceCommand).check(Schema.isMinLength(1)),
+  verdict: Schema.Literal("accepted"),
 });
+export type GoalAcceptedEvidence = typeof GoalAcceptedEvidence.Type;
+export const GoalUnacceptedEvidence = Schema.Struct({
+  ...GoalEvidenceBaseFields,
+  commands: Schema.Array(GoalEvidenceCommand),
+  verdict: Schema.Literals(["rejected", "inconclusive"]),
+});
+export type GoalUnacceptedEvidence = typeof GoalUnacceptedEvidence.Type;
+export const GoalEvidence = Schema.Union([GoalAcceptedEvidence, GoalUnacceptedEvidence]);
 export type GoalEvidence = typeof GoalEvidence.Type;
 export const GoalWriterCommit = Schema.Struct({
   id: GoalArtifactId,
@@ -452,7 +464,15 @@ export const GoalWorkflowCommand = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("goal.node.cancel"),
     ...commandBase,
+    /**
+     * Cancellation targets a concrete immutable graph version. A lead may need
+     * to stop a still-running node from a prior revision after publishing a
+     * replacement graph, so this must never be inferred from the current
+     * revision.
+     */
+    graphVersionId: GoalGraphVersionId,
     nodeId: GoalNodeId,
+    disposition: Schema.Literals(["cancelled", "superseded"]),
     reason: Schema.optional(Schema.String),
   }),
   Schema.Struct({

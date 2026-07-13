@@ -3,6 +3,7 @@ import {
   type Goal as GoalType,
   GoalDetail,
   type GoalDetail as GoalDetailType,
+  type GoalGraphNode,
   type GoalGraphVersion,
   GoalGraphVersion as GoalGraphVersionSchema,
   GoalGraphEdge,
@@ -26,6 +27,8 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { hasDurableCommandEvidence } from "./GoalEvidenceValidation.ts";
+
 const MAX_GRAPH_NODES = 1_000;
 const MAX_GRAPH_EDGES = 5_000;
 type GoalArtifactType = typeof GoalArtifact.Type;
@@ -45,7 +48,9 @@ export class GoalProjectionValidationError extends Schema.TaggedErrorClass<GoalP
       "structural_limit",
       "policy_expansion",
       "stale_evidence",
+      "machine_evidence_required",
       "independent_verification_required",
+      "stale_active_run_target",
       "referential_integrity",
       "persistence_error",
     ]),
@@ -90,6 +95,35 @@ const sandboxRank = { "read-only": 0, "workspace-write": 1, "danger-full-access"
 // Lower rank is less authority. A child may require more approvals, never fewer.
 const approvalRank = { untrusted: 0, "on-request": 1, never: 2 } as const;
 
+/**
+ * Provider workers never receive the retained integration worktree. Integration is a
+ * server-side assembly step; a conflict resolver must still be a normal writer so its
+ * one clean commit passes through the same serial integration path.
+ */
+export function validateGoalNodeWorkspace(node: GoalGraphNode): void {
+  if (node.workspaceMode === "integration") {
+    throw new GoalProjectionValidationError({
+      reason: "policy_expansion",
+      detail: `Node ${node.id} requests the server-reserved integration workspace. Use an isolated writer node for conflict resolution.`,
+    });
+  }
+  if (
+    node.workspaceMode === "read_only" &&
+    (node.policy.sandboxMode !== "read-only" || node.policy.writableRoots.length > 0)
+  ) {
+    throw new GoalProjectionValidationError({
+      reason: "policy_expansion",
+      detail: `Read-only node ${node.id} must use a read-only sandbox with no writable roots.`,
+    });
+  }
+  if (node.workspaceMode === "writer" && node.policy.sandboxMode !== "workspace-write") {
+    throw new GoalProjectionValidationError({
+      reason: "policy_expansion",
+      detail: `Writer node ${node.id} must use the isolated workspace-write sandbox.`,
+    });
+  }
+}
+
 export function validateGoalGraph(graph: GoalGraphVersion, rootPolicy: GoalType["policy"]): void {
   if (graph.nodes.length > MAX_GRAPH_NODES || graph.edges.length > MAX_GRAPH_EDGES) {
     throw new GoalProjectionValidationError({
@@ -118,6 +152,7 @@ export function validateGoalGraph(graph: GoalGraphVersion, rootPolicy: GoalType[
         detail: `Node ${node.id} expands root policy.`,
       });
     }
+    validateGoalNodeWorkspace(node);
   }
   const edgeIds = new Set<string>();
   const outgoing = new Map<string, Array<string>>();
@@ -310,6 +345,12 @@ export interface GoalProjectionStoreShape {
     ReadonlyArray<GoalDetailType>,
     GoalProjectionValidationError
   >;
+  /**
+   * Includes lifecycle-schedulable goals plus any goal with an active attempt.
+   * Callers must still gate *new* work on lifecycle status; the extra rows are
+   * capacity and recovery context for workers that continue while paused or
+   * blocked.
+   */
   readonly listSchedulable: Effect.Effect<
     ReadonlyArray<GoalDetailType>,
     GoalProjectionValidationError
@@ -395,6 +436,8 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         ...existing,
         objective: event.payload.objective,
         status: event.payload.status,
+        currentGraphVersionId:
+          event.type === "goal.reopened" ? null : existing.currentGraphVersionId,
         integrationBranch: event.payload.integrationBranch,
         integrationWorktreePath: event.payload.integrationWorktreePath,
         integrationSha: event.payload.integrationSha,
@@ -408,8 +451,8 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         updatedAt: event.payload.updatedAt,
       } satisfies GoalType;
       const payload = yield* encodeGoal(next);
-      yield* sql`UPDATE goals SET status=${next.status}, integration_sha=${next.integrationSha},
-        verified_sha=${next.verifiedSha}, payload_json=${payload}, updated_at=${next.updatedAt}
+      yield* sql`UPDATE goals SET status=${next.status}, current_graph_version_id=${next.currentGraphVersionId},
+        integration_sha=${next.integrationSha}, verified_sha=${next.verifiedSha}, payload_json=${payload}, updated_at=${next.updatedAt}
         WHERE goal_id=${next.id}`;
     });
 
@@ -501,6 +544,14 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         reason: "referential_integrity",
         detail: `${entity} ${id} reuses an existing ID with different immutable identity.`,
       });
+
+    const rejectCancelledNodePublication = (node: GoalNodeProjection, publication: string) => {
+      if (node.status !== "cancelled" && node.status !== "superseded") return null;
+      return new GoalProjectionValidationError({
+        reason: "stale_active_run_target",
+        detail: `${publication} is late because node ${node.node.id} is ${node.status}.`,
+      });
+    };
 
     const activateGraph = Effect.fn("GoalProjectionStore.activateGraph")(function* (
       input: Parameters<GoalProjectionStoreShape["activateGraph"]>[0],
@@ -704,33 +755,70 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
               updated_at=excluded.updated_at`;
           return;
         }
-        case "goal.artifact-published":
-          yield* requireAttempt(
+        case "goal.artifact-published": {
+          const owningAttempt = yield* requireAttempt(
             event.payload.attemptId,
             event.payload.goalId,
             event.payload.nodeId,
           );
-          {
-            const payload = yield* encodeArtifact(event.payload);
-            const existingRows =
-              yield* sql<PayloadRow>`SELECT payload_json FROM goal_artifacts WHERE artifact_id=${event.payload.id}`;
-            if (existingRows[0] !== undefined) {
-              const existing = yield* decodeArtifact(existingRows[0].payload_json);
-              if ((yield* encodeArtifact(existing)) !== payload)
-                return yield* identityConflict("Artifact", event.payload.id);
-              return;
-            }
-            yield* sql`INSERT INTO goal_artifacts (artifact_id, goal_id, node_id, attempt_id, kind, payload_json, created_at) VALUES (${event.payload.id}, ${event.payload.goalId}, ${event.payload.nodeId}, ${event.payload.attemptId}, ${event.payload.kind}, ${payload}, ${event.payload.createdAt})`;
+          const owningNode = yield* requireNode(
+            event.payload.goalId,
+            owningAttempt.graphVersionId,
+            event.payload.nodeId,
+          );
+          const cancellation = rejectCancelledNodePublication(
+            owningNode,
+            `Artifact ${event.payload.id}`,
+          );
+          if (cancellation !== null) return yield* cancellation;
+          const payload = yield* encodeArtifact(event.payload);
+          const existingRows =
+            yield* sql<PayloadRow>`SELECT payload_json FROM goal_artifacts WHERE artifact_id=${event.payload.id}`;
+          if (existingRows[0] !== undefined) {
+            const existing = yield* decodeArtifact(existingRows[0].payload_json);
+            if ((yield* encodeArtifact(existing)) !== payload)
+              return yield* identityConflict("Artifact", event.payload.id);
+            return;
           }
+          yield* sql`INSERT INTO goal_artifacts (artifact_id, goal_id, node_id, attempt_id, kind, payload_json, created_at) VALUES (${event.payload.id}, ${event.payload.goalId}, ${event.payload.nodeId}, ${event.payload.attemptId}, ${event.payload.kind}, ${payload}, ${event.payload.createdAt})`;
           return;
+        }
         case "goal.writer-commit-recorded": {
           const owningAttempt = yield* requireAttempt(
             event.payload.attemptId,
             event.payload.goalId,
             event.payload.nodeId,
           );
+          const owningNode = yield* requireNode(
+            event.payload.goalId,
+            event.payload.graphVersionId,
+            event.payload.nodeId,
+          );
           if (owningAttempt.graphVersionId !== event.payload.graphVersionId)
             return yield* identityConflict("Writer commit", event.payload.id);
+          if (owningNode.node.workspaceMode !== "writer")
+            return yield* new GoalProjectionValidationError({
+              reason: "referential_integrity",
+              detail: `Writer commit ${event.payload.id} belongs to non-writer node ${event.payload.nodeId}.`,
+            });
+          const cancellation = rejectCancelledNodePublication(
+            owningNode,
+            `Writer commit ${event.payload.id}`,
+          );
+          if (cancellation !== null) return yield* cancellation;
+          if (!event.payload.cleanSingleCommit)
+            return yield* new GoalProjectionValidationError({
+              reason: "referential_integrity",
+              detail: `Writer commit ${event.payload.id} is not a clean single-commit publication.`,
+            });
+          if (
+            owningAttempt.baseIntegrationSha === null ||
+            event.payload.baseSha !== owningAttempt.baseIntegrationSha
+          )
+            return yield* new GoalProjectionValidationError({
+              reason: "referential_integrity",
+              detail: `Writer commit ${event.payload.id} does not match attempt ${owningAttempt.id}'s recorded base SHA.`,
+            });
           const existingRows =
             yield* sql<PayloadRow>`SELECT payload_json FROM goal_writer_commits WHERE writer_commit_id=${event.payload.id}`;
           let payload = event.payload;
@@ -770,7 +858,33 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
             event.payload.producerAttemptId,
             event.payload.goalId,
           );
+          const verifierNode = yield* requireNode(
+            event.payload.goalId,
+            verifierAttempt.graphVersionId,
+            verifierAttempt.nodeId,
+          );
+          const producerNode = yield* requireNode(
+            event.payload.goalId,
+            producerAttempt.graphVersionId,
+            producerAttempt.nodeId,
+          );
+          const verifierCancellation = rejectCancelledNodePublication(
+            verifierNode,
+            `Evidence ${event.payload.id}`,
+          );
+          if (verifierCancellation !== null) return yield* verifierCancellation;
+          const producerCancellation = rejectCancelledNodePublication(
+            producerNode,
+            `Evidence ${event.payload.id}`,
+          );
+          if (producerCancellation !== null) return yield* producerCancellation;
           if (event.payload.verdict === "accepted") {
+            if (!hasDurableCommandEvidence(event.payload))
+              return yield* new GoalProjectionValidationError({
+                reason: "machine_evidence_required",
+                detail:
+                  "Accepted evidence requires a recorded command with a durable log artifact reference.",
+              });
             const goal = yield* readGoal(event.payload.goalId);
             if (
               goal.integrationSha === null ||
@@ -876,8 +990,17 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
       );
     });
     const listSchedulable = Effect.gen(function* () {
-      const rows =
-        yield* sql<PayloadRow>`SELECT payload_json FROM goals WHERE status IN ('planning', 'running') AND current_graph_version_id IS NOT NULL ORDER BY created_at, goal_id`;
+      const rows = yield* sql<PayloadRow>`SELECT payload_json FROM goals
+          WHERE current_graph_version_id IS NOT NULL
+            AND (
+              status IN ('planning', 'running')
+              OR EXISTS (
+                SELECT 1 FROM goal_attempts
+                WHERE goal_attempts.goal_id = goals.goal_id
+                  AND goal_attempts.status IN ('leased', 'launching', 'running', 'stalled')
+              )
+            )
+          ORDER BY created_at, goal_id`;
       return yield* Effect.forEach(rows, (row) =>
         decodeGoal(row.payload_json).pipe(Effect.flatMap((goal) => getDetail(goal.id))),
       );

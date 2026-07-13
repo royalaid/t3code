@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
+  GoalArtifactId,
   GoalAttemptId,
   GoalEvidenceId,
   GoalGraphVersionId,
@@ -25,7 +26,7 @@ describe("goal completion evidence gate", () => {
       executionThreadId: input.threadId,
     }) as GoalDetail["attempts"][number];
   const detail = {
-    goal: { integrationSha: "sha:current" },
+    goal: { integrationSha: "sha:current", currentGraphVersionId: graphVersionId },
     attempts: [
       attempt({
         id: producerId,
@@ -44,6 +45,14 @@ describe("goal completion evidence gate", () => {
         attemptId: verifierId,
         producerAttemptId: producerId,
         integrationSha: "sha:current",
+        commands: [
+          {
+            command: "vp test",
+            exitCode: 0,
+            logArtifactId: GoalArtifactId.make("artifact:verification-log"),
+          },
+        ],
+        artifacts: [GoalArtifactId.make("artifact:verification-log")],
         verdict: "accepted",
       },
     ],
@@ -54,6 +63,23 @@ describe("goal completion evidence gate", () => {
     expect(
       hasIndependentAcceptedEvidence({
         ...detail,
+        evidence: [{ ...detail.evidence[0]!, commands: [] }],
+      }),
+    ).toBe(false);
+    expect(
+      hasIndependentAcceptedEvidence({
+        ...detail,
+        evidence: [
+          {
+            ...detail.evidence[0]!,
+            commands: [{ command: "vp test", exitCode: 0, logArtifactId: null }],
+          },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      hasIndependentAcceptedEvidence({
+        ...detail,
         evidence: [{ ...detail.evidence[0]!, integrationSha: "sha:stale" }],
       }),
     ).toBe(false);
@@ -61,6 +87,15 @@ describe("goal completion evidence gate", () => {
       hasIndependentAcceptedEvidence({
         ...detail,
         evidence: [{ ...detail.evidence[0]!, producerAttemptId: verifierId }],
+      }),
+    ).toBe(false);
+    expect(
+      hasIndependentAcceptedEvidence({
+        ...detail,
+        goal: {
+          ...detail.goal,
+          currentGraphVersionId: GoalGraphVersionId.make("graph:evidence:reopened"),
+        },
       }),
     ).toBe(false);
   });

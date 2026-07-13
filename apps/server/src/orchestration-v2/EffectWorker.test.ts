@@ -8,6 +8,7 @@ import {
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -19,13 +20,17 @@ import { CheckpointRollbackServiceV2 } from "./CheckpointRollbackService.ts";
 import type { OrchestrationEffectV2 } from "./EffectOutbox.ts";
 import {
   executorLayer,
+  goalPolicyFailureOutboxError,
   orchestrationEffectAttemptLimit,
+  OrchestrationEffectExecutionError,
   OrchestrationEffectExecutorV2,
+  terminalGoalPolicyFailureForEffectCause,
 } from "./EffectWorker.ts";
 import { RunFinalizationService } from "./RunFinalizationService.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderTurnControlServiceV2 } from "./ProviderTurnControlService.ts";
 import { ProviderTurnStartError, ProviderTurnStartServiceV2 } from "./ProviderTurnStartService.ts";
+import { GoalRuntimePolicyResolveError } from "./RuntimePolicy.ts";
 import { RuntimeRequestServiceV2 } from "./RuntimeRequestService.ts";
 import { GoalAttemptExecutionService } from "./GoalAttemptExecutionService.ts";
 
@@ -42,6 +47,51 @@ const runId = RunId.make("run:effect-worker-restart");
 it("limits goal attempt infrastructure launch to one retry", () => {
   assert.equal(orchestrationEffectAttemptLimit("goal-attempt.launch", 5), 2);
   assert.equal(orchestrationEffectAttemptLimit("provider-turn.start", 5), 5);
+});
+
+it("terminalizes a restricted goal tool policy without retrying its provider start", () => {
+  const policyFailure = new GoalRuntimePolicyResolveError({
+    reason: "tool_allowlist_unsupported",
+    detail: "Restricted goal tool allowlists require an adapter-native enforcement mapping.",
+    toolAllowlist: ["shell"],
+  });
+  const executionFailure = new OrchestrationEffectExecutionError({
+    effectId: "effect:goal-policy",
+    effectType: "provider-turn.start",
+    cause: new ProviderTurnStartError({ runId, cause: policyFailure }),
+  });
+
+  const resolved = terminalGoalPolicyFailureForEffectCause(Cause.fail(executionFailure));
+  assert.equal(resolved?.reason, "tool_allowlist_unsupported");
+  assert.deepEqual(resolved?.toolAllowlist, ["shell"]);
+  assert.deepEqual(
+    JSON.parse(
+      goalPolicyFailureOutboxError({
+        reason: resolved!.reason,
+        detail: resolved!.detail,
+        ...(resolved!.toolAllowlist === undefined
+          ? {}
+          : { toolAllowlist: resolved!.toolAllowlist }),
+      }),
+    ),
+    {
+      type: "goal_policy_rejected",
+      reason: "tool_allowlist_unsupported",
+      detail: "Restricted goal tool allowlists require an adapter-native enforcement mapping.",
+      toolAllowlist: ["shell"],
+    },
+  );
+
+  const genericFailure = terminalGoalPolicyFailureForEffectCause(
+    Cause.fail(
+      new OrchestrationEffectExecutionError({
+        effectId: "effect:provider",
+        effectType: "provider-turn.start",
+        cause: "provider unavailable",
+      }),
+    ),
+  );
+  assert.equal(genericFailure, undefined);
 });
 
 function restartEffect(

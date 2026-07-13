@@ -20,6 +20,7 @@ import { EventSinkV2 } from "./EventSink.ts";
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
 import { makeKeyedSerialExecutor } from "./KeyedSerialExecutor.ts";
+import { hasDurableCommandEvidence } from "./GoalEvidenceValidation.ts";
 import { goalBranchName, parseGitWorktreeList } from "./GoalWorkspaceService.ts";
 
 export class GoalIntegrationError extends Schema.TaggedErrorClass<GoalIntegrationError>()(
@@ -47,14 +48,18 @@ const integrationError =
 
 export function hasIndependentAcceptedEvidence(detail: GoalDetail): boolean {
   const sha = detail.goal.integrationSha;
-  if (sha === null) return false;
+  const graphVersionId = detail.goal.currentGraphVersionId;
+  if (sha === null || graphVersionId === null) return false;
   return detail.evidence.some((evidence) => {
     if (evidence.verdict !== "accepted" || evidence.integrationSha !== sha) return false;
+    if (!hasDurableCommandEvidence(evidence)) return false;
     const verifier = detail.attempts.find((attempt) => attempt.id === evidence.attemptId);
     const producer = detail.attempts.find((attempt) => attempt.id === evidence.producerAttemptId);
     return (
       verifier !== undefined &&
       producer !== undefined &&
+      verifier.graphVersionId === graphVersionId &&
+      producer.graphVersionId === graphVersionId &&
       verifier.id !== producer.id &&
       verifier.nodeId !== producer.nodeId &&
       verifier.executionThreadId !== null &&
