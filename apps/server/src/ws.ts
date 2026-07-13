@@ -70,6 +70,12 @@ import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as ServerConfig from "./config.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
+import {
+  clientGoalCommandRejection,
+  commandThreadIds,
+} from "./orchestration-v2/GoalClientCommandPolicy.ts";
+import * as GoalProjectionStore from "./orchestration-v2/GoalProjectionStore.ts";
+import { OrchestratorDispatchError } from "./orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "./orchestration-v2/ThreadManagementService.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
@@ -436,6 +442,7 @@ const makeWsRpcLayer = (
       const currentSessionId = currentSession.sessionId;
       const sql = yield* SqlClient.SqlClient;
       const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+      const goalProjectionStore = yield* GoalProjectionStore.GoalProjectionStore;
       const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const projectEnrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
@@ -894,11 +901,35 @@ const makeWsRpcLayer = (
       const dispatchUserCommand = Effect.fn("ws.dispatchUserCommand")(function* (
         command: OrchestrationV2Command,
       ) {
+        const bindings = yield* Effect.forEach(commandThreadIds(command), (threadId) =>
+          goalProjectionStore
+            .resolveMcpBinding(threadId)
+            .pipe(Effect.map((binding) => ({ threadId, kind: binding?.kind ?? null }))),
+        ).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause,
+              }),
+          ),
+        );
+        const rejection = clientGoalCommandRejection(command, bindings);
+        if (rejection !== null) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: rejection,
+          });
+        }
+        const creationSource =
+          "creationSource" in command && command.creationSource === "mobile" ? "mobile" : "web";
         return yield* startup.enqueueCommand(
           threadManagement.dispatch(
             ThreadManagementService.withCreationProvenance(command, {
               createdBy: "user",
-              creationSource: "creationSource" in command ? command.creationSource : "web",
+              creationSource,
             }),
           ),
         );
@@ -992,8 +1023,19 @@ const makeWsRpcLayer = (
         [ORCHESTRATION_V2_WS_METHODS.launchThread]: (input) =>
           observeRpcEffect(
             ORCHESTRATION_V2_WS_METHODS.launchThread,
-            startup
-              .enqueueCommand(
+            Effect.gen(function* () {
+              if (input.threadId !== undefined) {
+                const binding = yield* goalProjectionStore.resolveMcpBinding(input.threadId);
+                if (binding !== null) {
+                  return yield* new OrchestratorDispatchError({
+                    commandId: input.commandId,
+                    commandType: "thread.launch",
+                    cause: `Goal ${binding.kind === "worker" ? "child" : "root"} threads are launched by the durable goal workflow, not a client thread-launch request.`,
+                  });
+                }
+              }
+              const creationSource = input.creationSource === "mobile" ? "mobile" : "web";
+              return yield* startup.enqueueCommand(
                 threadLaunch.launch({
                   commandId: input.commandId,
                   ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
@@ -1021,20 +1063,20 @@ const makeWsRpcLayer = (
                         },
                       }),
                   createdBy: "user",
-                  creationSource: input.creationSource ?? "web",
+                  creationSource,
                 }),
-              )
-              .pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new OrchestrationV2ThreadLaunchError({
-                      commandId: input.commandId,
-                      projectId: input.projectId,
-                      message: "Failed to launch thread",
-                      cause,
-                    }),
-                ),
+              );
+            }).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationV2ThreadLaunchError({
+                    commandId: input.commandId,
+                    projectId: input.projectId,
+                    message: "Failed to launch thread",
+                    cause,
+                  }),
               ),
+            ),
             {
               "rpc.aggregate": "orchestration",
               "orchestration_v2.command_id": input.commandId,
