@@ -47,60 +47,92 @@ import { OrchestratorMcpService } from "../../OrchestratorMcpService.ts";
 const dependencies = [McpInvocationContext.McpInvocationContext, OrchestratorMcpService];
 
 export const GoalReadTool = Tool.make("goal_read", {
+  description:
+    "Root-lead read of the full durable goal projection: current revision, graph versions, nodes, attempts, artifacts, evidence, writer commits, and failures. Call before planning and re-read after a stale-revision or lifecycle conflict; pass goal.currentRevision as goal_replace_graph.expectedRevision.",
   parameters: GoalMcpReadInput,
   success: GoalMcpReadResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
-}).annotate(Tool.Readonly, true);
+})
+  .annotate(Tool.Title, "Read durable goal state")
+  .annotate(Tool.Readonly, true);
 export const GoalCapabilitiesTool = Tool.make("goal_capabilities", {
+  description:
+    "Read the calling goal credential's authenticated role, node scope, graph-replacement and cancellation authority, and currently available provider/model route candidates. Use these returned capabilities instead of assuming authority from the prompt.",
   success: GoalMcpCapabilitiesResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
-}).annotate(Tool.Readonly, true);
+})
+  .annotate(Tool.Title, "Read goal capabilities")
+  .annotate(Tool.Readonly, true);
 export const GoalReplaceGraphTool = Tool.make("goal_replace_graph", {
+  description:
+    "Root-lead only: atomically publish the complete next goal graph, not a patch. Use expectedRevision from the latest goal_read; if rejected as stale, re-read and reconcile a new whole-graph revision. Set graph.publishedByNodeId to the authenticated root thread ID, and use writer nodes followed by an independent read-only verifier that transitively depends on every writer.",
   parameters: GoalMcpReplaceGraphInput,
   success: GoalMcpMutationResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
-}).annotate(Tool.Destructive, true);
+})
+  .annotate(Tool.Title, "Replace the goal graph")
+  .annotate(Tool.Destructive, true);
 export const GoalNodeReadTool = Tool.make("goal_node_read", {
+  description:
+    "Read one durable node projection for this goal. Workers must pass the exact goalId and nodeId supplied in their execution capsule and may read only their credential-owned node; use its objective, success criteria, context packet, output contract, and evidence requirements as the work boundary.",
   parameters: GoalMcpNodeReadInput,
   success: GoalMcpNodeReadResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
-}).annotate(Tool.Readonly, true);
+})
+  .annotate(Tool.Title, "Read a goal node")
+  .annotate(Tool.Readonly, true);
 export const GoalNodeCancelTool = Tool.make("goal_node_cancel", {
+  description:
+    "Root-lead only: request cancellation or supersession of a node in the explicitly supplied immutable graphVersionId. Never infer the current graph version; re-read goal state before retrying a stale or already-terminal target.",
   parameters: GoalMcpNodeCancelInput,
   success: GoalMcpMutationResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
-}).annotate(Tool.Destructive, true);
+})
+  .annotate(Tool.Title, "Cancel a goal node")
+  .annotate(Tool.Destructive, true);
 export const GoalResultPublishTool = Tool.make("goal_result_publish", {
+  description:
+    "Worker-only: publish result artifacts for the exact attempt owned by the calling goal credential. Every artifact must match the credential's goal, node, and attempt IDs. Writer workers publish the one clean commit they produced and must not integrate that commit themselves; verifier workers publish their logs and report artifacts before submitting evidence.",
   parameters: GoalMcpResultPublishInput,
   success: GoalMcpMutationResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
-}).annotate(Tool.Destructive, true);
+})
+  .annotate(Tool.Title, "Publish a goal result")
+  .annotate(Tool.Destructive, true);
 export const GoalEvidenceReadTool = Tool.make("goal_evidence_read", {
+  description:
+    "Read durable evidence visible to the calling goal credential, optionally filtered by evidenceId. Root leads may read goal evidence; workers are restricted to evidence from their own attempt.",
   parameters: GoalMcpEvidenceReadInput,
   success: GoalMcpEvidenceReadResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
-}).annotate(Tool.Readonly, true);
+})
+  .annotate(Tool.Title, "Read goal evidence")
+  .annotate(Tool.Readonly, true);
 export const GoalEvidenceSubmitTool = Tool.make("goal_evidence_submit", {
+  description:
+    "Worker-only: submit verifier evidence for the exact goal, node, and attempt owned by the calling credential. Accepted evidence must name the current workspace-base integration SHA, include at least one durable command result with its published log artifact, and identify a distinct succeeded writer-ancestor producer attempt; publish referenced artifacts with goal_result_publish first.",
   parameters: GoalMcpEvidenceSubmitInput,
   success: GoalMcpMutationResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
-}).annotate(Tool.Destructive, true);
+})
+  .annotate(Tool.Title, "Submit goal evidence")
+  .annotate(Tool.Destructive, true);
 
 export const OrchestratorCapabilitiesTool = Tool.make("orchestrator_capabilities", {
   description:

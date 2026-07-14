@@ -532,6 +532,31 @@ describe("orchestrator MCP toolkit", () => {
                   Effect.provideService(McpSchema.McpServerClient, client),
                 );
 
+            const registeredGoalTools = server.tools.filter(({ tool }) =>
+              tool.name.startsWith("goal_"),
+            );
+            expect(registeredGoalTools).toHaveLength(8);
+            for (const { tool } of registeredGoalTools) {
+              expect(tool.annotations?.title).toBeTruthy();
+              expect(tool.description?.length).toBeGreaterThan(80);
+            }
+            expect(
+              registeredGoalTools.find(({ tool }) => tool.name === "goal_read")?.tool.annotations
+                ?.readOnlyHint,
+            ).toBe(true);
+            expect(
+              registeredGoalTools.find(({ tool }) => tool.name === "goal_replace_graph")?.tool
+                .annotations?.destructiveHint,
+            ).toBe(true);
+            expect(
+              registeredGoalTools.find(({ tool }) => tool.name === "goal_result_publish")?.tool
+                .description,
+            ).toContain("exact attempt");
+            expect(
+              registeredGoalTools.find(({ tool }) => tool.name === "goal_evidence_submit")?.tool
+                .description,
+            ).toContain("integration SHA");
+
             const capabilitiesTool = server.tools.find(
               ({ tool }) => tool.name === "orchestrator_capabilities",
             );
