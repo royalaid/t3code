@@ -84,7 +84,7 @@ const goalNode = (id: string) => ({
 });
 
 it.layer(TestLayer)("ProjectionStoreV2", (it) => {
-  it.effect("overlays authoritative goal detail and shell summaries only on goal roots", () =>
+  it.effect("projects source-owned goal history while keeping root detail root-only", () =>
     Effect.gen(function* () {
       const projectionStore = yield* ProjectionStoreV2;
       const goalStore = yield* GoalProjectionStore;
@@ -207,14 +207,42 @@ it.layer(TestLayer)("ProjectionStoreV2", (it) => {
           updatedAt: timestamp,
         },
       });
-      assert.isNull((yield* projectionStore.getThreadProjection(ordinaryThreadId)).goal ?? null);
-      const detail = (yield* projectionStore.getThreadProjection(goalThreadId)).goal;
+      const sourceProjection = yield* projectionStore.getThreadProjection(ordinaryThreadId);
+      assert.isNull(sourceProjection.goal ?? null);
+      assert.deepEqual(sourceProjection.goalSurface, {
+        activeGoalId: null,
+        episodes: [
+          {
+            goalId,
+            rootThreadId: goalThreadId,
+            objective: "overlay",
+            status: "completed",
+            currentRevision: 1,
+            readyCount: 1,
+            runningCount: 1,
+            blockedCount: 1,
+            attentionRequired: true,
+            verified: true,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          },
+        ],
+      });
+      const rootProjection = yield* projectionStore.getThreadProjection(goalThreadId);
+      const detail = rootProjection.goal;
       assert.equal(detail?.goal.id, goalId);
+      assert.isNull(rootProjection.goalSurface);
+      assert.deepEqual(rootProjection.thread.lineage, {
+        parentThreadId: ordinaryThreadId,
+        relationshipToParent: "subagent",
+        rootThreadId: ordinaryThreadId,
+      });
       const shells = yield* projectionStore.getShellSnapshot();
       assert.equal(shells.threads.length, 34);
       const ordinary = shells.threads.find((thread) => thread.id === ordinaryThreadId);
       const root = shells.threads.find((thread) => thread.id === goalThreadId);
       assert.isNull(ordinary?.goalSummary ?? null);
+      assert.deepEqual(ordinary?.goalSurface, sourceProjection.goalSurface);
       assert.deepInclude(root?.goalSummary, {
         readyCount: 1,
         runningCount: 1,
@@ -222,6 +250,7 @@ it.layer(TestLayer)("ProjectionStoreV2", (it) => {
         attentionRequired: true,
         verified: true,
       });
+      assert.isNull(root?.goalSurface ?? null);
     }),
   );
   it.effect("projects one shared provider session into multiple thread bindings", () =>

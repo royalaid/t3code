@@ -179,6 +179,58 @@ it("rejects graph workspace modes that could bypass isolated writer integration"
 });
 
 it.layer(TestLayer)("GoalProjectionStore", (it) => {
+  it.effect("permits sequential goals but rejects a second nonterminal goal from one source", () =>
+    Effect.gen(function* () {
+      const store = yield* GoalProjectionStore;
+      const sourceThreadId = ThreadId.make("thread:sequential-source");
+      const first = {
+        id: GoalId.make("goal:sequential:first"),
+        objective: "first",
+        status: "planning" as const,
+        sourceThreadId,
+        rootThreadId: ThreadId.make("thread:sequential-root:first"),
+        policy,
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: null,
+        integrationWorktreePath: null,
+        integrationSha: null,
+        verifiedSha: null,
+        createdAt: "2026-07-11T00:00:00.000Z",
+        updatedAt: "2026-07-11T00:00:00.000Z",
+      };
+      yield* store.create(first);
+
+      const concurrent = yield* store
+        .create({
+          ...first,
+          id: GoalId.make("goal:sequential:concurrent"),
+          objective: "concurrent",
+          rootThreadId: ThreadId.make("thread:sequential-root:concurrent"),
+        })
+        .pipe(Effect.flip);
+      assert.equal(concurrent.reason, "referential_integrity");
+      assert.match(concurrent.detail, /already has active goal/iu);
+
+      yield* store.apply({
+        type: "goal.cancelled",
+        payload: {
+          ...first,
+          status: "cancelled",
+          updatedAt: "2026-07-11T00:00:01.000Z",
+        },
+      });
+      yield* store.create({
+        ...first,
+        id: GoalId.make("goal:sequential:second"),
+        objective: "second",
+        rootThreadId: ThreadId.make("thread:sequential-root:second"),
+        createdAt: "2026-07-11T00:00:02.000Z",
+        updatedAt: "2026-07-11T00:00:02.000Z",
+      });
+    }),
+  );
+
   it.effect("enforces canonical publisher provenance and completion-valid graphs", () =>
     Effect.gen(function* () {
       const store = yield* GoalProjectionStore;

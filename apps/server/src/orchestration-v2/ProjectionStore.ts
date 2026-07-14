@@ -44,6 +44,8 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   goalSummaryFromDetail,
   readGoalDetailByRootThread,
+  readGoalSurfaceBySourceThread,
+  readGoalSurfacesBySourceThread,
   readGoalSummariesByRootThread,
 } from "./GoalProjectionStore.ts";
 
@@ -161,6 +163,7 @@ export function emptyProjection(
     contextTransfers: [],
     visibleTurnItems: [],
     goal: null,
+    goalSurface: null,
     updatedAt: event.occurredAt,
   };
 }
@@ -817,6 +820,7 @@ export function threadShellFromProjection(
       projection.goal === undefined || projection.goal === null
         ? null
         : goalSummaryFromDetail(projection.goal),
+    goalSurface: projection.goalSurface ?? null,
     createdAt: projection.thread.createdAt,
     updatedAt: projection.updatedAt,
     archivedAt: projection.thread.archivedAt,
@@ -934,6 +938,7 @@ function shellFromState(input: {
   readonly state: ShellThreadState;
   readonly visibleItemCount: number;
   readonly goalSummary: Exclude<OrchestrationV2ThreadShell["goalSummary"], undefined>;
+  readonly goalSurface: Exclude<OrchestrationV2ThreadShell["goalSurface"], undefined>;
 }): OrchestrationV2ThreadShell {
   return {
     createdBy: input.state.thread.createdBy,
@@ -975,6 +980,7 @@ function shellFromState(input: {
     itemCount: input.state.itemCount,
     visibleItemCount: input.visibleItemCount,
     goalSummary: input.goalSummary,
+    goalSurface: input.goalSurface,
     createdAt: input.state.thread.createdAt,
     updatedAt: input.state.updatedAt,
     archivedAt: input.state.thread.archivedAt,
@@ -1989,8 +1995,38 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           decodeRows(decodeContextTransferPayload, threadId)(contextTransferRows),
         ]);
         const orderedMessages = sortMessagesByTurnItemOrder(messages, turnItems);
+        const [goal, goalSurface] = yield* Effect.all([
+          readGoalDetailByRootThread(sql, threadId),
+          readGoalSurfaceBySourceThread(sql, threadId),
+        ]);
+        const goalSourceThread =
+          goal === null
+            ? null
+            : yield* sql<PayloadRow>`
+                SELECT payload_json
+                FROM orchestration_v2_projection_threads
+                WHERE thread_id = ${goal.goal.sourceThreadId}
+                LIMIT 1
+              `.pipe(
+                Effect.flatMap((rows) =>
+                  rows[0] === undefined
+                    ? Effect.succeed(null)
+                    : decodeThreadPayload(rows[0].payload_json),
+                ),
+              );
+        const effectiveThread =
+          goal === null
+            ? thread
+            : {
+                ...thread,
+                lineage: {
+                  parentThreadId: goal.goal.sourceThreadId,
+                  relationshipToParent: "subagent" as const,
+                  rootThreadId: goalSourceThread?.lineage.rootThreadId ?? goal.goal.sourceThreadId,
+                },
+              };
         const projection = {
-          thread,
+          thread: effectiveThread,
           runs,
           attempts,
           nodes,
@@ -2007,7 +2043,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           contextHandoffs,
           contextTransfers,
           visibleTurnItems: [],
-          goal: yield* readGoalDetailByRootThread(sql, threadId),
+          goal,
+          goalSurface,
           updatedAt: thread.updatedAt,
         } satisfies OrchestrationV2ThreadProjection;
         return withLocalVisibleTurnItems(projection);
@@ -2219,18 +2256,46 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               }),
             );
             const statesByThreadId = new Map(states.map((state) => [state.thread.id, state]));
-            const goalSummariesByRootThread = yield* readGoalSummariesByRootThread(sql);
+            const [goalSummariesByRootThread, goalSurfacesBySourceThread] = yield* Effect.all([
+              readGoalSummariesByRootThread(sql),
+              readGoalSurfacesBySourceThread(sql),
+            ]);
 
-            const shells = states.map((state) =>
-              shellFromState({
-                state,
-                goalSummary: goalSummariesByRootThread.get(state.thread.id) ?? null,
+            const sourceThreadByGoalRoot = new Map<ThreadId, ThreadId>();
+            for (const [sourceThreadId, surface] of goalSurfacesBySourceThread) {
+              for (const episode of surface.episodes) {
+                sourceThreadByGoalRoot.set(episode.rootThreadId, sourceThreadId);
+              }
+            }
+
+            const shells = states.map((state) => {
+              const sourceThreadId = sourceThreadByGoalRoot.get(state.thread.id);
+              const effectiveState =
+                sourceThreadId === undefined
+                  ? state
+                  : {
+                      ...state,
+                      thread: {
+                        ...state.thread,
+                        lineage: {
+                          parentThreadId: sourceThreadId,
+                          relationshipToParent: "subagent" as const,
+                          rootThreadId:
+                            statesByThreadId.get(sourceThreadId)?.thread.lineage.rootThreadId ??
+                            sourceThreadId,
+                        },
+                      },
+                    };
+              return shellFromState({
+                state: effectiveState,
+                goalSummary: goalSummariesByRootThread.get(effectiveState.thread.id) ?? null,
+                goalSurface: goalSurfacesBySourceThread.get(effectiveState.thread.id) ?? null,
                 visibleItemCount: visibleItemCountForShell({
-                  threadId: state.thread.id,
+                  threadId: effectiveState.thread.id,
                   statesByThreadId,
                 }),
-              }),
-            );
+              });
+            });
 
             return {
               schemaVersion: ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,

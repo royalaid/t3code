@@ -3,6 +3,7 @@ import {
   type Goal as GoalType,
   GoalDetail,
   type GoalDetail as GoalDetailType,
+  type GoalEpisodeSummary,
   type GoalGraphNode,
   type GoalGraphVersion,
   GoalGraphVersion as GoalGraphVersionSchema,
@@ -17,6 +18,7 @@ import {
   GoalNodeId,
   GoalAttemptId,
   GoalSummary,
+  type GoalSurface,
   GoalWriterCommit,
   ThreadId,
   type GoalWorkflowEvent,
@@ -342,6 +344,80 @@ export const readGoalSummariesByRootThread = Effect.fn("readGoalSummariesByRootT
   return new Map(entries);
 });
 
+const TERMINAL_GOAL_STATUSES = new Set<GoalType["status"]>(["completed", "failed", "cancelled"]);
+
+type GoalSurfaceRow = GoalSummaryRow & { readonly source_thread_id: string };
+
+const goalSurfacesFromRows = Effect.fn("GoalProjectionStore.goalSurfacesFromRows")(function* (
+  rows: ReadonlyArray<GoalSurfaceRow>,
+) {
+  const surfaces = new Map<ThreadId, GoalSurface>();
+  for (const row of rows) {
+    const goal = yield* decodeGoal(row.payload_json);
+    const episode: GoalEpisodeSummary = {
+      goalId: goal.id,
+      rootThreadId: goal.rootThreadId,
+      objective: goal.objective,
+      status: goal.status,
+      currentRevision: goal.currentRevision,
+      readyCount: row.ready_count,
+      runningCount: row.running_count,
+      blockedCount: row.blocked_count,
+      attentionRequired:
+        row.blocked_count > 0 ||
+        goal.status === "blocked" ||
+        goal.status === "failed" ||
+        goal.status === "paused",
+      verified: goal.integrationSha !== null && goal.verifiedSha === goal.integrationSha,
+      createdAt: goal.createdAt,
+      updatedAt: goal.updatedAt,
+    };
+    const sourceThreadId = ThreadId.make(row.source_thread_id);
+    const surface = surfaces.get(sourceThreadId) ?? { activeGoalId: null, episodes: [] };
+    surfaces.set(sourceThreadId, {
+      activeGoalId: TERMINAL_GOAL_STATUSES.has(goal.status) ? surface.activeGoalId : goal.id,
+      episodes: [...surface.episodes, episode],
+    });
+  }
+  return surfaces;
+});
+
+export const readGoalSurfacesBySourceThread = Effect.fn("readGoalSurfacesBySourceThread")(
+  function* (sql: SqlClient.SqlClient) {
+    const rows = yield* sql<GoalSurfaceRow>`
+    SELECT g.root_thread_id, g.source_thread_id, g.payload_json,
+      SUM(CASE WHEN n.status = 'ready' THEN 1 ELSE 0 END) AS ready_count,
+      SUM(CASE WHEN n.status IN ('running', 'processing') THEN 1 ELSE 0 END) AS running_count,
+      SUM(CASE WHEN n.status = 'blocked' THEN 1 ELSE 0 END) AS blocked_count
+    FROM goals g
+    LEFT JOIN goal_nodes n
+      ON n.goal_id = g.goal_id AND n.graph_version_id = g.current_graph_version_id
+    GROUP BY g.goal_id, g.root_thread_id, g.source_thread_id, g.payload_json
+    ORDER BY g.created_at, g.goal_id
+  `;
+    return yield* goalSurfacesFromRows(rows);
+  },
+);
+
+export const readGoalSurfaceBySourceThread = Effect.fn("readGoalSurfaceBySourceThread")(function* (
+  sql: SqlClient.SqlClient,
+  sourceThreadId: ThreadId,
+) {
+  const rows = yield* sql<GoalSurfaceRow>`
+    SELECT g.root_thread_id, g.source_thread_id, g.payload_json,
+      SUM(CASE WHEN n.status = 'ready' THEN 1 ELSE 0 END) AS ready_count,
+      SUM(CASE WHEN n.status IN ('running', 'processing') THEN 1 ELSE 0 END) AS running_count,
+      SUM(CASE WHEN n.status = 'blocked' THEN 1 ELSE 0 END) AS blocked_count
+    FROM goals g
+    LEFT JOIN goal_nodes n
+      ON n.goal_id = g.goal_id AND n.graph_version_id = g.current_graph_version_id
+    WHERE g.source_thread_id = ${sourceThreadId}
+    GROUP BY g.goal_id, g.root_thread_id, g.source_thread_id, g.payload_json
+    ORDER BY g.created_at, g.goal_id
+  `;
+  return (yield* goalSurfacesFromRows(rows)).get(sourceThreadId) ?? null;
+});
+
 export interface GoalProjectionStoreShape {
   readonly create: (goal: GoalType) => Effect.Effect<void, GoalProjectionValidationError>;
   readonly activateGraph: (input: {
@@ -406,6 +482,19 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
             detail: `Goal ${goal.id} reuses an existing ID with different immutable identity.`,
           });
         return;
+      }
+      const activeRows = yield* sql<{ readonly goal_id: string }>`
+        SELECT goal_id
+        FROM goals
+        WHERE source_thread_id = ${goal.sourceThreadId}
+          AND status NOT IN ('completed', 'failed', 'cancelled')
+        LIMIT 1
+      `;
+      if (activeRows[0] !== undefined) {
+        return yield* new GoalProjectionValidationError({
+          reason: "referential_integrity",
+          detail: `Source thread ${goal.sourceThreadId} already has active goal ${activeRows[0].goal_id}.`,
+        });
       }
       yield* sql`INSERT INTO goals (
         goal_id, root_thread_id, source_thread_id, status, current_graph_version_id, current_revision,

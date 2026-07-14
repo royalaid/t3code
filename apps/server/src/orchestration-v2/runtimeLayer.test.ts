@@ -563,6 +563,32 @@ it.layer(SharedApplicationDataPlaneTestLayer)("goal launch invariants", (it) => 
       });
       const created = yield* orchestrator.getThreadProjection(rootThreadId);
       const goalId = created.goal!.goal.id;
+      assert.deepEqual(created.thread.lineage, {
+        parentThreadId: sourceThreadId,
+        relationshipToParent: "subagent",
+        rootThreadId: sourceThreadId,
+      });
+      const sourceAfterGoalLaunch = yield* orchestrator.getThreadProjection(sourceThreadId);
+      assert.isNull(sourceAfterGoalLaunch.goal ?? null);
+      assert.deepEqual(sourceAfterGoalLaunch.goalSurface, {
+        activeGoalId: goalId,
+        episodes: [
+          {
+            goalId,
+            rootThreadId,
+            objective: "Implement the trusted prompt transport",
+            status: "waiting_for_source",
+            currentRevision: 0,
+            readyCount: 0,
+            runningCount: 0,
+            blockedCount: 0,
+            attentionRequired: false,
+            verified: false,
+            createdAt: created.goal!.goal.createdAt,
+            updatedAt: created.goal!.goal.updatedAt,
+          },
+        ],
+      });
       const claimId = `goal-root-launch:${goalId}`;
       yield* orchestrator.dispatch({
         type: "goal.pending-launch.claim",

@@ -356,6 +356,26 @@ export const GoalSummary = Schema.Struct({
   attentionRequired: Schema.Boolean,
   verified: Schema.Boolean,
 });
+export const GoalEpisodeSummary = Schema.Struct({
+  goalId: GoalId,
+  rootThreadId: ThreadId,
+  objective: Schema.String,
+  status: GoalLifecycleStatus,
+  currentRevision: NonNegativeInt,
+  readyCount: NonNegativeInt,
+  runningCount: NonNegativeInt,
+  blockedCount: NonNegativeInt,
+  attentionRequired: Schema.Boolean,
+  verified: Schema.Boolean,
+  createdAt: GoalTimestamp,
+  updatedAt: GoalTimestamp,
+});
+export type GoalEpisodeSummary = typeof GoalEpisodeSummary.Type;
+export const GoalSurface = Schema.Struct({
+  activeGoalId: Schema.NullOr(GoalId),
+  episodes: Schema.Array(GoalEpisodeSummary),
+});
+export type GoalSurface = typeof GoalSurface.Type;
 export const GoalDetail = Schema.Struct({
   goal: Goal,
   graphVersions: Schema.Array(GoalGraphVersion),

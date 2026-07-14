@@ -49,6 +49,7 @@ import {
   GoalAttempt,
   GoalDetail,
   GoalEvidence,
+  GoalSurface,
   GoalFailureRecordedPayload,
   GoalGraphActivatedPayload,
   GoalNodeProjection,
@@ -1178,6 +1179,7 @@ export const OrchestrationV2ThreadProjection = Schema.Struct({
   contextTransfers: Schema.Array(OrchestrationV2ContextTransfer),
   visibleTurnItems: Schema.Array(OrchestrationV2ProjectedTurnItem),
   goal: Schema.optionalKey(Schema.NullOr(GoalDetail)),
+  goalSurface: Schema.optionalKey(Schema.NullOr(GoalSurface)),
   updatedAt: Schema.DateTimeUtc,
 });
 export type OrchestrationV2ThreadProjection = typeof OrchestrationV2ThreadProjection.Type;
@@ -1229,6 +1231,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   itemCount: NonNegativeInt,
   visibleItemCount: NonNegativeInt,
   goalSummary: Schema.optionalKey(Schema.NullOr(GoalSummary)),
+  goalSurface: Schema.optionalKey(Schema.NullOr(GoalSurface)),
   createdAt: Schema.DateTimeUtc,
   updatedAt: Schema.DateTimeUtc,
   archivedAt: Schema.NullOr(Schema.DateTimeUtc),

@@ -5541,8 +5541,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             interactionMode: source.thread.interactionMode,
             branch: null,
             worktreePath: null,
-            createdBy: command.createdBy,
-            creationSource: command.creationSource,
+            parentThreadId: command.threadId,
+            createdBy: "system",
+            creationSource: "server",
           },
           events,
         );
