@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
-import { ProviderInstanceId } from "@t3tools/contracts";
+import { GoalNodeId, type GoalRoutingRequest, ProviderInstanceId } from "@t3tools/contracts";
 
 import {
+  admitGoalGraphRoutes,
   describeGoalRoutingCatalog,
   resolveGoalRoute,
   type GoalRoutingCatalogEntry,
@@ -25,11 +26,13 @@ const entry = (
 });
 
 describe("resolveGoalRoute", () => {
-  it("describes the scheduler catalog with capabilities and goal policy constraints", () => {
+  it("groups the scheduler catalog by provider and identical route constraints", () => {
     expect(
       describeGoalRoutingCatalog({
         catalog: [
           entry("codex", "gpt-5.4", ["workspace.patch", "analysis", "tools.shell"]),
+          entry("codex", "gpt-5.3", ["tools.shell", "workspace.patch", "analysis"]),
+          entry("codex", "gpt-mini", ["analysis"]),
           entry("claudeAgent", "claude-sonnet-4-6", ["tools.shell", "analysis"]),
         ],
         providerAllowlist: ["codex"],
@@ -37,14 +40,20 @@ describe("resolveGoalRoute", () => {
     ).toEqual([
       {
         providerInstanceId: "claudeAgent",
-        model: "claude-sonnet-4-6",
+        models: ["claude-sonnet-4-6"],
         capabilities: ["analysis", "tools.shell"],
         unmetConstraints: ["provider_allowlist:claudeAgent"],
       },
       {
         providerInstanceId: "codex",
-        model: "gpt-5.4",
+        models: ["gpt-5.3", "gpt-5.4"],
         capabilities: ["analysis", "tools.shell", "workspace.patch"],
+        unmetConstraints: [],
+      },
+      {
+        providerInstanceId: "codex",
+        models: ["gpt-mini"],
+        capabilities: ["analysis"],
         unmetConstraints: [],
       },
     ]);
@@ -143,5 +152,85 @@ describe("resolveGoalRoute", () => {
       expect(decision.route.providerInstanceId).toBe("fast");
       expect(decision.route.rationale).toContain("sole");
     }
+  });
+});
+
+describe("admitGoalGraphRoutes", () => {
+  const node = (
+    id: string,
+    routingRequest: GoalRoutingRequest,
+    requiredCapabilities: ReadonlyArray<string>,
+  ) => ({
+    id: GoalNodeId.make(id),
+    routingRequest,
+    requiredCapabilities,
+    policy: {
+      sandboxMode: "read-only" as const,
+      approvalPolicy: "never" as const,
+      writableRoots: [],
+      providerAllowlist: ["codex"],
+      toolAllowlist: ["*"],
+    },
+  });
+
+  it("rejects invented ordinary-skill capabilities with node-specific constraints", () => {
+    expect(
+      admitGoalGraphRoutes({
+        nodes: [
+          node(
+            "node:writer",
+            {
+              type: "exact",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5.4",
+            },
+            ["git", "markdown"],
+          ),
+        ],
+        catalog: [entry("codex", "gpt-5.4", ["analysis", "tools.shell"])],
+      }),
+    ).toEqual({
+      type: "rejected",
+      issues: [
+        {
+          nodeId: "node:writer",
+          unmetConstraints: ["capability:git", "capability:markdown"],
+        },
+      ],
+    });
+  });
+
+  it("accepts valid exact and requirements routes", () => {
+    expect(
+      admitGoalGraphRoutes({
+        nodes: [
+          node(
+            "node:writer",
+            {
+              type: "exact",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5.4",
+            },
+            ["tools.shell"],
+          ),
+          node(
+            "node:verifier",
+            {
+              type: "requirements",
+              capabilities: ["analysis"],
+              latencyClass: "standard",
+              costClass: "standard",
+            },
+            [],
+          ),
+        ],
+        catalog: [
+          entry("codex", "gpt-5.4", ["analysis", "tools.shell"], {
+            latencyClasses: ["standard"],
+            costClasses: ["standard"],
+          }),
+        ],
+      }),
+    ).toEqual({ type: "accepted" });
   });
 });

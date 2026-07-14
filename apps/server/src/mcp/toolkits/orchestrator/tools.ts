@@ -59,7 +59,7 @@ export const GoalReadTool = Tool.make("goal_read", {
   .annotate(Tool.Readonly, true);
 export const GoalCapabilitiesTool = Tool.make("goal_capabilities", {
   description:
-    "Read the calling goal credential's authenticated role, node scope, graph-replacement and cancellation authority, and currently available provider/model route candidates. Use these returned capabilities instead of assuming authority from the prompt.",
+    "Read the calling goal credential's authenticated role, node scope, graph-replacement and cancellation authority, and compact provider/model route groups. requiredCapabilities accepts only protocol capability tokens advertised by these groups; ordinary task skills such as git or markdown must not be listed there. Use these returned capabilities instead of assuming authority from the prompt.",
   success: GoalMcpCapabilitiesResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
@@ -69,7 +69,7 @@ export const GoalCapabilitiesTool = Tool.make("goal_capabilities", {
   .annotate(Tool.Readonly, true);
 export const GoalReplaceGraphTool = Tool.make("goal_replace_graph", {
   description:
-    "Root-lead only: atomically publish the complete next goal graph, not a patch. Use expectedRevision from the latest goal_read; if rejected as stale, re-read and reconcile a new whole-graph revision. Use a globally unique graph.id that contains the exact goalId and revision, set graph.publishedByNodeId to the authenticated root thread ID, and use writer nodes followed by an independent read-only verifier that transitively depends on every writer.",
+    "Root-lead only: validate and atomically publish the complete next goal graph, not a patch. Every node must resolve against the live route groups; an unrunnable node rejects the whole graph without changing durable goal state. Use expectedRevision from the latest goal_read; after publication re-read the goal, and if rejected as stale, reconcile a new whole-graph revision. Use a globally unique graph.id that contains the exact goalId and revision, set graph.publishedByNodeId to the authenticated root thread ID, and use writer nodes followed by an independent read-only verifier that transitively depends on every writer.",
   parameters: GoalMcpReplaceGraphInput,
   success: GoalMcpMutationResult,
   failure: OrchestratorMcpFailure,

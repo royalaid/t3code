@@ -144,6 +144,13 @@ export const GoalRouteCandidate = Schema.Struct({
   unmetConstraints: Schema.Array(TrimmedNonEmptyString),
 });
 export type GoalRouteCandidate = typeof GoalRouteCandidate.Type;
+export const GoalRouteGroup = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  models: Schema.Array(TrimmedNonEmptyString),
+  capabilities: Schema.Array(TrimmedNonEmptyString),
+  unmetConstraints: Schema.Array(TrimmedNonEmptyString),
+});
+export type GoalRouteGroup = typeof GoalRouteGroup.Type;
 export const GoalResolvedRoute = Schema.Struct({
   requested: GoalRoutingRequest,
   providerInstanceId: ProviderInstanceId,

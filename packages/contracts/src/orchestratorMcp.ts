@@ -34,7 +34,7 @@ import {
   GoalEvidence,
   GoalGraphVersion,
   GoalNodeProjection,
-  GoalRouteCandidate,
+  GoalRouteGroup,
 } from "./goalWorkflow.ts";
 
 const OrchestratorMcpPrompt = TrimmedNonEmptyString.check(Schema.isMaxLength(120_000));
@@ -456,7 +456,7 @@ export const GoalMcpCapabilitiesResult = Schema.Struct({
   canReplaceGraph: Schema.Boolean,
   canCancelAnyNode: Schema.Boolean,
   scopedNodeId: Schema.NullOr(GoalNodeId),
-  routeCandidates: Schema.Array(GoalRouteCandidate),
+  routeGroups: Schema.Array(GoalRouteGroup),
 });
 export type GoalMcpCapabilitiesResult = typeof GoalMcpCapabilitiesResult.Type;
 export const GoalMcpReplaceGraphInput = Schema.Struct({

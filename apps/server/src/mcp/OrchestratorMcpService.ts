@@ -73,6 +73,7 @@ import * as Schema from "effect/Schema";
 import { isBuiltInProviderAdapterDriverV2 } from "../orchestration-v2/builtInProviderAdapterDrivers.ts";
 import { goalGraphPublisherIssue } from "../orchestration-v2/GoalGraphSemantics.ts";
 import {
+  admitGoalGraphRoutes,
   describeGoalRoutingCatalog,
   GoalRoutingService,
 } from "../orchestration-v2/GoalRoutingService.ts";
@@ -973,7 +974,7 @@ const make = Effect.gen(function* () {
         if (authority.kind === "ordinary")
           return yield* failure("goal_scope_mismatch", "Credential is not goal scoped.");
         const { detail } = yield* loadGoal(scope, authority.goalId);
-        const routeCandidates = yield* goalRouting.catalog.pipe(
+        const routeGroups = yield* goalRouting.catalog.pipe(
           Effect.map((catalog) =>
             describeGoalRoutingCatalog({
               catalog,
@@ -993,7 +994,7 @@ const make = Effect.gen(function* () {
           canReplaceGraph: authority.kind === "goal_lead",
           canCancelAnyNode: authority.kind === "goal_lead",
           scopedNodeId: authority.kind === "goal_worker" ? authority.nodeId : null,
-          routeCandidates,
+          routeGroups,
         };
       }),
     goalReplaceGraph: (scope, input) =>
@@ -1005,6 +1006,30 @@ const make = Effect.gen(function* () {
         if (identityIssue !== null) return yield* failure("invalid_request", identityIssue);
         const publisherIssue = goalGraphPublisherIssue(input.graph, detail.goal.rootThreadId);
         if (publisherIssue !== null) return yield* failure("invalid_request", publisherIssue);
+        const catalog = yield* goalRouting.catalog.pipe(
+          Effect.mapError((cause) =>
+            failure(
+              "orchestration_error",
+              `Could not validate goal graph routes: ${errorMessage(cause)}`,
+            ),
+          ),
+        );
+        const admission = admitGoalGraphRoutes({
+          nodes: input.graph.nodes,
+          catalog,
+        });
+        if (admission.type === "rejected") {
+          const issues = admission.issues
+            .map(
+              (issue) =>
+                `${issue.nodeId}: ${issue.unmetConstraints.join(", ") || "unresolved_route"}`,
+            )
+            .join("\n");
+          return yield* failure(
+            "invalid_request",
+            `Graph routing admission rejected these nodes:\n${issues}`,
+          );
+        }
         return yield* dispatchGoalMutation(scope, {
           type: "goal.graph.replace",
           commandId: goalGraphMutationCommandId(

@@ -159,6 +159,11 @@ describe("goal root prompts", () => {
     expect(trustedInstructions).toContain("must use an empty writableRoots array");
     expect(trustedInstructions).toContain("Never copy a source checkout");
     expect(trustedInstructions).toContain("graph id that includes goal:selective-graph");
+    expect(trustedInstructions).toContain("advertised protocol capability tokens");
+    expect(trustedInstructions).toContain("requiredCapabilities: []");
+    expect(trustedInstructions).toMatch(
+      /goal_replace_graph[\s\S]*goal_read[\s\S]*running attempt/u,
+    );
   });
 });
 

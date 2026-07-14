@@ -1,6 +1,9 @@
 import {
+  type GoalGraphNode,
+  type GoalNodeId,
   type GoalResolvedRoute,
   type GoalRouteCandidate,
+  type GoalRouteGroup,
   type GoalRoutingDecision,
   type GoalRoutingRequest,
   ProviderInstanceId,
@@ -50,18 +53,58 @@ function baseUnmetConstraints(
 export function describeGoalRoutingCatalog(input: {
   readonly catalog: ReadonlyArray<GoalRoutingCatalogEntry>;
   readonly providerAllowlist: ReadonlyArray<string>;
-}): ReadonlyArray<GoalRouteCandidate> {
-  return input.catalog
-    .map((entry) => ({
+}): ReadonlyArray<GoalRouteGroup> {
+  const groups = new Map<string, GoalRouteGroup>();
+  for (const entry of input.catalog) {
+    const capabilities = sortedUnique(entry.capabilities);
+    const unmetConstraints = sortedUnique(baseUnmetConstraints(input.providerAllowlist, entry));
+    const key = JSON.stringify([entry.providerInstanceId, capabilities, unmetConstraints]);
+    const current = groups.get(key);
+    groups.set(key, {
       providerInstanceId: entry.providerInstanceId,
-      model: entry.model,
-      capabilities: sortedUnique(entry.capabilities),
-      unmetConstraints: sortedUnique(baseUnmetConstraints(input.providerAllowlist, entry)),
-    }))
-    .toSorted((left, right) => {
-      const providerOrder = left.providerInstanceId.localeCompare(right.providerInstanceId);
-      return providerOrder === 0 ? left.model.localeCompare(right.model) : providerOrder;
+      models: sortedUnique([...(current?.models ?? []), entry.model]),
+      capabilities,
+      unmetConstraints,
     });
+  }
+  return [...groups.values()].toSorted((left, right) => {
+    const providerOrder = left.providerInstanceId.localeCompare(right.providerInstanceId);
+    return providerOrder === 0
+      ? (left.models[0] ?? "").localeCompare(right.models[0] ?? "")
+      : providerOrder;
+  });
+}
+
+export interface GoalGraphRouteAdmissionIssue {
+  readonly nodeId: GoalNodeId;
+  readonly unmetConstraints: ReadonlyArray<string>;
+}
+
+export type GoalGraphRouteAdmission =
+  | { readonly type: "accepted" }
+  | {
+      readonly type: "rejected";
+      readonly issues: ReadonlyArray<GoalGraphRouteAdmissionIssue>;
+    };
+
+export function admitGoalGraphRoutes(input: {
+  readonly nodes: ReadonlyArray<
+    Pick<GoalGraphNode, "id" | "routingRequest" | "requiredCapabilities" | "policy">
+  >;
+  readonly catalog: ReadonlyArray<GoalRoutingCatalogEntry>;
+}): GoalGraphRouteAdmission {
+  const issues = input.nodes.flatMap((node): ReadonlyArray<GoalGraphRouteAdmissionIssue> => {
+    const decision = resolveGoalRoute({
+      requested: node.routingRequest,
+      requiredCapabilities: node.requiredCapabilities,
+      providerAllowlist: node.policy.providerAllowlist,
+      catalog: input.catalog,
+    });
+    return decision.type === "resolved"
+      ? []
+      : [{ nodeId: node.id, unmetConstraints: decision.unmetConstraints }];
+  });
+  return issues.length === 0 ? { type: "accepted" } : { type: "rejected", issues };
 }
 
 function candidateFor(input: GoalRouteInput, entry: GoalRoutingCatalogEntry): GoalRouteCandidate {
