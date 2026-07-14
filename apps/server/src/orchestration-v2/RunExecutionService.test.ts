@@ -15,6 +15,7 @@ import {
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
+  RuntimeRequestId,
   RunAttemptId,
   RunId,
   ThreadId,
@@ -134,6 +135,10 @@ it.effect("routes shared-runtime events only to their owning root run", () =>
       identity: second,
       providerTurnId: null,
     });
+    assert.deepEqual(
+      Array.from(firstInitial.appThreadIdsByProviderThreadId.get(first.providerThreadId) ?? []),
+      [first.threadId],
+    );
     const [firstTurnAccepted, firstAfterTurn] = routeProviderEvent(turnEvent, first, firstInitial);
     const [secondTurnAccepted, secondAfterTurn] = routeProviderEvent(
       turnEvent,
@@ -143,6 +148,17 @@ it.effect("routes shared-runtime events only to their owning root run", () =>
 
     assert.isTrue(firstTurnAccepted);
     assert.isFalse(secondTurnAccepted);
+    assert.deepEqual(
+      Array.from(firstAfterTurn.providerThreadIdsByProviderTurnId.get(firstTurnId) ?? []),
+      [first.providerThreadId],
+    );
+    const [repeatedTurnAccepted, unchangedAfterRepeatedTurn] = routeProviderEvent(
+      turnEvent,
+      first,
+      firstAfterTurn,
+    );
+    assert.isTrue(repeatedTurnAccepted);
+    assert.strictEqual(unchangedAfterRepeatedTurn, firstAfterTurn);
     assert.isTrue(routeProviderEvent(messageEvent, first, firstAfterTurn)[0]);
     assert.isFalse(routeProviderEvent(messageEvent, second, secondAfterTurn)[0]);
     assert.isTrue(routeProviderEvent(terminalEvent, first, firstAfterTurn)[0]);
@@ -324,6 +340,7 @@ it.effect("delivers durable run trusted instructions to the provider turn", () =
 
 it.effect("keeps ingesting owned child events after the root turn terminalizes", () =>
   Effect.gen(function* () {
+    const now = yield* DateTime.now;
     const threadId = ThreadId.make("thread:run-execution-late-child");
     const childThreadId = ThreadId.make("thread:run-execution-late-child:child");
     const runId = RunId.make("run:run-execution-late-child");
@@ -340,6 +357,7 @@ it.effect("keeps ingesting owned child events after the root turn terminalizes",
     const childNodeId = NodeId.make("node:run-execution-late-child:child");
     const subagentNodeId = NodeId.make("node:run-execution-late-child:subagent");
     const childMessageIngested = yield* Deferred.make<void>();
+    const childRuntimeRequestRouted = yield* Ref.make(false);
     const order = yield* Ref.make<ReadonlyArray<string>>([]);
     const testLayer = runExecutionServiceLayer.pipe(
       Layer.provide(
@@ -364,6 +382,23 @@ it.effect("keeps ingesting owned child events after the root turn terminalizes",
           Layer.mock(ProviderEventIngestorV2)({
             ingestNormalized: (input) =>
               Effect.gen(function* () {
+                if (input.event.type === "runtime_request.updated") {
+                  const routing = input.runtimeRequestRouting;
+                  const providerThreadIds = Array.from(
+                    routing?.providerThreadIdsByProviderTurnId.get(childProviderTurnId) ?? [],
+                  );
+                  const appThreadIds = Array.from(
+                    routing?.appThreadIdsByProviderThreadId.get(childProviderThreadId) ?? [],
+                  );
+                  if (
+                    providerThreadIds.length === 1 &&
+                    providerThreadIds[0] === childProviderThreadId &&
+                    appThreadIds.length === 1 &&
+                    appThreadIds[0] === childThreadId
+                  ) {
+                    yield* Ref.set(childRuntimeRequestRouted, true);
+                  }
+                }
                 if (
                   input.event.type === "message.updated" &&
                   input.event.message.threadId === childThreadId
@@ -421,6 +456,22 @@ it.effect("keeps ingesting owned child events after the root turn terminalizes",
           status: "running",
         },
       } as ProviderAdapterV2Event,
+      {
+        type: "runtime_request.updated",
+        driver,
+        threadId: ThreadId.make("thread:provider:codex:native-child"),
+        runtimeRequest: {
+          id: RuntimeRequestId.make("runtime-request:run-execution-late-child"),
+          nodeId: childNodeId,
+          providerTurnId: childProviderTurnId,
+          nativeRequestRef: null,
+          kind: "command",
+          status: "pending",
+          responseCapability: { type: "live", providerSessionId },
+          createdAt: now,
+          resolvedAt: null,
+        },
+      },
       {
         type: "turn.terminal",
         driver,
@@ -522,6 +573,10 @@ it.effect("keeps ingesting owned child events after the root turn terminalizes",
 
     const observed = yield* Deferred.await(childMessageIngested).pipe(
       Effect.timeoutOption("2 seconds"),
+    );
+    assert.isTrue(
+      yield* Ref.get(childRuntimeRequestRouted),
+      "child runtime request was not authoritatively routed",
     );
     assert.isTrue(Option.isSome(observed), "child message was not ingested after root terminal");
     assert.deepEqual(yield* Ref.get(order), ["root-finalized", "child-message"]);

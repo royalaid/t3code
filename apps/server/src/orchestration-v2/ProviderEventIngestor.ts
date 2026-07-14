@@ -6,7 +6,10 @@ import {
   type OrchestrationV2Run,
   ProviderInstanceId,
   ProviderSessionId,
+  ProviderThreadId,
+  ProviderTurnId,
   RawEventId,
+  RuntimeRequestId,
   RunAttemptId,
   RunId,
   ThreadId,
@@ -49,9 +52,37 @@ export class ProviderEventPublishError extends Schema.TaggedErrorClass<ProviderE
   }
 }
 
+export class ProviderRuntimeRequestBindingMissingError extends Schema.TaggedErrorClass<ProviderRuntimeRequestBindingMissingError>()(
+  "ProviderRuntimeRequestBindingMissingError",
+  {
+    providerSessionId: ProviderSessionId,
+    requestId: RuntimeRequestId,
+    providerTurnId: Schema.NullOr(ProviderTurnId),
+    missingBinding: Schema.Literals(["provider_turn", "provider_thread", "app_thread"]),
+  },
+) {}
+
+export class ProviderRuntimeRequestBindingAmbiguousError extends Schema.TaggedErrorClass<ProviderRuntimeRequestBindingAmbiguousError>()(
+  "ProviderRuntimeRequestBindingAmbiguousError",
+  {
+    providerSessionId: ProviderSessionId,
+    requestId: RuntimeRequestId,
+    providerTurnId: Schema.NullOr(ProviderTurnId),
+    ambiguousBinding: Schema.Literals(["provider_thread", "app_thread"]),
+    candidateIds: Schema.Array(Schema.Union([ProviderThreadId, ThreadId])),
+  },
+) {}
+
+export const ProviderRuntimeRequestBindingError = Schema.Union([
+  ProviderRuntimeRequestBindingMissingError,
+  ProviderRuntimeRequestBindingAmbiguousError,
+]);
+export type ProviderRuntimeRequestBindingError = typeof ProviderRuntimeRequestBindingError.Type;
+
 export const ProviderEventIngestorV2Error = Schema.Union([
   ProviderEventNormalizeError,
   ProviderEventPublishError,
+  ProviderRuntimeRequestBindingError,
 ]);
 export type ProviderEventIngestorV2Error = typeof ProviderEventIngestorV2Error.Type;
 
@@ -63,7 +94,16 @@ export interface ProviderEventIngestInput {
   readonly runId?: RunId;
   readonly nodeId?: NodeId;
   readonly rawEventId?: RawEventId;
+  readonly runtimeRequestRouting?: ProviderRuntimeRequestRouting;
   readonly event: ProviderAdapterV2Event;
+}
+
+export interface ProviderRuntimeRequestRouting {
+  readonly appThreadIdsByProviderThreadId: ReadonlyMap<ProviderThreadId, ReadonlySet<ThreadId>>;
+  readonly providerThreadIdsByProviderTurnId: ReadonlyMap<
+    ProviderTurnId,
+    ReadonlySet<ProviderThreadId>
+  >;
 }
 
 export interface ProviderEventIngestorV2Shape {
@@ -95,6 +135,52 @@ function compactUndefined<T extends Record<string, unknown>>(record: T): T {
 }
 
 const decodeDomainEvent = Schema.decodeUnknownEffect(OrchestrationV2DomainEvent);
+
+export const resolveRuntimeRequestThreadBinding = Effect.fn(
+  "ProviderEventIngestor.resolveRuntimeRequestThreadBinding",
+)(function* (input: {
+  readonly providerSessionId: ProviderSessionId;
+  readonly requestId: RuntimeRequestId;
+  readonly providerTurnId: ProviderTurnId | null;
+  readonly routing?: ProviderRuntimeRequestRouting;
+}) {
+  const missing = (missingBinding: "provider_turn" | "provider_thread" | "app_thread") =>
+    new ProviderRuntimeRequestBindingMissingError({
+      providerSessionId: input.providerSessionId,
+      requestId: input.requestId,
+      providerTurnId: input.providerTurnId,
+      missingBinding,
+    });
+  const resolveSingleBinding = <Value extends ProviderThreadId | ThreadId>(
+    candidates: ReadonlySet<Value> | undefined,
+    binding: "provider_thread" | "app_thread",
+  ) =>
+    Effect.gen(function* () {
+      if (candidates === undefined || candidates.size === 0) {
+        return yield* missing(binding);
+      }
+      if (candidates.size > 1) {
+        return yield* new ProviderRuntimeRequestBindingAmbiguousError({
+          providerSessionId: input.providerSessionId,
+          requestId: input.requestId,
+          providerTurnId: input.providerTurnId,
+          ambiguousBinding: binding,
+          candidateIds: Array.from(candidates),
+        });
+      }
+      return candidates.values().next().value!;
+    });
+  if (input.providerTurnId === null) return yield* missing("provider_turn");
+  if (input.routing === undefined) return yield* missing("provider_thread");
+  const providerThreadId = yield* resolveSingleBinding(
+    input.routing.providerThreadIdsByProviderTurnId.get(input.providerTurnId),
+    "provider_thread",
+  );
+  return yield* resolveSingleBinding(
+    input.routing.appThreadIdsByProviderThreadId.get(providerThreadId),
+    "app_thread",
+  );
+});
 
 export const layer: Layer.Layer<ProviderEventIngestorV2, never, EventSinkV2 | IdAllocatorV2> =
   Layer.effect(
@@ -215,7 +301,14 @@ export const layer: Layer.Layer<ProviderEventIngestorV2, never, EventSinkV2 | Id
               return [
                 yield* makeDomainEvent(input, {
                   type: "runtime-request.updated",
-                  ...(input.event.threadId === undefined ? {} : { threadId: input.event.threadId }),
+                  threadId: yield* resolveRuntimeRequestThreadBinding({
+                    providerSessionId: input.providerSessionId,
+                    requestId: input.event.runtimeRequest.id,
+                    providerTurnId: input.event.runtimeRequest.providerTurnId,
+                    ...(input.runtimeRequestRouting === undefined
+                      ? {}
+                      : { routing: input.runtimeRequestRouting }),
+                  }),
                   payload: input.event.runtimeRequest,
                   nodeId: input.event.runtimeRequest.nodeId,
                 }),
@@ -254,14 +347,15 @@ export const layer: Layer.Layer<ProviderEventIngestorV2, never, EventSinkV2 | Id
               ];
           }
         }).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderEventNormalizeError({
-                providerSessionId: input.providerSessionId,
-                threadId: input.threadId,
-                providerEvent: input.event,
-                cause,
-              }),
+          Effect.mapError((cause) =>
+            Schema.is(ProviderRuntimeRequestBindingError)(cause)
+              ? cause
+              : new ProviderEventNormalizeError({
+                  providerSessionId: input.providerSessionId,
+                  threadId: input.threadId,
+                  providerEvent: input.event,
+                  cause,
+                }),
           ),
         );
 

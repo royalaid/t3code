@@ -38,10 +38,13 @@ import type {
   ProviderAdapterV2SessionRuntime,
   ProviderAdapterV2TurnMessage,
 } from "./ProviderAdapter.ts";
-import { ProviderEventIngestorV2 } from "./ProviderEventIngestor.ts";
+import {
+  ProviderEventIngestorV2,
+  type ProviderRuntimeRequestRouting,
+} from "./ProviderEventIngestor.ts";
 import { makeProviderFailure, makeProviderFailureTurnItem } from "./ProviderFailure.ts";
 
-export interface ProviderEventRoutingState {
+export interface ProviderEventRoutingState extends ProviderRuntimeRequestRouting {
   readonly ownedThreadIds: ReadonlySet<ThreadId>;
   readonly ownedProviderThreadIds: ReadonlySet<ProviderThreadId>;
   readonly ownedProviderTurnIds: ReadonlySet<ProviderTurnId>;
@@ -95,8 +98,29 @@ export function makeProviderEventRoutingState(input: {
     ]),
     ownedProviderTurnIds:
       input.providerTurnId === null ? new Set() : new Set([input.providerTurnId]),
+    appThreadIdsByProviderThreadId: new Map([
+      [input.identity.providerThreadId, new Set([input.identity.threadId])],
+    ]),
+    providerThreadIdsByProviderTurnId:
+      input.providerTurnId === null
+        ? new Map()
+        : new Map([[input.providerTurnId, new Set([input.identity.providerThreadId])]]),
     rootProviderTurnId: input.providerTurnId,
   };
+}
+
+function addRoutingBinding<Key, Value>(
+  bindings: ReadonlyMap<Key, ReadonlySet<Value>>,
+  key: Key,
+  value: Value,
+): ReadonlyMap<Key, ReadonlySet<Value>> {
+  const values = bindings.get(key);
+  if (values?.has(value) === true) {
+    return bindings;
+  }
+  const next = new Map(bindings);
+  next.set(key, new Set([...(values ?? []), value]));
+  return next;
 }
 
 export function routeProviderEvent(
@@ -108,18 +132,53 @@ export function routeProviderEvent(
   const ownsChildThread = (threadId: ThreadId): boolean =>
     threadId !== input.threadId && ownsThread(threadId);
   const ownsRun = (runId: string | null): boolean => runId === input.runId;
-  const addProviderThread = (providerThreadId: ProviderThreadId): ProviderEventRoutingState => ({
-    ...state,
-    ownedProviderThreadIds: new Set([...state.ownedProviderThreadIds, providerThreadId]),
-  });
+  const addProviderThread = (
+    providerThreadId: ProviderThreadId,
+    appThreadId?: ThreadId | null,
+  ): ProviderEventRoutingState => {
+    const ownsProviderThread = state.ownedProviderThreadIds.has(providerThreadId);
+    const appThreadBindings =
+      appThreadId == null
+        ? state.appThreadIdsByProviderThreadId
+        : addRoutingBinding(state.appThreadIdsByProviderThreadId, providerThreadId, appThreadId);
+    if (ownsProviderThread && appThreadBindings === state.appThreadIdsByProviderThreadId) {
+      return state;
+    }
+    return {
+      ...state,
+      ownedProviderThreadIds: ownsProviderThread
+        ? state.ownedProviderThreadIds
+        : new Set([...state.ownedProviderThreadIds, providerThreadId]),
+      appThreadIdsByProviderThreadId: appThreadBindings,
+    };
+  };
   const addProviderTurn = (
-    providerTurnId: ProviderTurnId,
+    providerTurn: OrchestrationV2ProviderTurn,
     root: boolean,
-  ): ProviderEventRoutingState => ({
-    ...state,
-    ownedProviderTurnIds: new Set([...state.ownedProviderTurnIds, providerTurnId]),
-    rootProviderTurnId: root ? providerTurnId : state.rootProviderTurnId,
-  });
+  ): ProviderEventRoutingState => {
+    const ownsProviderTurn = state.ownedProviderTurnIds.has(providerTurn.id);
+    const providerThreadBindings = addRoutingBinding(
+      state.providerThreadIdsByProviderTurnId,
+      providerTurn.id,
+      providerTurn.providerThreadId,
+    );
+    const rootProviderTurnId = root ? providerTurn.id : state.rootProviderTurnId;
+    if (
+      ownsProviderTurn &&
+      providerThreadBindings === state.providerThreadIdsByProviderTurnId &&
+      rootProviderTurnId === state.rootProviderTurnId
+    ) {
+      return state;
+    }
+    return {
+      ...state,
+      ownedProviderTurnIds: ownsProviderTurn
+        ? state.ownedProviderTurnIds
+        : new Set([...state.ownedProviderTurnIds, providerTurn.id]),
+      providerThreadIdsByProviderTurnId: providerThreadBindings,
+      rootProviderTurnId,
+    };
+  };
 
   switch (event.type) {
     case "provider_session.updated":
@@ -149,7 +208,9 @@ export function routeProviderEvent(
       const belongs =
         state.ownedProviderThreadIds.has(event.providerThread.id) ||
         (event.providerThread.appThreadId !== null && ownsThread(event.providerThread.appThreadId));
-      return belongs ? [true, addProviderThread(event.providerThread.id)] : [false, state];
+      return belongs
+        ? [true, addProviderThread(event.providerThread.id, event.providerThread.appThreadId)]
+        : [false, state];
     }
     case "provider_turn.updated": {
       const isRoot = event.providerTurn.runAttemptId === input.attemptId;
@@ -159,7 +220,7 @@ export function routeProviderEvent(
           state.ownedProviderThreadIds.has(event.providerTurn.providerThreadId)) ||
         state.ownedProviderTurnIds.has(event.providerTurn.id) ||
         (event.threadId !== undefined && ownsChildThread(event.threadId));
-      return belongs ? [true, addProviderTurn(event.providerTurn.id, isRoot)] : [false, state];
+      return belongs ? [true, addProviderTurn(event.providerTurn, isRoot)] : [false, state];
     }
     case "node.updated": {
       const belongs = ownsRun(event.node.runId) || ownsChildThread(event.node.threadId);
@@ -581,9 +642,11 @@ export const layer: Layer.Layer<
               );
               yield* Ref.set(rootRunFinalized, true);
             });
-          const trackChildLifecycle = (event: ProviderAdapterV2Event) =>
+          const trackChildLifecycle = (
+            event: ProviderAdapterV2Event,
+            routing: ProviderEventRoutingState,
+          ) =>
             Effect.gen(function* () {
-              const routing = yield* Ref.get(eventRouting);
               if (event.type === "provider_turn.updated") {
                 const isRoot =
                   event.providerTurn.runAttemptId === input.attempt.id ||
@@ -640,6 +703,7 @@ export const layer: Layer.Layer<
             Stream.tap((event) =>
               Effect.gen(function* () {
                 let storedEventCount = 0;
+                const routing = yield* Ref.get(eventRouting);
                 if (shouldDeliverProviderEvent(event, assistantStreamingEnabled)) {
                   const storedEvents = yield* providerEventIngestor.ingestNormalized({
                     providerSessionId: input.providerSessionId,
@@ -648,6 +712,11 @@ export const layer: Layer.Layer<
                     runId: input.run.id,
                     nodeId: input.rootNode.id,
                     event,
+                    ...(event.type === "runtime_request.updated"
+                      ? {
+                          runtimeRequestRouting: routing,
+                        }
+                      : {}),
                     ...(event.type === "provider_thread.updated" &&
                     event.providerThread.id === input.providerThread.id
                       ? {
@@ -668,8 +737,7 @@ export const layer: Layer.Layer<
                 }
                 if (
                   event.type === "turn_item.updated" &&
-                  event.turnItem.providerTurnId ===
-                    (yield* Ref.get(eventRouting)).rootProviderTurnId
+                  event.turnItem.providerTurnId === routing.rootProviderTurnId
                 ) {
                   yield* Ref.update(latestTurnItemOrdinal, (current) =>
                     Math.max(current, event.turnItem.ordinal),
@@ -680,7 +748,7 @@ export const layer: Layer.Layer<
                   yield* Ref.set(rootTerminalSeen, true);
                   yield* finalizeRootRun(event);
                 }
-                yield* trackChildLifecycle(event);
+                yield* trackChildLifecycle(event, routing);
               }),
             ),
             Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
