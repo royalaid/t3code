@@ -46,6 +46,7 @@ import { EventSinkV2 } from "./EventSink.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
+import { buildGoalRootTrustedInstructions } from "./GoalPrompts.ts";
 import { makeKeyedSerialExecutor } from "./KeyedSerialExecutor.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { applyToProjection, emptyProjection, ProjectionStoreV2 } from "./ProjectionStore.ts";
@@ -845,6 +846,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
+    if (
+      command.parentThreadId !== undefined &&
+      (command.createdBy !== "system" || command.creationSource !== "server")
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "Parent-owned thread lineage is restricted to server-created threads.",
+      });
+    }
+    const parentThreadId = command.parentThreadId;
+    const parent =
+      parentThreadId === undefined
+        ? null
+        : yield* projectionStore.getThreadProjection(parentThreadId).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestratorProjectionError({
+                  threadId: parentThreadId,
+                  cause,
+                }),
+            ),
+          );
+    if (parent !== null && parent.thread.projectId !== command.projectId) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "Parent and child threads must belong to the same project.",
+      });
+    }
     const thread: OrchestrationV2AppThread = {
       createdBy: command.createdBy,
       creationSource: command.creationSource,
@@ -859,9 +890,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       worktreePath: command.worktreePath,
       activeProviderThreadId: null,
       lineage: {
-        parentThreadId: null,
-        relationshipToParent: null,
-        rootThreadId: command.threadId,
+        parentThreadId: parent?.thread.id ?? null,
+        relationshipToParent: parent === null ? null : "subagent",
+        rootThreadId: parent?.thread.lineage.rootThreadId ?? command.threadId,
       },
       forkedFrom: null,
       createdAt: now,
@@ -2098,19 +2129,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       }
       const modelSelection = command.modelSelection ?? projection.thread.modelSelection;
-      let trustedInstructionsAdapter: ProviderAdapterV2Shape | undefined;
-      if (command.trustedInstructions !== undefined) {
-        if (
-          command.goalLaunchClaim === undefined ||
+      if (
+        command.trustedInstructions !== undefined &&
+        (command.goalLaunchClaim === undefined ||
           command.createdBy !== "system" ||
-          command.creationSource !== "server"
-        ) {
-          return yield* new OrchestratorDispatchError({
-            commandId: command.commandId,
-            commandType: command.type,
-            cause: "Trusted instructions are restricted to server-owned goal-root launches.",
-          });
-        }
+          command.creationSource !== "server")
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Trusted instructions are restricted to server-owned goal-root launches.",
+        });
+      }
+      const goalBinding = yield* goalProjectionStore
+        .resolveMcpBinding(command.threadId)
+        .pipe(mapDispatchError(command));
+      const effectiveTrustedInstructions =
+        command.trustedInstructions ??
+        (goalBinding?.kind === "lead"
+          ? buildGoalRootTrustedInstructions(goalBinding.goalId)
+          : undefined);
+      let trustedInstructionsAdapter: ProviderAdapterV2Shape | undefined;
+      if (effectiveTrustedInstructions !== undefined) {
         const adapter = yield* providerAdapters.get(modelSelection.instanceId).pipe(
           Effect.mapError(
             (cause) =>
@@ -2309,9 +2349,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           completedAt: null,
           checkpointId: null,
           contextHandoffId: null,
-          ...(command.trustedInstructions === undefined
+          ...(effectiveTrustedInstructions === undefined
             ? {}
-            : { trustedInstructions: command.trustedInstructions }),
+            : { trustedInstructions: effectiveTrustedInstructions }),
           ...(command.sourcePlanRef === undefined ? {} : { sourcePlanRef: command.sourcePlanRef }),
         };
         const attempt: OrchestrationV2RunAttempt = {
@@ -2574,9 +2614,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           completedAt: null,
           checkpointId: null,
           contextHandoffId: null,
-          ...(command.trustedInstructions === undefined
+          ...(effectiveTrustedInstructions === undefined
             ? {}
-            : { trustedInstructions: command.trustedInstructions }),
+            : { trustedInstructions: effectiveTrustedInstructions }),
           ...(command.sourcePlanRef === undefined ? {} : { sourcePlanRef: command.sourcePlanRef }),
         };
         const attempt: OrchestrationV2RunAttempt = {
@@ -3203,9 +3243,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         checkpointId: null,
         contextHandoffId:
           portableForkHandoff?.id ?? providerSwitchHandoff?.id ?? mergeBackHandoff?.id ?? null,
-        ...(command.trustedInstructions === undefined
+        ...(effectiveTrustedInstructions === undefined
           ? {}
-          : { trustedInstructions: command.trustedInstructions }),
+          : { trustedInstructions: effectiveTrustedInstructions }),
         ...(command.sourcePlanRef === undefined ? {} : { sourcePlanRef: command.sourcePlanRef }),
       };
       const attempt: OrchestrationV2RunAttempt = {

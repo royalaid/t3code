@@ -278,7 +278,7 @@ export const GoalWriterCommit = Schema.Struct({
   cleanSingleCommit: Schema.Boolean,
   integrationBeforeSha: TrimmedNonEmptyString,
   integrationAfterSha: Schema.NullOr(TrimmedNonEmptyString),
-  state: Schema.Literals(["published", "integrated", "conflicted", "rejected"]),
+  state: Schema.Literals(["published", "integrating", "integrated", "conflicted", "rejected"]),
   createdAt: GoalTimestamp,
   updatedAt: GoalTimestamp,
 });

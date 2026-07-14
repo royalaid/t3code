@@ -26,8 +26,54 @@ type SidebarProject = {
 
 export type ThreadTraversalDirection = "previous" | "next";
 
-export function isSidebarSubagentThread(thread: Pick<SidebarThreadSummary, "lineage">): boolean {
-  return thread.lineage.relationshipToParent === "subagent";
+export interface SidebarThreadHierarchyRow {
+  readonly thread: SidebarThreadSummary;
+  readonly depth: number;
+  readonly childCount: number;
+  readonly rootThreadId: SidebarThreadSummary["id"];
+  readonly ancestorThreadIds: ReadonlyArray<SidebarThreadSummary["id"]>;
+}
+
+/** Preserve the caller's sort order while moving server-owned child threads below their parent. */
+export function flattenSidebarThreadHierarchy(
+  threads: ReadonlyArray<SidebarThreadSummary>,
+): ReadonlyArray<SidebarThreadHierarchyRow> {
+  const byId = new Map(threads.map((thread) => [thread.id, thread] as const));
+  const childrenByParentId = new Map<SidebarThreadSummary["id"], Array<SidebarThreadSummary>>();
+  const attachedChildIds = new Set<SidebarThreadSummary["id"]>();
+  for (const thread of threads) {
+    const parentId =
+      thread.lineage.relationshipToParent === "subagent" ? thread.lineage.parentThreadId : null;
+    if (parentId === null || parentId === thread.id || !byId.has(parentId)) continue;
+    const siblings = childrenByParentId.get(parentId);
+    if (siblings === undefined) childrenByParentId.set(parentId, [thread]);
+    else siblings.push(thread);
+    attachedChildIds.add(thread.id);
+  }
+
+  const rows: Array<SidebarThreadHierarchyRow> = [];
+  const visited = new Set<SidebarThreadSummary["id"]>();
+  const append = (
+    thread: SidebarThreadSummary,
+    depth: number,
+    rootThreadId: SidebarThreadSummary["id"],
+    ancestorThreadIds: ReadonlyArray<SidebarThreadSummary["id"]>,
+  ) => {
+    if (visited.has(thread.id)) return;
+    visited.add(thread.id);
+    const children = childrenByParentId.get(thread.id) ?? [];
+    rows.push({ thread, depth, childCount: children.length, rootThreadId, ancestorThreadIds });
+    for (const child of children) {
+      append(child, depth + 1, rootThreadId, [...ancestorThreadIds, thread.id]);
+    }
+  };
+  for (const thread of threads) {
+    if (!attachedChildIds.has(thread.id)) append(thread, 0, thread.id, []);
+  }
+  for (const thread of threads) {
+    if (!visited.has(thread.id)) append(thread, 0, thread.id, []);
+  }
+  return rows;
 }
 
 export function getSidebarForkParentThreadId(

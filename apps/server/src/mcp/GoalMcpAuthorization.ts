@@ -1,3 +1,7 @@
+import type { GoalDetail, GoalNodeId } from "@t3tools/contracts";
+
+import type { McpGoalAuthority } from "./McpInvocationContext.ts";
+
 const ACTIVE_WORKER_STATUSES = new Set(["leased", "launching", "running", "stalled"]);
 
 type OwnedRecord = {
@@ -6,6 +10,22 @@ type OwnedRecord = {
   readonly nodeId: string;
   readonly attemptId: string;
 };
+
+export function selectGoalNodeForAuthority(
+  detail: GoalDetail,
+  authority: Exclude<McpGoalAuthority, { readonly kind: "ordinary" }>,
+  nodeId: GoalNodeId,
+) {
+  const graphVersionId =
+    authority.kind === "goal_worker"
+      ? detail.attempts.find((attempt) => attempt.id === authority.attemptId)?.graphVersionId
+      : detail.goal.currentGraphVersionId;
+  return graphVersionId === null || graphVersionId === undefined
+    ? undefined
+    : detail.nodes.find(
+        (candidate) => candidate.graphVersionId === graphVersionId && candidate.node.id === nodeId,
+      );
+}
 
 export function validateGoalWorkerBinding(input: {
   readonly authority: {

@@ -284,6 +284,7 @@ const scheduledTaskProvided = scheduledTaskServiceLayer.pipe(
 
 export const OrchestrationV2LayerLive = Layer.mergeAll(
   goalProjectionStoreLayer,
+  goalRoutingProvided,
   orchestratorProvided,
   threadManagementProvided,
   effectWorkerProvided,

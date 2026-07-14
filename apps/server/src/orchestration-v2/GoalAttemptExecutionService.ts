@@ -18,7 +18,11 @@ import * as Schema from "effect/Schema";
 
 import { EventSinkV2 } from "./EventSink.ts";
 import { isGoalVerifierNode, transitiveAncestorNodeIds } from "./GoalGraphSemantics.ts";
-import { buildGoalWorkerPrompt, type GoalWorkerExecutionContext } from "./GoalPrompts.ts";
+import {
+  buildGoalWorkerPrompt,
+  type GoalWorkerAncestorArtifact,
+  type GoalWorkerExecutionContext,
+} from "./GoalPrompts.ts";
 import { GoalProjectionStore, validateGoalNodeWorkspace } from "./GoalProjectionStore.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
 import {
@@ -34,6 +38,7 @@ const GoalAttemptExecutionReason = Schema.Literals([
   "workspace_binding_mismatch",
   "verification_sha_mismatch",
   "ancestor_attempt_missing",
+  "ancestor_context_too_large",
   "producer_context_missing",
   "producer_context_ambiguous",
 ]);
@@ -50,6 +55,20 @@ export class GoalAttemptExecutionError extends Schema.TaggedErrorClass<GoalAttem
 ) {}
 
 const isGoalAttemptExecutionError = Schema.is(GoalAttemptExecutionError);
+const MAX_GOAL_WORKER_ANCESTOR_ARTIFACTS = 128;
+const MAX_GOAL_WORKER_ANCESTOR_ARTIFACT_BYTES = 64 * 1024;
+
+export function goalWorkerAncestorArtifactBudgetError(
+  artifacts: ReadonlyArray<GoalWorkerAncestorArtifact>,
+): string | null {
+  if (artifacts.length > MAX_GOAL_WORKER_ANCESTOR_ARTIFACTS) {
+    return `Ancestor context contains ${artifacts.length} artifacts; the limit is ${MAX_GOAL_WORKER_ANCESTOR_ARTIFACTS}.`;
+  }
+  const encodedBytes = new TextEncoder().encode(JSON.stringify(artifacts)).byteLength;
+  return encodedBytes > MAX_GOAL_WORKER_ANCESTOR_ARTIFACT_BYTES
+    ? `Ancestor artifact context is ${encodedBytes} bytes; the limit is ${MAX_GOAL_WORKER_ANCESTOR_ARTIFACT_BYTES} bytes.`
+    : null;
+}
 
 function executionContractError(input: {
   readonly reason: GoalAttemptExecutionReason;
@@ -205,6 +224,15 @@ export function buildGoalWorkerExecutionCapsule(input: {
       uri: artifact.uri,
       digest: artifact.digest,
     }));
+  const artifactBudgetError = goalWorkerAncestorArtifactBudgetError(ancestorArtifacts);
+  if (artifactBudgetError !== null) {
+    return throwExecutionContractError({
+      reason: "ancestor_context_too_large",
+      operation: "bound-ancestor-context",
+      attemptId,
+      cause: artifactBudgetError,
+    });
+  }
 
   const integratedWriterAttemptsByNode = new Map<GoalNodeId, Set<GoalAttemptId>>();
   for (const record of detail.writerCommits) {
@@ -524,6 +552,7 @@ export const layer = Layer.effect(
           interactionMode: freshDetail.goal.rootInteractionMode ?? "default",
           branch: workspace.branch,
           worktreePath: workspace.path,
+          parentThreadId: freshDetail.goal.rootThreadId,
           createdBy: "system",
           creationSource: "server",
         })
@@ -559,22 +588,23 @@ export const layer = Layer.effect(
           input.attemptId,
         )("Worker thread launched without a durable run.");
       }
+      const interruptUnboundRun = threads
+        .dispatch({
+          type: "run.interrupt",
+          commandId: CommandId.make(`goal-attempt-cancel-race-interrupt:${input.attemptId}`),
+          threadId: executionThreadId,
+          runId: run.id,
+          reason: "Goal cancelled before the worker launch could be bound.",
+          createdBy: "system",
+          creationSource: "server",
+        })
+        .pipe(Effect.mapError(failure("interrupt-cancel-race", input.attemptId)));
       // If cancellation committed in the narrow interval around the message
       // transaction, the worker run may exist before its attempt can be
       // durably bound. Compensate immediately rather than leaving a provider
       // turn alive without an owning active goal attempt.
       if (!(yield* launchStillFenced())) {
-        yield* threads
-          .dispatch({
-            type: "run.interrupt",
-            commandId: CommandId.make(`goal-attempt-cancel-race-interrupt:${input.attemptId}`),
-            threadId: executionThreadId,
-            runId: run.id,
-            reason: "Goal cancelled before the worker launch could be bound.",
-            createdBy: "system",
-            creationSource: "server",
-          })
-          .pipe(Effect.mapError(failure("interrupt-cancel-race", input.attemptId)));
+        yield* interruptUnboundRun;
         return;
       }
       const now = yield* DateTime.now;
@@ -586,7 +616,8 @@ export const layer = Layer.effect(
         leaseExpiresAt: DateTime.formatIso(DateTime.add(now, { minutes: 10 })),
         updatedAt: DateTime.formatIso(now),
       };
-      yield* persistAttempt(updated, "run-bound", "launching", ["running"]);
+      const bound = yield* persistAttempt(updated, "run-bound", "launching", ["running"]);
+      if (bound.stale) yield* interruptUnboundRun;
     });
     return GoalAttemptExecutionService.of({ launch });
   }),

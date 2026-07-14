@@ -82,6 +82,12 @@ export const layer = Layer.effect(
       readonly detail: GoalDetail;
       readonly key: string;
       readonly type: string;
+      readonly fenceLifecycle?: boolean;
+      readonly expectedNode?: {
+        readonly graphVersionId: GoalNodeProjection["graphVersionId"];
+        readonly nodeId: GoalNodeProjection["node"]["id"];
+        readonly statuses: ReadonlyArray<GoalNodeProjection["status"]>;
+      };
       readonly payloads: ReadonlyArray<{
         readonly type: OrchestrationV2DomainEvent["type"];
         readonly payload: unknown;
@@ -103,7 +109,22 @@ export const layer = Layer.effect(
           ),
         ),
       );
-      yield* events.commitCommand({
+      if (input.fenceLifecycle === true) {
+        return yield* events.commitGoalLifecycleCommand({
+          commandId,
+          threadId: input.detail.goal.rootThreadId,
+          commandType: input.type,
+          acceptedAt: now,
+          goalId: input.detail.goal.id,
+          expectedStatus: input.detail.goal.status,
+          expectedRevision: input.detail.goal.currentRevision,
+          expectedGraphVersionId: input.detail.goal.currentGraphVersionId,
+          ...(input.expectedNode === undefined ? {} : { expectedNode: input.expectedNode }),
+          events: domainEvents,
+          effects: [],
+        });
+      }
+      const committed = yield* events.commitCommand({
         commandId,
         threadId: input.detail.goal.rootThreadId,
         commandType: input.type,
@@ -111,6 +132,7 @@ export const layer = Layer.effect(
         events: domainEvents,
         effects: [],
       });
+      return { committed: committed.committed, stale: false, storedEvents: committed.storedEvents };
     });
 
     const markSimpleNodeSucceeded = Effect.fn("GoalIntegrationService.markSimpleNodeSucceeded")(
@@ -258,13 +280,30 @@ export const layer = Layer.effect(
         createdAt: timestamp,
         updatedAt: timestamp,
       };
-      if (existing === undefined)
-        yield* commit({
+      if (existing === undefined) {
+        const published = yield* commit({
           detail,
           key: `writer-published:${attempt.id}:${head}`,
           type: "goal.writer.publish",
+          fenceLifecycle: true,
           payloads: [{ type: "goal.writer-commit-recorded", payload: record }],
         });
+        if (published.stale) return;
+      }
+
+      const integrating = {
+        ...record,
+        state: "integrating" as const,
+        updatedAt: timestamp,
+      };
+      const integrationClaim = yield* commit({
+        detail,
+        key: `writer-integrating:${attempt.id}:${head}`,
+        type: "goal.writer.integrating",
+        fenceLifecycle: true,
+        payloads: [{ type: "goal.writer-commit-recorded", payload: integrating }],
+      });
+      if (integrationClaim.stale) return;
 
       const integrationPath = detail.goal.integrationWorktreePath;
       const projectedBefore = detail.goal.integrationSha;
@@ -300,25 +339,71 @@ export const layer = Layer.effect(
             args: ["cherry-pick", "--abort"],
             allowNonZeroExit: true,
           });
-          const conflicted = { ...record, state: "conflicted" as const, updatedAt: timestamp };
+          const currentDetail = yield* goals.getDetail(detail.goal.id);
+          const currentRecord = currentDetail.writerCommits.find(
+            (candidate) => candidate.id === record.id,
+          );
+          const currentNode = currentDetail.nodes.find(
+            (candidate) =>
+              candidate.graphVersionId === attempt.graphVersionId &&
+              candidate.node.id === attempt.nodeId,
+          );
+          if (currentRecord === undefined || currentNode === undefined)
+            return yield* integrationError(
+              "read-current-conflict",
+              detail.goal.id,
+            )(`Writer integration claim ${record.id} no longer has a projected record and node.`);
+          if (currentRecord.state === "conflicted") return;
+          const settledAt = DateTime.formatIso(yield* DateTime.now);
+          const conflicted = {
+            ...currentRecord,
+            state: "conflicted" as const,
+            updatedAt: settledAt,
+          };
+          const preserveLifecycle = new Set(["paused", "completed", "failed", "cancelled"]).has(
+            currentDetail.goal.status,
+          );
+          const lifecycleIsTerminal = new Set(["completed", "failed", "cancelled"]).has(
+            currentDetail.goal.status,
+          );
+          const nodePayloads =
+            currentNode.status === "processing" && !lifecycleIsTerminal
+              ? [
+                  {
+                    type: "goal.node-transitioned" as const,
+                    payload: {
+                      ...currentNode,
+                      status: "blocked" as const,
+                      blocker: cherryPick.stderr.trim().slice(0, 4_000) || "Integration conflict",
+                      updatedAt: settledAt,
+                    },
+                  },
+                ]
+              : [];
           yield* commit({
-            detail,
+            detail: currentDetail,
             key: `writer-conflict:${attempt.id}:${head}`,
             type: "goal.writer.conflict",
+            fenceLifecycle: true,
+            ...(nodePayloads.length === 0
+              ? {}
+              : {
+                  expectedNode: {
+                    graphVersionId: currentNode.graphVersionId,
+                    nodeId: currentNode.node.id,
+                    statuses: ["processing" as const],
+                  },
+                }),
             payloads: [
               { type: "goal.writer-commit-recorded", payload: conflicted },
-              {
-                type: "goal.node-transitioned",
-                payload: {
-                  ...node,
-                  status: "blocked",
-                  blocker: cherryPick.stderr.trim().slice(0, 4_000) || "Integration conflict",
-                  updatedAt: timestamp,
-                },
-              },
+              ...nodePayloads,
               {
                 type: "goal.integration-conflicted",
-                payload: { ...detail.goal, status: "blocked", updatedAt: timestamp },
+                payload: {
+                  ...currentDetail.goal,
+                  status: preserveLifecycle ? currentDetail.goal.status : "blocked",
+                  updatedAt: settledAt,
+                },
               },
               {
                 type: "goal.failure-recorded",
@@ -336,7 +421,7 @@ export const layer = Layer.effect(
                   recoveryState: "unresolved",
                   blocker:
                     "Integration conflict requires a root-lead graph revision with a dedicated resolver node.",
-                  occurredAt: timestamp,
+                  occurredAt: settledAt,
                 },
               },
             ],
@@ -349,35 +434,75 @@ export const layer = Layer.effect(
           args: ["rev-parse", "--verify", "HEAD^{commit}"],
         })).stdout.trim();
       }
+      const currentDetail = yield* goals.getDetail(detail.goal.id);
+      const currentRecord = currentDetail.writerCommits.find(
+        (candidate) => candidate.id === record.id,
+      );
+      const currentNode = currentDetail.nodes.find(
+        (candidate) =>
+          candidate.graphVersionId === attempt.graphVersionId &&
+          candidate.node.id === attempt.nodeId,
+      );
+      if (currentRecord === undefined || currentNode === undefined)
+        return yield* integrationError(
+          "read-current-integration",
+          detail.goal.id,
+        )(`Writer integration claim ${record.id} no longer has a projected record and node.`);
+      if (currentRecord.state === "integrated") {
+        yield* cleanupWriter(currentDetail, attempt);
+        return;
+      }
+      const settledAt = DateTime.formatIso(yield* DateTime.now);
       const integrated = {
-        ...record,
+        ...currentRecord,
         integrationAfterSha: afterSha,
         state: "integrated" as const,
-        updatedAt: timestamp,
+        updatedAt: settledAt,
       };
-      yield* commit({
-        detail,
+      const nodePayloads =
+        currentNode.status === "processing" &&
+        !new Set(["completed", "failed", "cancelled"]).has(currentDetail.goal.status)
+          ? [
+              {
+                type: "goal.node-transitioned" as const,
+                payload: {
+                  ...currentNode,
+                  status: "succeeded" as const,
+                  blocker: null,
+                  updatedAt: settledAt,
+                },
+              },
+            ]
+          : [];
+      const settled = yield* commit({
+        detail: currentDetail,
         key: `writer-integrated:${attempt.id}:${afterSha}`,
         type: "goal.writer.integrate",
+        fenceLifecycle: true,
+        ...(nodePayloads.length === 0
+          ? {}
+          : {
+              expectedNode: {
+                graphVersionId: currentNode.graphVersionId,
+                nodeId: currentNode.node.id,
+                statuses: ["processing" as const],
+              },
+            }),
         payloads: [
           { type: "goal.writer-commit-recorded", payload: integrated },
           {
             type: "goal.integration-updated",
             payload: {
-              ...detail.goal,
-              status: "running",
+              ...currentDetail.goal,
               integrationSha: afterSha,
               verifiedSha: null,
-              updatedAt: timestamp,
+              updatedAt: settledAt,
             },
           },
-          {
-            type: "goal.node-transitioned",
-            payload: { ...node, status: "succeeded", blocker: null, updatedAt: timestamp },
-          },
+          ...nodePayloads,
         ],
       });
-      yield* cleanupWriter(detail, attempt);
+      if (!settled.stale) yield* cleanupWriter(currentDetail, attempt);
     });
 
     const rescanUnlocked = Effect.fn("GoalIntegrationService.rescanUnlocked")(function* (
@@ -431,6 +556,7 @@ export const layer = Layer.effect(
           detail,
           key: `complete:${goalId}:${detail.goal.integrationSha}`,
           type: "goal.complete",
+          fenceLifecycle: true,
           payloads: [
             {
               type: "goal.completed",
@@ -454,6 +580,9 @@ export const layer = Layer.effect(
     yield* events.stream().pipe(
       Stream.filter((stored: OrchestrationV2StoredEvent) =>
         new Set([
+          "goal.updated",
+          "goal.reopened",
+          "goal.cancelled",
           "goal.node-transitioned",
           "goal.artifact-published",
           "goal.evidence-submitted",
@@ -462,13 +591,14 @@ export const layer = Layer.effect(
       ),
       Stream.runForEach((stored) => {
         const event = stored.event;
-        const payload = event.payload as { readonly goalId?: GoalId };
-        return payload.goalId === undefined
+        const payload = event.payload as { readonly goalId?: GoalId; readonly id?: GoalId };
+        const goalId = payload.goalId ?? payload.id;
+        return goalId === undefined
           ? Effect.void
-          : rescan(payload.goalId).pipe(
+          : rescan(goalId).pipe(
               Effect.catch((cause) =>
                 Effect.logError("Goal integration event processing failed", {
-                  goalId: payload.goalId,
+                  goalId,
                   cause,
                 }),
               ),

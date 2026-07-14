@@ -7,13 +7,14 @@ the design gaps that remain open for a maintainer decision.
 
 ## TL;DR
 
-The branch is coherent and well-tested at the unit/integration level, honestly
-documented, and structurally faithful to its design docs. But the live `/goal`
-pipeline had **never been run end-to-end** — the first real UI drive found a
-chain of bugs that made goal launch impossible on any machine. Five are fixed
-and pushed (all typecheck-clean, full server suite green: 1284 passing). The
-feature now reaches a **live root lead**, but does not yet complete a goal because
-the lead is never instructed to act as an orchestrator (finding #9 below).
+The first real UI drive found a chain of bugs that made goal launch impossible
+on any machine. The initial five launch fixes were pushed with a typecheck-clean,
+1284-test server run. A second implementation pass resolved the root contract,
+approval routing, worker authority binding, graph-revision lookup, and root-run
+pause races. A Codex-led live goal now reaches `completed` through one isolated
+writer, server integration, and one independent verifier with accepted evidence
+for the exact final SHA. The source checkout remains unchanged by design; the
+retained integration branch is the explicit local deliverable.
 
 ## Environment / how to run it on this machine
 
@@ -57,10 +58,10 @@ each; no production behavior beyond goal launch is touched.
 
 3. **`fix(goals): serialize shared read-only worktree creation per goal`**
    `GoalWorkspaceService.ts`. The startup rescan and the settlement event stream
-   can drive launch concurrently, racing the same `git worktree add -b
-goal-read/<...>` and failing with "cannot lock ref ... reference already
+   can drive launch concurrently, racing the same
+   `git worktree add -b goal-read/<...>` and failing with "cannot lock ref ... reference already
    exists." Wrapped the shared read-only worktree creation in the existing
-   per-goal serial executor (same guard `provision()` already uses).
+   per-goal serial executor (the same guard `provision()` already uses).
 
 4. **`fix(goals): launch root lead on goal.created without awaiting a restart`**
    `GoalLaunchService.ts`. The launch consumer only reacted to terminal
@@ -87,35 +88,74 @@ transport-boundary client-authority enforcement (`d086daae6`) rejects client
 commands on goal threads exactly as documented. File-change approvals surface in
 the UI and resolve.
 
-## Open findings (NOT fixed — need a maintainer decision)
+### Follow-up execution-contract fixes
 
-- **★ #9 — the root lead is never told to orchestrate (why goals don't complete).**
-  The lead is launched (`GoalLaunchService.ts` ~L305) with an `initialMessage`
-  that is only the objective + handoff context. It gets **no** instruction that
-  it is a coordinator or that it must publish a worker-node graph via the
-  `goal_replace_graph` MCP tool (that tool exists and is authorized for the lead
-  — `OrchestratorMcpService.ts:945-958`, `mcp/toolkits/orchestrator/tools.ts`).
-  Codex `developer_instructions` are only injected for `interactionMode ===
-"plan"` (`CodexAdapterV2.ts:538`); the goal lead runs in default build mode.
-  Result: the lead behaves as a plain coding agent and edits files **directly in
-  its read-only `goal-read/` checkout** (approval-gated), producing `nodes=0,
-rev=0` indefinitely. Those direct edits are an architectural dead end — they
-  never become a writer commit and never reach the server-controlled integration
-  worktree, so the goal can never reach integration/verification/completion.
-  Fix requires authoring an orchestrator system/developer prompt for the lead —
-  a deliberate product/prompt decision, intentionally left to the maintainer.
+1. The server now delivers a deterministic root-lead orchestration contract
+   through Claude and Codex trusted instruction channels. Objective and handoff
+   text stay in the user role. The contract requires `goal_read`,
+   `goal_capabilities`, and a completion-valid whole-graph publication instead
+   of direct root edits.
+2. Graph activation derives publisher identity from the authenticated lead and
+   rejects graphs without a producer-backed verifier that transitively follows
+   every writer. Terminal goals remain fenced; running replacements,
+   revision-zero blocked recovery, and revisioned root-controlled paused
+   replacement are explicit lifecycle paths.
+3. Worker prompts are fresh execution capsules containing only the active node,
+   attempt, workspace SHA, usable ancestors, and relevant artifacts. Worker MCP
+   node lookup is pinned to the attempt's graph revision so reused node IDs
+   cannot resolve a stale immutable revision.
+4. Runtime approvals are projected onto the bound application thread while
+   responses retain the original provider turn/request identity. Codex's
+   injected `t3-code` MCP approves exactly the eight goal tools through per-tool
+   configuration so the required control plane cannot silently self-reject;
+   unrelated MCP, shell, and file operations retain their normal approval path.
+5. Worker startup persists the exact provider-session binding before issuing
+   the goal MCP credential. A stale or different session fails the active
+   attempt fence rather than receiving authority.
+6. A root-control run pauses scheduling once. Publishing a replacement graph
+   resumes the goal, and subsequent `waiting` events from the same run no longer
+   re-pause the new graph. Explicit interruption retains Stop semantics.
+7. Goal attempt threads now persist the root lead as server-owned parent
+   lineage. The project sidebar renders writer and verifier rows beneath that
+   root, counts only roots against its preview limit, and exposes per-parent
+   collapse without reparenting ordinary threads or forks.
+8. `goal_capabilities` now reads the scheduler's provider catalog instead of
+   returning empty capability arrays. The root sees the same sorted capability
+   snapshots and goal-policy provider constraints that will evaluate its graph.
 
-- **#7 — exec-approval routing (the "it's taking forever" hang).** A lead's
-  native `command` (exec) approval request is projected under the **raw provider
-  thread id** (`thread:provider:codex:native-thread:...`) instead of the goal-root
-  orchestration thread, so the UI (subscribed to the orchestration thread) never
-  renders it and the lead blocks forever at 0% CPU. `file-change` approvals bind
-  correctly and are resolvable. This is the same provider-turn-mapping bug family
-  the upstream author filed against PR #2829. Start at
-  `ProviderEventIngestor.ts:214` (`runtime_request.updated`) and the native-thread
-  id derivation in `IdAllocator.ts:365`.
+### Final live acceptance
 
-- **#8 — cancellation doesn't terminalize.** Cancel Goal killed the lead's
+The live fixture goal `goal:2264ac6f-2121-445e-b074-c11c5389a9d3` completed on
+graph revision 5. Revision 5 was the stable retry after earlier revisions were
+intentionally interrupted by server hot reloads while live-found fixes were
+installed.
+
+- Writer attempt: `writer_square_minimal`, one clean commit, integrated as
+  `b09ed0f44ca5cffca88c327e896c077986f8573d`.
+- Verifier attempt: `verifier_square_minimal`, Codex, launched only after writer
+  integration and bound to `provider-session:provider-instance:codex:shared`.
+- Verification: exact HEAD, `git diff --check`, changed-file scope, README
+  documentation, and direct Node ESM assertions all passed.
+- Evidence: durable log/report artifacts and an accepted verdict target the
+  same integration SHA; the goal's `integrationSha` and `verifiedSha` match.
+- UI: the goal panel shows revision 5 `completed`, two succeeded nodes, one
+  integrated commit, and one accepted current-SHA verdict.
+- Delivery boundary: the original fixture checkout remains on its initial SHA;
+  the clean retained integration branch contains the verified commit, exactly
+  as specified by `goal-workflows-context.md`.
+
+## Finding status
+
+- **Resolved #9 — root orchestration contract.** The root receives trusted,
+  provider-native coordination instructions. The live Codex root published
+  valid writer/verifier graphs without editing its read-only checkout, while
+  deterministic adapter tests cover the Claude trusted-channel mapping.
+- **Resolved #7 — exec-approval routing.** Runtime requests bind to the
+  application thread visible in the UI while response delivery retains the raw
+  provider identifiers needed to resume the original turn. Focused routing
+  tests are green and live worker approval requests rendered and resolved.
+
+- **Open #8 — cancellation doesn't terminalize.** Cancel Goal killed the lead's
   provider session but the `goals` row stayed `planning` (updatedAt unchanged) —
   cancellation projection/fencing gap, consistent with the committed
   `TODO(interrupt-hardening)` at `Orchestrator.ts:4678`. The web Cancel Goal
@@ -124,6 +164,12 @@ rev=0` indefinitely. Those direct edits are an architectural dead end — they
 - **Recovery orphaning.** A goal that dies in `planning` (e.g. server restart) is
   not re-driven: startup recovery only rescans `waiting_for_source` /
   `provisioning`. Goals stuck in `planning` remain stuck across boots.
+
+- **Root diagnostic parity.** Humans can open the new nested worker rows and read
+  their full timelines. A goal-bound lead sees durable attempt, artifact,
+  evidence, and failure state through `goal_read`, but has no narrowly scoped
+  read-only tool for the underlying worker timeline. Adding that primitive needs
+  a deliberate goal-authority and MCP-surface decision.
 
 ## Upstream context
 
@@ -142,12 +188,13 @@ rev=0` indefinitely. Those direct edits are an architectural dead end — they
 
 ## Suggested next steps
 
-1. Decide the lead-orchestration model (#9): give the goal lead a developer/system
-   prompt that instructs decompose-and-publish-graph, OR formally support a
-   "lead does the work directly" mode where the lead's edits are captured as a
-   writer commit onto the integration branch. Until one of these exists, `/goal`
-   cannot complete.
-2. Fix the exec-approval thread binding (#7) so lead command approvals are
-   visible; this is the most user-visible remaining bug.
-3. Harden cancellation/recovery (#8 + planning-orphan) per the existing
+1. Harden cancellation/recovery (#8 + planning-orphan) per the existing
    interrupt-hardening TODO.
+2. Decide whether root leads should receive a same-goal, read-only attempt
+   timeline primitive for diagnosing worker provider failures.
+3. Run the repository-wide typecheck, check, and full server suite after the
+   follow-up execution-contract commits settle.
+4. Repeat the live acceptance from a clean revision-zero Codex goal before
+   release-candidate sign-off. This iteration intentionally relies on
+   deterministic adapter tests, rather than a second live provider run, for
+   Claude trusted-channel parity.

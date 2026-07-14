@@ -8,9 +8,9 @@ import {
   getVisibleThreadsForProject,
   getProjectSortTimestamp,
   getSidebarForkParentThreadId,
+  flattenSidebarThreadHierarchy,
   hasUnseenCompletion,
   isContextMenuPointerDown,
-  isSidebarSubagentThread,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
   resolveProjectStatusIndicator,
@@ -73,18 +73,69 @@ describe("resolveSidebarStageBadgeLabel", () => {
 });
 
 describe("sidebar thread lineage helpers", () => {
-  it("identifies subagent threads so the sidebar can hide them", () => {
-    const parentId = ThreadId.make("thread-parent");
-    const subagent = makeThreadFixture({
+  it("nests subagent threads beneath their parent while preserving sibling order", () => {
+    const parent = makeThreadFixture({ id: ThreadId.make("thread-parent") });
+    const child = makeThreadFixture({
+      id: ThreadId.make("thread-child"),
       lineage: {
-        rootThreadId: parentId,
-        parentThreadId: parentId,
+        rootThreadId: parent.id,
+        parentThreadId: parent.id,
+        relationshipToParent: "subagent",
+      },
+    });
+    const grandchild = makeThreadFixture({
+      id: ThreadId.make("thread-grandchild"),
+      lineage: {
+        rootThreadId: parent.id,
+        parentThreadId: child.id,
+        relationshipToParent: "subagent",
+      },
+    });
+    const sibling = makeThreadFixture({ id: ThreadId.make("thread-sibling") });
+
+    expect(flattenSidebarThreadHierarchy([grandchild, child, sibling, parent])).toMatchObject([
+      { thread: { id: sibling.id }, depth: 0, childCount: 0 },
+      { thread: { id: parent.id }, depth: 0, childCount: 1 },
+      {
+        thread: { id: child.id },
+        depth: 1,
+        childCount: 1,
+        rootThreadId: parent.id,
+        ancestorThreadIds: [parent.id],
+      },
+      {
+        thread: { id: grandchild.id },
+        depth: 2,
+        childCount: 0,
+        rootThreadId: parent.id,
+        ancestorThreadIds: [parent.id, child.id],
+      },
+    ]);
+  });
+
+  it("keeps forks and orphaned subagents at the root level", () => {
+    const missingParentId = ThreadId.make("thread-missing-parent");
+    const fork = makeThreadFixture({
+      id: ThreadId.make("thread-fork"),
+      lineage: {
+        rootThreadId: missingParentId,
+        parentThreadId: missingParentId,
+        relationshipToParent: "fork",
+      },
+    });
+    const orphan = makeThreadFixture({
+      id: ThreadId.make("thread-orphan"),
+      lineage: {
+        rootThreadId: missingParentId,
+        parentThreadId: missingParentId,
         relationshipToParent: "subagent",
       },
     });
 
-    expect(isSidebarSubagentThread(subagent)).toBe(true);
-    expect(isSidebarSubagentThread(makeThreadFixture())).toBe(false);
+    expect(flattenSidebarThreadHierarchy([fork, orphan])).toMatchObject([
+      { thread: { id: fork.id }, depth: 0 },
+      { thread: { id: orphan.id }, depth: 0 },
+    ]);
   });
 
   it("resolves the parent thread for fork sidebar affordances", () => {

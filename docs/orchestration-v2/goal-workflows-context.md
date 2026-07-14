@@ -61,14 +61,31 @@ Important enforcement points:
 - Root-lead and worker MCP credentials are scoped to the goal, thread, and
   active provider session. Generic orchestration commands cannot bypass the
   graph or resource accounting.
+- Worker startup durably binds the attempt to the exact provider session before
+  issuing that session's MCP credential. Authorization selects a worker node
+  from the attempt's immutable graph revision and a lead node from the current
+  active revision, so reused node IDs cannot resolve stale graph data.
 - The root lead uses a deterministic shared read-only checkout and
   `approval-required` runtime. It cannot use the retained integration worktree.
+- The root orchestration contract is server-owned trusted instruction. The goal
+  objective and source capsule remain user-role data and cannot override it.
+  Codex's injected `t3-code` MCP server approves exactly its eight goal tools
+  through per-tool configuration. Other MCP tools plus ordinary shell and file
+  requests retain their normal approval behavior and still follow the resolved
+  provider runtime, which may be stricter than the node policy.
 - Read-only nodes use the shared read checkout; writers use isolated branches
   from their recorded integration SHA. The retained integration worktree is
   server-controlled assembly only.
 - A policy can only narrow. Provider launch must receive the resolved runtime
   policy; a provider that cannot enforce a non-wildcard tool allowlist must
   reject the attempt rather than silently broaden it.
+- Goal attempt threads persist the root lead as server-owned subagent lineage.
+  Client-created threads cannot claim a parent, cross-project parentage is
+  rejected, and the sidebar derives its nested presentation from that durable
+  relationship without changing routing or child authority.
+- `goal_capabilities` reads the same provider capability catalog as the scheduler,
+  including the active goal policy's provider constraints, so graph routing
+  requests do not depend on guessed or placeholder capability data.
 
 ## Scheduling, cancellation, and recovery
 
@@ -89,6 +106,10 @@ new launches while existing workers continue.
 - Cancel Goal is terminal. It must cancel unbound launch effects and fence
   pending goal provisioning as well as interrupt bound work; cancellation
   preserves artifacts and diagnostic worktrees.
+- A root-control run pauses scheduling once at the start of that run. A valid
+  graph replacement from a revisioned root-controlled `paused` goal atomically
+  returns it to `running`; later `waiting` updates from the same run do not
+  re-pause it. An explicit interruption still pauses future launches.
 
 ## Integration and verification
 
@@ -105,6 +126,20 @@ Completion is a server invariant, not a prompt convention:
 - integration SHA changes and reopening invalidate accepted verification;
 - reopening retains historical evidence but requires a fresh graph revision and
   fresh verification.
+- Artifact and evidence timestamps use canonical UTC DateTime values including
+  milliseconds, for example `2026-07-14T01:53:01.000Z`.
+
+### Live Codex acceptance record
+
+On 2026-07-13, a local two-file goal completed through graph revision 5 after
+the live run was used to find and fix provider-session, stale-node lookup, and
+root-control pause races. The stable revision contained one writer followed by
+one independent verifier. The writer's single commit was integrated as
+`b09ed0f44ca5cffca88c327e896c077986f8573d`; the verifier checked that exact SHA,
+published durable log/report artifacts, and submitted an accepted verdict. The
+goal projected `completed` with matching integration and verified SHAs. The
+source checkout remained unchanged, as required by the explicit local-delivery
+boundary; the retained integration branch is the deliverable.
 
 ## Validation record
 

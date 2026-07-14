@@ -42,6 +42,7 @@ import { McpSchema, McpServer } from "effect/unstable/ai";
 
 import { ClaudeProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import { GoalRoutingService } from "../orchestration-v2/GoalRoutingService.ts";
 import { OrchestratorV2, type OrchestratorV2Shape } from "../orchestration-v2/Orchestrator.ts";
 import { layer as threadManagementServiceLayer } from "../orchestration-v2/ThreadManagementService.ts";
 import {
@@ -442,6 +443,34 @@ describe("orchestrator MCP toolkit", () => {
               model: "opencode/test",
             }),
           ]);
+          const goalRoutingLayer = Layer.succeed(
+            GoalRoutingService,
+            GoalRoutingService.of({
+              catalog: Effect.succeed([
+                {
+                  providerInstanceId: codexInstanceId,
+                  model: codexModel,
+                  capabilities: ["tools.shell", "workspace.patch"],
+                  latencyClasses: [],
+                  costClasses: [],
+                  enabled: true,
+                  installed: true,
+                  authenticated: true,
+                },
+                {
+                  providerInstanceId: claudeInstanceId,
+                  model: claudeModel,
+                  capabilities: ["tools.shell", "workspace.patch"],
+                  latencyClasses: [],
+                  costClasses: [],
+                  enabled: true,
+                  installed: true,
+                  authenticated: true,
+                },
+              ]),
+              route: () => Effect.die("GoalRoutingService.route is unused in this MCP test"),
+            }),
+          );
           // In-memory ScheduledTaskService stub so the schedule/list/update/
           // delete tools can be exercised without SQL/launch wiring.
           const scheduledStore = yield* Ref.make<ReadonlyArray<ScheduledTask>>([]);
@@ -472,6 +501,7 @@ describe("orchestrator MCP toolkit", () => {
             Layer.provideMerge(McpServer.McpServer.layer),
             Layer.provideMerge(orchestrationLayer),
             Layer.provide(providerRegistryLayer),
+            Layer.provide(goalRoutingLayer),
             Layer.provide(scheduledTaskStubLayer),
             Layer.provide(NodeServices.layer),
           );

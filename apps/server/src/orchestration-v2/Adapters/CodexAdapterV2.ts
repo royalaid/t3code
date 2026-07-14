@@ -965,6 +965,19 @@ export class CodexAppServerClientFactory extends Context.Service<
   CodexAppServerClientFactoryShape
 >()("t3/orchestration-v2/Adapters/CodexAdapterV2/CodexAppServerClientFactory") {}
 
+const CODEX_GOAL_MCP_TOOL_APPROVALS = Object.fromEntries(
+  [
+    "goal_read",
+    "goal_capabilities",
+    "goal_replace_graph",
+    "goal_node_read",
+    "goal_node_cancel",
+    "goal_result_publish",
+    "goal_evidence_read",
+    "goal_evidence_submit",
+  ].map((name) => [name, { approval_mode: "approve" }]),
+);
+
 export function codexThreadRuntimeParams(input: {
   readonly threadId: ThreadId | null;
   readonly modelSelection?: { readonly model: string };
@@ -986,6 +999,7 @@ export function codexThreadRuntimeParams(input: {
             mcp_servers: {
               "t3-code": {
                 url: mcpSession.endpoint,
+                tools: CODEX_GOAL_MCP_TOOL_APPROVALS,
                 http_headers: {
                   Authorization: mcpSession.authorizationHeader,
                 },

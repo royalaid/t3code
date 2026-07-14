@@ -6,6 +6,7 @@ import {
   CommandId,
   ContextTransferId,
   EventId,
+  GoalArtifactId,
   GoalId,
   GoalEvidenceId,
   GoalAttemptId,
@@ -501,6 +502,345 @@ it.layer(TestLayer)("orchestration V2 foundation persistence", (it) => {
         Effect.flatMap((maintenance) => maintenance.verify),
       );
       assert.isTrue(verification.valid);
+    }),
+  );
+
+  it.effect("rejects a stale root pause after a replacement graph activates", () =>
+    Effect.gen(function* () {
+      const eventSink = yield* EventSinkV2;
+      const goalStore = yield* GoalProjectionStore;
+      const now = yield* DateTime.now;
+      const timestamp = DateTime.formatIso(now);
+      const threadId = ThreadId.make("thread:foundation-root-pause-race");
+      const goalId = GoalId.make("goal:foundation-root-pause-race");
+      const goal = {
+        id: goalId,
+        objective: "keep replacement graphs running",
+        status: "planning" as const,
+        sourceThreadId: ThreadId.make("thread:foundation-root-pause-race-source"),
+        rootThreadId: threadId,
+        sourceActiveRunId: null,
+        initialRootRunId: RunId.make("run:foundation-root-pause-race"),
+        pendingLaunchClaimId: `goal-root-launch:${goalId}`,
+        policy: foundationGoalPolicy,
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: "goal/root-pause-race",
+        integrationWorktreePath: "/workspace/root-pause-race",
+        integrationSha: "sha:root-pause-race",
+        verifiedSha: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      yield* eventSink.write({
+        events: [
+          threadCreatedEvent({
+            id: "event:foundation-root-pause-race:thread",
+            thread: makeThread(threadId, now),
+            now,
+          }),
+          {
+            id: EventId.make("event:foundation-root-pause-race:create"),
+            type: "goal.created",
+            threadId,
+            occurredAt: now,
+            payload: goal,
+          },
+        ],
+      });
+
+      const { graph: firstGraph } = makeCompletionGraph({
+        goalId,
+        rootThreadId: threadId,
+        graphId: "graph:foundation-root-pause-race:1",
+        writerId: "node:foundation-root-pause-race:writer:1",
+        verifierId: "node:foundation-root-pause-race:verifier:1",
+        edgeId: "edge:foundation-root-pause-race:1",
+        createdAt: timestamp,
+      });
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("event:foundation-root-pause-race:graph:1"),
+            type: "goal.graph-version-activated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              goalId,
+              expectedRevision: 0,
+              expectedStatus: "planning",
+              graph: firstGraph,
+              activatedAt: timestamp,
+            },
+          },
+        ],
+      });
+      const beforeReplacement = yield* goalStore.getDetail(goalId);
+
+      const { graph: replacementBase } = makeCompletionGraph({
+        goalId,
+        rootThreadId: threadId,
+        graphId: "graph:foundation-root-pause-race:2",
+        writerId: "node:foundation-root-pause-race:writer:2",
+        verifierId: "node:foundation-root-pause-race:verifier:2",
+        edgeId: "edge:foundation-root-pause-race:2",
+        createdAt: timestamp,
+      });
+      const replacementGraph = { ...replacementBase, revision: 2 };
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("event:foundation-root-pause-race:graph:2"),
+            type: "goal.graph-version-activated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              goalId,
+              expectedRevision: 1,
+              expectedStatus: "running",
+              graph: replacementGraph,
+              activatedAt: timestamp,
+            },
+          },
+        ],
+      });
+
+      const pause = yield* eventSink.commitGoalLifecycleCommand({
+        commandId: CommandId.make("command:foundation-root-pause-race"),
+        threadId,
+        commandType: "goal.root-control.pause",
+        acceptedAt: now,
+        goalId,
+        expectedStatus: "running",
+        expectedRevision: beforeReplacement.goal.currentRevision,
+        expectedGraphVersionId: beforeReplacement.goal.currentGraphVersionId,
+        events: [
+          {
+            id: EventId.make("event:foundation-root-pause-race:pause"),
+            type: "goal.updated",
+            threadId,
+            occurredAt: now,
+            payload: { ...beforeReplacement.goal, status: "paused", updatedAt: timestamp },
+          },
+        ],
+        effects: [],
+      });
+
+      assert.isTrue(pause.stale);
+      const final = yield* goalStore.getDetail(goalId);
+      assert.equal(final.goal.status, "running");
+      assert.equal(final.goal.currentRevision, 2);
+      assert.equal(final.goal.currentGraphVersionId, replacementGraph.id);
+    }),
+  );
+
+  it.effect("fences lifecycle integration by node state while allowing claimed settlement", () =>
+    Effect.gen(function* () {
+      const eventSink = yield* EventSinkV2;
+      const goalStore = yield* GoalProjectionStore;
+      const now = yield* DateTime.now;
+      const timestamp = DateTime.formatIso(now);
+      const threadId = ThreadId.make("thread:foundation-integration-node-race");
+      const goalId = GoalId.make("goal:foundation-integration-node-race");
+      const goal = {
+        id: goalId,
+        objective: "settle a claimed writer without reviving a cancelled node",
+        status: "planning" as const,
+        sourceThreadId: ThreadId.make("thread:foundation-integration-node-race-source"),
+        rootThreadId: threadId,
+        policy: foundationGoalPolicy,
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: "goal/integration-node-race",
+        integrationWorktreePath: "/workspace/integration-node-race",
+        integrationSha: "sha:integration-node-race",
+        verifiedSha: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      yield* eventSink.write({
+        events: [
+          threadCreatedEvent({
+            id: "event:foundation-integration-node-race:thread",
+            thread: makeThread(threadId, now),
+            now,
+          }),
+          {
+            id: EventId.make("event:foundation-integration-node-race:create"),
+            type: "goal.created",
+            threadId,
+            occurredAt: now,
+            payload: goal,
+          },
+        ],
+      });
+      const { graph, writer } = makeCompletionGraph({
+        goalId,
+        rootThreadId: threadId,
+        graphId: "graph:foundation-integration-node-race",
+        writerId: "node:foundation-integration-node-race:writer",
+        verifierId: "node:foundation-integration-node-race:verifier",
+        edgeId: "edge:foundation-integration-node-race",
+        createdAt: timestamp,
+      });
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("event:foundation-integration-node-race:graph"),
+            type: "goal.graph-version-activated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              goalId,
+              expectedRevision: 0,
+              expectedStatus: "planning",
+              graph,
+              activatedAt: timestamp,
+            },
+          },
+        ],
+      });
+      const attemptId = GoalAttemptId.make("attempt:foundation-integration-node-race");
+      const attempt = {
+        id: attemptId,
+        goalId,
+        graphVersionId: graph.id,
+        nodeId: writer.id,
+        ordinal: 1,
+        status: "succeeded" as const,
+        requestedRoute: writer.routingRequest,
+        resolvedRoute: null,
+        providerSessionId: null,
+        executionThreadId: ThreadId.make("thread:foundation-integration-node-race:worker"),
+        runId: null,
+        rootExecutionNodeId: null,
+        baseIntegrationSha: goal.integrationSha,
+        workspacePath: "/workspace/integration-node-race-worker",
+        leaseOwner: "worker",
+        leaseExpiresAt: null,
+        usage: {
+          inputTokens: null,
+          outputTokens: null,
+          cachedTokens: null,
+          costMicros: null,
+          nativeDescendantCount: 0,
+        },
+        failureReason: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      const activeNode = (yield* goalStore.getDetail(goalId)).nodes.find(
+        (candidate) => candidate.node.id === writer.id,
+      )!;
+      const writerRecord = {
+        id: GoalArtifactId.make("commit:foundation-integration-node-race"),
+        goalId,
+        graphVersionId: graph.id,
+        nodeId: writer.id,
+        attemptId,
+        baseSha: goal.integrationSha,
+        commitSha: "sha:writer",
+        cleanSingleCommit: true,
+        integrationBeforeSha: goal.integrationSha,
+        integrationAfterSha: null,
+        state: "integrating" as const,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("event:foundation-integration-node-race:attempt"),
+            type: "goal.attempt-created",
+            threadId,
+            occurredAt: now,
+            payload: attempt,
+          },
+          {
+            id: EventId.make("event:foundation-integration-node-race:processing"),
+            type: "goal.node-transitioned",
+            threadId,
+            occurredAt: now,
+            payload: { ...activeNode, status: "processing", activeAttemptId: null },
+          },
+          {
+            id: EventId.make("event:foundation-integration-node-race:claim"),
+            type: "goal.writer-commit-recorded",
+            threadId,
+            occurredAt: now,
+            payload: writerRecord,
+          },
+        ],
+      });
+      const beforeCancellation = yield* goalStore.getDetail(goalId);
+      const processingNode = beforeCancellation.nodes.find(
+        (candidate) => candidate.node.id === writer.id,
+      )!;
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("event:foundation-integration-node-race:cancel"),
+            type: "goal.node-transitioned",
+            threadId,
+            occurredAt: now,
+            payload: { ...processingNode, status: "cancelled" },
+          },
+        ],
+      });
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("event:foundation-integration-node-race:settle"),
+            type: "goal.writer-commit-recorded",
+            threadId,
+            occurredAt: now,
+            payload: {
+              ...writerRecord,
+              integrationAfterSha: "sha:integrated",
+              state: "integrated",
+            },
+          },
+        ],
+      });
+
+      const stale = yield* eventSink.commitGoalLifecycleCommand({
+        commandId: CommandId.make("command:foundation-integration-node-race"),
+        threadId,
+        commandType: "goal.writer.integrate",
+        acceptedAt: now,
+        goalId,
+        expectedStatus: beforeCancellation.goal.status,
+        expectedRevision: beforeCancellation.goal.currentRevision,
+        expectedGraphVersionId: beforeCancellation.goal.currentGraphVersionId,
+        expectedNode: {
+          graphVersionId: processingNode.graphVersionId,
+          nodeId: processingNode.node.id,
+          statuses: ["processing"],
+        },
+        events: [
+          {
+            id: EventId.make("event:foundation-integration-node-race:stale-lifecycle"),
+            type: "goal.integration-updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              ...beforeCancellation.goal,
+              integrationSha: "sha:integrated",
+              updatedAt: timestamp,
+            },
+          },
+        ],
+        effects: [],
+      });
+
+      assert.isTrue(stale.stale);
+      const final = yield* goalStore.getDetail(goalId);
+      assert.equal(final.goal.integrationSha, goal.integrationSha);
+      assert.equal(
+        final.nodes.find((candidate) => candidate.node.id === writer.id)?.status,
+        "cancelled",
+      );
+      assert.equal(final.writerCommits[0]?.state, "integrated");
     }),
   );
 

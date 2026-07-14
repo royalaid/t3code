@@ -190,6 +190,90 @@ it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
     }),
   );
 
+  it.effect("persists server-created child lineage and rejects user-authored parent claims", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* OrchestratorV2;
+      const projectId = ProjectId.make("runtime-layer-child-lineage-project");
+      const parentThreadId = ThreadId.make("runtime-layer-parent-thread");
+      const childThreadId = ThreadId.make("runtime-layer-child-thread");
+
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-parent-create"),
+        threadId: parentThreadId,
+        projectId,
+        title: "Parent thread",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "system",
+        creationSource: "server",
+        commandId: CommandId.make("runtime-layer-child-create"),
+        threadId: childThreadId,
+        projectId,
+        title: "Child thread",
+        modelSelection,
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        parentThreadId,
+      });
+
+      const child = yield* orchestrator.getThreadProjection(childThreadId);
+      assert.deepEqual(child.thread.lineage, {
+        parentThreadId,
+        relationshipToParent: "subagent",
+        rootThreadId: parentThreadId,
+      });
+
+      const rejected = yield* orchestrator
+        .dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make("runtime-layer-forged-child-create"),
+          threadId: ThreadId.make("runtime-layer-forged-child-thread"),
+          projectId,
+          title: "Forged child thread",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          parentThreadId,
+        })
+        .pipe(Effect.flip);
+      assert.equal(rejected._tag, "OrchestratorDispatchError");
+
+      const crossProject = yield* orchestrator
+        .dispatch({
+          type: "thread.create",
+          createdBy: "system",
+          creationSource: "server",
+          commandId: CommandId.make("runtime-layer-cross-project-child-create"),
+          threadId: ThreadId.make("runtime-layer-cross-project-child-thread"),
+          projectId: ProjectId.make("runtime-layer-other-project"),
+          title: "Cross-project child thread",
+          modelSelection,
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          parentThreadId,
+        })
+        .pipe(Effect.flip);
+      assert.equal(crossProject._tag, "OrchestratorDispatchError");
+    }),
+  );
+
   it.effect("does not overwrite a generated branch from a stale worktree sync", () =>
     Effect.gen(function* () {
       const orchestrator = yield* OrchestratorV2;
@@ -507,6 +591,22 @@ it.layer(SharedApplicationDataPlaneTestLayer)("goal launch invariants", (it) => 
       assert.equal(launched.messages[0]?.text, "UNTRUSTED_TASK_DATA");
       assert.notInclude(launched.messages[0]?.text ?? "", "TRUSTED_GOAL_ROOT_CONTRACT");
 
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-goal-trusted-corrective-message"),
+        threadId: rootThreadId,
+        messageId: MessageId.make("runtime-layer-goal-trusted-corrective-message"),
+        text: "Publish a corrective graph revision.",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "queue_after_active" },
+      });
+      const corrected = yield* orchestrator.getThreadProjection(rootThreadId);
+      assert.include(corrected.runs[1]?.trustedInstructions ?? "", String(goalId));
+      assert.include(corrected.runs[1]?.trustedInstructions ?? "", "immutable root lead");
+
       const rejected = yield* orchestrator
         .dispatch({
           type: "message.dispatch",
@@ -528,8 +628,8 @@ it.layer(SharedApplicationDataPlaneTestLayer)("goal launch invariants", (it) => 
       const unsupported = yield* orchestrator
         .dispatch({
           type: "message.dispatch",
-          createdBy: "system",
-          creationSource: "server",
+          createdBy: "user",
+          creationSource: "web",
           commandId: CommandId.make("runtime-layer-goal-trusted-unsupported"),
           threadId: rootThreadId,
           messageId: MessageId.make("runtime-layer-goal-trusted-unsupported"),
@@ -539,16 +639,14 @@ it.layer(SharedApplicationDataPlaneTestLayer)("goal launch invariants", (it) => 
             instanceId: unsupportedProviderInstance.instanceId,
             model: "unsupported-model",
           },
-          trustedInstructions: "TRUSTED_GOAL_ROOT_CONTRACT",
-          dispatchMode: { type: "defer_start" },
-          goalLaunchClaim: { goalId, claimId },
+          dispatchMode: { type: "queue_after_active" },
         })
         .pipe(Effect.flip);
       assert.equal(unsupported._tag, "OrchestratorProviderAdapterError");
       if (unsupported._tag === "OrchestratorProviderAdapterError") {
         assert.match(String(unsupported.cause), /trusted instructions/iu);
       }
-      assert.lengthOf((yield* orchestrator.getThreadProjection(rootThreadId)).runs, 1);
+      assert.lengthOf((yield* orchestrator.getThreadProjection(rootThreadId)).runs, 2);
     }),
   );
 

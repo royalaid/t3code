@@ -411,6 +411,95 @@ it.layer(TestLayer)("GoalScheduler durable leasing", (it) => {
       );
     }),
   );
+
+  it.effect(
+    "leases independent writers together and gates their verifier on both integrations",
+    () =>
+      Effect.gen(function* () {
+        const goals = yield* GoalProjectionStore;
+        const scheduler = yield* GoalScheduler;
+        const goalId = GoalId.make("goal:scheduler-parallel-writers");
+        const graphVersionId = GoalGraphVersionId.make("graph:scheduler-parallel-writers");
+        const writerA = schedulerNode(GoalNodeId.make("node:parallel-writer:a"), "writer");
+        const writerB = schedulerNode(GoalNodeId.make("node:parallel-writer:b"), "writer");
+        yield* createGoalWithGraph({
+          goals,
+          goalId,
+          graphVersionId,
+          nodes: [writerA, writerB],
+          createdAt: "2026-07-13T00:00:00.000Z",
+        });
+
+        const writers = yield* scheduler.tick;
+        assert.deepEqual(
+          writers.leasedAttempts
+            .filter((attempt) => attempt.goalId === goalId)
+            .map((attempt) => attempt.nodeId)
+            .toSorted(),
+          [writerA.id, writerB.id].toSorted(),
+        );
+        let detail = yield* goals.getDetail(goalId);
+        const verifier = detail.nodes.find(
+          (candidate) => candidate.node.outputContract.kind === "verification",
+        );
+        assert.equal(verifier?.status, "pending");
+
+        const markWriterIntegrated = (nodeId: GoalNodeId) =>
+          Effect.gen(function* () {
+            const current = yield* goals.getDetail(goalId);
+            const node = current.nodes.find(
+              (candidate) =>
+                candidate.graphVersionId === graphVersionId && candidate.node.id === nodeId,
+            );
+            const attempt = current.attempts.find(
+              (candidate) =>
+                candidate.graphVersionId === graphVersionId && candidate.nodeId === nodeId,
+            );
+            assert.isTrue(node !== undefined && attempt !== undefined);
+            if (node === undefined || attempt === undefined) return;
+            yield* goals.apply({
+              type: "goal.attempt-transitioned",
+              payload: {
+                ...attempt,
+                status: "succeeded",
+                leaseOwner: null,
+                leaseExpiresAt: null,
+                updatedAt: "2026-07-13T00:00:01.000Z",
+              },
+            });
+            yield* goals.apply({
+              type: "goal.node-transitioned",
+              payload: {
+                ...node,
+                status: "succeeded",
+                activeAttemptId: null,
+                updatedAt: "2026-07-13T00:00:01.000Z",
+              },
+            });
+          });
+
+        yield* markWriterIntegrated(writerA.id);
+        assert.lengthOf(
+          (yield* scheduler.tick).leasedAttempts.filter((attempt) => attempt.goalId === goalId),
+          0,
+        );
+        detail = yield* goals.getDetail(goalId);
+        assert.equal(
+          detail.nodes.find((candidate) => candidate.node.id === verifier?.node.id)?.status,
+          "pending",
+        );
+
+        yield* markWriterIntegrated(writerB.id);
+        const verifierLease = yield* scheduler.tick;
+        assert.deepEqual(
+          verifierLease.leasedAttempts
+            .filter((attempt) => attempt.goalId === goalId)
+            .map((attempt) => attempt.nodeId),
+          verifier === undefined ? [] : [verifier.node.id],
+        );
+        assert.equal((yield* goals.getDetail(goalId)).attempts.length, 3);
+      }),
+  );
 });
 
 it.layer(CapacityTestLayer)("GoalScheduler global capacity", (it) => {

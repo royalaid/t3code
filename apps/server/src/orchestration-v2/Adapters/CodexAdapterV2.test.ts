@@ -285,6 +285,16 @@ describe("CodexAdapterV2 process spawning", () => {
             mcp_servers: {
               "t3-code": {
                 url: "http://127.0.0.1:43123/mcp",
+                tools: {
+                  goal_read: { approval_mode: "approve" },
+                  goal_capabilities: { approval_mode: "approve" },
+                  goal_replace_graph: { approval_mode: "approve" },
+                  goal_node_read: { approval_mode: "approve" },
+                  goal_node_cancel: { approval_mode: "approve" },
+                  goal_result_publish: { approval_mode: "approve" },
+                  goal_evidence_read: { approval_mode: "approve" },
+                  goal_evidence_submit: { approval_mode: "approve" },
+                },
                 http_headers: {
                   Authorization: "Bearer secret-codex-token",
                 },

@@ -1,6 +1,14 @@
+import {
+  GoalAttemptId,
+  type GoalDetail,
+  GoalGraphVersionId,
+  GoalId,
+  GoalNodeId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { validateGoalWorkerBinding } from "./GoalMcpAuthorization.ts";
+import { selectGoalNodeForAuthority, validateGoalWorkerBinding } from "./GoalMcpAuthorization.ts";
 
 const authority = {
   kind: "goal_worker" as const,
@@ -125,5 +133,51 @@ describe("validateGoalWorkerBinding", () => {
         ],
       }),
     ).toMatch(/artifact/iu);
+  });
+});
+
+describe("selectGoalNodeForAuthority", () => {
+  const graphVersionId = GoalGraphVersionId.make("graph:v3");
+  const attemptId = GoalAttemptId.make("attempt:3");
+  const nodeId = GoalNodeId.make("node:1");
+  const detail = {
+    goal: { currentGraphVersionId: graphVersionId },
+    attempts: [{ id: attemptId, graphVersionId }],
+    nodes: [
+      { graphVersionId: GoalGraphVersionId.make("graph:v1"), node: { id: nodeId } },
+      { graphVersionId, node: { id: nodeId } },
+    ],
+  } as unknown as GoalDetail;
+
+  it("selects the worker attempt revision instead of an older node with the same ID", () => {
+    expect(
+      selectGoalNodeForAuthority(
+        detail,
+        {
+          kind: "goal_worker",
+          goalId: GoalId.make("goal:3"),
+          rootThreadId: ThreadId.make("thread:root:3"),
+          executionThreadId: ThreadId.make("thread:worker:3"),
+          nodeId,
+          attemptId,
+          nativeOwnerAttemptId: attemptId,
+        },
+        nodeId,
+      )?.graphVersionId,
+    ).toBe(graphVersionId);
+  });
+
+  it("selects the active graph revision for the lead", () => {
+    expect(
+      selectGoalNodeForAuthority(
+        detail,
+        {
+          kind: "goal_lead",
+          goalId: GoalId.make("goal:3"),
+          rootThreadId: ThreadId.make("thread:root:3"),
+        },
+        nodeId,
+      )?.graphVersionId,
+    ).toBe(graphVersionId);
   });
 });

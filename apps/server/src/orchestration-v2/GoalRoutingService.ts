@@ -34,18 +34,34 @@ const sortedUnique = (values: Iterable<string>): ReadonlyArray<string> =>
   [...new Set(values)].toSorted((left, right) => left.localeCompare(right));
 
 function baseUnmetConstraints(
-  input: GoalRouteInput,
+  providerAllowlist: ReadonlyArray<string>,
   entry: GoalRoutingCatalogEntry,
 ): ReadonlyArray<string> {
   const allowed =
-    input.providerAllowlist.includes("*") ||
-    input.providerAllowlist.includes(entry.providerInstanceId);
+    providerAllowlist.includes("*") || providerAllowlist.includes(entry.providerInstanceId);
   return [
     ...(allowed ? [] : [`provider_allowlist:${entry.providerInstanceId}`]),
     ...(entry.enabled ? [] : [`provider_disabled:${entry.providerInstanceId}`]),
     ...(entry.installed ? [] : [`provider_not_installed:${entry.providerInstanceId}`]),
     ...(entry.authenticated ? [] : [`provider_not_authenticated:${entry.providerInstanceId}`]),
   ];
+}
+
+export function describeGoalRoutingCatalog(input: {
+  readonly catalog: ReadonlyArray<GoalRoutingCatalogEntry>;
+  readonly providerAllowlist: ReadonlyArray<string>;
+}): ReadonlyArray<GoalRouteCandidate> {
+  return input.catalog
+    .map((entry) => ({
+      providerInstanceId: entry.providerInstanceId,
+      model: entry.model,
+      capabilities: sortedUnique(entry.capabilities),
+      unmetConstraints: sortedUnique(baseUnmetConstraints(input.providerAllowlist, entry)),
+    }))
+    .toSorted((left, right) => {
+      const providerOrder = left.providerInstanceId.localeCompare(right.providerInstanceId);
+      return providerOrder === 0 ? left.model.localeCompare(right.model) : providerOrder;
+    });
 }
 
 function candidateFor(input: GoalRouteInput, entry: GoalRoutingCatalogEntry): GoalRouteCandidate {
@@ -55,7 +71,7 @@ function candidateFor(input: GoalRouteInput, entry: GoalRoutingCatalogEntry): Go
       : input.requiredCapabilities;
   const capabilities = sortedUnique(entry.capabilities);
   const unmet = [
-    ...baseUnmetConstraints(input, entry),
+    ...baseUnmetConstraints(input.providerAllowlist, entry),
     ...sortedUnique(required)
       .filter((capability) => !capabilities.includes(capability))
       .map((capability) => `capability:${capability}`),

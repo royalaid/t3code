@@ -27,6 +27,7 @@ import {
   buildGoalWorkerExecutionCapsule,
   goalAttemptLaunchIsFenced,
   goalAttemptWorkspaceBindingError,
+  goalWorkerAncestorArtifactBudgetError,
   layer,
 } from "./GoalAttemptExecutionService.ts";
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
@@ -96,6 +97,27 @@ it("requires an actively running goal at every attempt launch fence", () => {
       attemptStatus: "cancelled",
       nodeStatus: "running",
     }),
+  );
+});
+
+it("bounds ancestor artifact count and serialized size before prompt construction", () => {
+  const artifact = {
+    id: GoalArtifactId.make("artifact:budget"),
+    nodeId: GoalNodeId.make("node:budget"),
+    attemptId: GoalAttemptId.make("attempt:budget"),
+    kind: "log" as const,
+    uri: "file:///tmp/goal.log",
+    digest: null,
+  };
+
+  assert.isNull(goalWorkerAncestorArtifactBudgetError([artifact]));
+  assert.match(
+    goalWorkerAncestorArtifactBudgetError(Array.from({ length: 129 }, () => artifact)) ?? "",
+    /129 artifacts/,
+  );
+  assert.match(
+    goalWorkerAncestorArtifactBudgetError([{ ...artifact, uri: "x".repeat(65_536) }]) ?? "",
+    /bytes/,
   );
 });
 
@@ -479,6 +501,7 @@ it.effect("launches a read-only worker once and persists the durable execution b
     const commands = yield* Ref.make<ReadonlyArray<OrchestrationV2Command>>([]);
     const committed = yield* Ref.make<ReadonlyArray<unknown>>([]);
     const threadBound = yield* Ref.make(false);
+    const staleRunBinding = yield* Ref.make(false);
     const goalId = GoalId.make("goal:execute");
     const attemptId = GoalAttemptId.make("attempt:execute");
     const graphVersionId = GoalGraphVersionId.make("graph:execute");
@@ -646,6 +669,12 @@ it.effect("launches a read-only worker once and persists the durable execution b
             if (input.commandType === "goal.attempt.thread-bound") {
               yield* Ref.set(threadBound, true);
             }
+            if (
+              input.commandType === "goal.attempt.run-bound" &&
+              (yield* Ref.get(staleRunBinding))
+            ) {
+              return { committed: false, stale: true, storedEvents: [] };
+            }
             return { committed: true, stale: false, storedEvents: [] };
           }),
       }),
@@ -684,6 +713,7 @@ it.effect("launches a read-only worker once and persists the durable execution b
     assert.equal(dispatched[0]?.type, "thread.create");
     if (dispatched[0]?.type === "thread.create") {
       assert.equal(dispatched[0].threadId, workerThreadId);
+      assert.equal(dispatched[0].parentThreadId, rootThreadId);
       assert.equal(dispatched[0].branch, "goal-read/execute");
       assert.equal(dispatched[0].worktreePath, "C:/worktrees/goal-read");
     }
@@ -705,6 +735,20 @@ it.effect("launches a read-only worker once and persists the durable execution b
     assert.isNull(persisted[0]?.events[0]?.payload.runId);
     assert.deepEqual(persisted[1]?.expectedStatuses, ["launching"]);
     assert.equal(persisted[1]?.events[0]?.payload.runId, "run:execute");
+
+    yield* Ref.set(commands, []);
+    yield* Ref.set(committed, []);
+    yield* Ref.set(threadBound, false);
+    yield* Ref.set(staleRunBinding, true);
+    yield* Effect.gen(function* () {
+      const service = yield* GoalAttemptExecutionService;
+      yield* service.launch({ goalId, attemptId });
+    }).pipe(Effect.provide(layer.pipe(Layer.provide(dependencies))));
+
+    assert.deepEqual(
+      (yield* Ref.get(commands)).map((command) => command.type),
+      ["thread.create", "message.dispatch", "run.interrupt"],
+    );
   }),
 );
 

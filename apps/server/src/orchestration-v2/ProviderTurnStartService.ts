@@ -1,10 +1,12 @@
 import {
   CommandId,
+  type GoalDetail,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
+  type ProviderSessionId,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -14,13 +16,13 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
-import { EventSinkV2 } from "./EventSink.ts";
+import { EventSinkV2, type EventSinkV2Shape } from "./EventSink.ts";
 import {
   ContextHandoffServiceV2,
   providerMessageWithContextHandoffs,
 } from "./ContextHandoffService.ts";
-import { IdAllocatorV2 } from "./IdAllocator.ts";
-import { GoalProjectionStore } from "./GoalProjectionStore.ts";
+import { IdAllocatorV2, type IdAllocatorV2AllocateShape } from "./IdAllocator.ts";
+import { GoalProjectionStore, type GoalProjectionStoreShape } from "./GoalProjectionStore.ts";
 import { ProjectionStoreV2 } from "./ProjectionStore.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { RunExecutionServiceV2 } from "./RunExecutionService.ts";
@@ -41,52 +43,31 @@ export class ProviderTurnStartError extends Schema.TaggedErrorClass<ProviderTurn
 
 const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
 
-/** Returns the policy rejection that must terminalize its durable launch effect. */
-export function terminalGoalPolicyFailureForProviderTurnStart(
-  cause: unknown,
-): GoalRuntimePolicyResolveError | undefined {
-  if (!isProviderTurnStartError(cause) || !isGoalRuntimePolicyResolveError(cause.cause)) {
-    return undefined;
-  }
-  return cause.cause.reason === "tool_allowlist_unsupported" ? cause.cause : undefined;
-}
+const providerTurnStartError = (runId: RunId) => (cause: unknown) =>
+  new ProviderTurnStartError({ runId, cause });
 
-/**
- * Goal worker threads are ordinary V2 threads at the provider boundary. Bind
- * them back to their active durable attempt before opening a provider session
- * so a provider receives the graph node's concrete, narrowed policy rather
- * than only the thread's coarse runtime mode.
- */
-export function resolveGoalAttemptRuntimePolicy(input: {
-  readonly goals: Pick<GoalProjectionStore["Service"], "getDetail" | "resolveMcpBinding">;
+type GoalWorkerContextInput = {
+  readonly goals: Pick<GoalProjectionStoreShape, "getDetail" | "resolveMcpBinding">;
   readonly threadId: ThreadId;
   readonly run: Pick<OrchestrationV2Run, "id" | "modelSelection">;
-  readonly inherited: import("./ProviderAdapter.ts").ProviderAdapterV2RuntimePolicy;
-}): Effect.Effect<
-  import("./ProviderAdapter.ts").ProviderAdapterV2RuntimePolicy,
-  ProviderTurnStartError
-> {
-  return Effect.gen(function* () {
-    const binding = yield* input.goals.resolveMcpBinding(input.threadId).pipe(
-      Effect.mapError(
-        (cause) =>
-          new ProviderTurnStartError({
-            runId: input.run.id,
-            cause,
-          }),
-      ),
-    );
-    if (binding?.kind !== "worker") return input.inherited;
+};
 
-    const detail = yield* input.goals.getDetail(binding.goalId).pipe(
-      Effect.mapError(
-        (cause) =>
-          new ProviderTurnStartError({
-            runId: input.run.id,
-            cause,
-          }),
-      ),
-    );
+type GoalWorkerContext = {
+  readonly detail: GoalDetail;
+  readonly attempt: GoalDetail["attempts"][number];
+  readonly node: GoalDetail["nodes"][number];
+};
+
+const resolveGoalWorkerContext = Effect.fn("ProviderTurnStartService.resolveGoalWorkerContext")(
+  function* (input: GoalWorkerContextInput) {
+    const binding = yield* input.goals
+      .resolveMcpBinding(input.threadId)
+      .pipe(Effect.mapError(providerTurnStartError(input.run.id)));
+    if (binding?.kind !== "worker") return null;
+
+    const detail = yield* input.goals
+      .getDetail(binding.goalId)
+      .pipe(Effect.mapError(providerTurnStartError(input.run.id)));
     const attempt = detail.attempts.find((candidate) => candidate.id === binding.attemptId);
     const node =
       attempt === undefined
@@ -113,22 +94,135 @@ export function resolveGoalAttemptRuntimePolicy(input: {
         cause: "Goal worker run is not bound to its active durable attempt and node.",
       });
     }
-    return yield* resolveGoalWorkerRuntimePolicy({
-      inherited: input.inherited,
-      rootPolicy: detail.goal.policy,
-      nodePolicy: node.node.policy,
-      workspaceMode: node.node.workspaceMode,
-      providerInstanceId: input.run.modelSelection.instanceId,
-    }).pipe(
-      Effect.mapError(
-        (cause) =>
-          new ProviderTurnStartError({
-            runId: input.run.id,
-            cause,
-          }),
-      ),
-    );
-  });
+    return { detail, attempt, node } satisfies GoalWorkerContext;
+  },
+);
+
+function resolveGoalWorkerRuntimePolicyFromContext(input: {
+  readonly context: GoalWorkerContext | null;
+  readonly run: GoalWorkerContextInput["run"];
+  readonly inherited: import("./ProviderAdapter.ts").ProviderAdapterV2RuntimePolicy;
+}): Effect.Effect<
+  import("./ProviderAdapter.ts").ProviderAdapterV2RuntimePolicy,
+  ProviderTurnStartError
+> {
+  if (input.context === null) return Effect.succeed(input.inherited);
+  return resolveGoalWorkerRuntimePolicy({
+    inherited: input.inherited,
+    rootPolicy: input.context.detail.goal.policy,
+    nodePolicy: input.context.node.node.policy,
+    workspaceMode: input.context.node.node.workspaceMode,
+    providerInstanceId: input.run.modelSelection.instanceId,
+  }).pipe(Effect.mapError(providerTurnStartError(input.run.id)));
+}
+
+/** Returns the policy rejection that must terminalize its durable launch effect. */
+export function terminalGoalPolicyFailureForProviderTurnStart(
+  cause: unknown,
+): GoalRuntimePolicyResolveError | undefined {
+  if (!isProviderTurnStartError(cause) || !isGoalRuntimePolicyResolveError(cause.cause)) {
+    return undefined;
+  }
+  return cause.cause.reason === "tool_allowlist_unsupported" ? cause.cause : undefined;
+}
+
+/**
+ * Goal worker threads are ordinary V2 threads at the provider boundary. Bind
+ * them back to their active durable attempt before opening a provider session
+ * so a provider receives the graph node's concrete, narrowed policy rather
+ * than only the thread's coarse runtime mode.
+ */
+export function resolveGoalAttemptRuntimePolicy(
+  input: GoalWorkerContextInput & {
+    readonly inherited: import("./ProviderAdapter.ts").ProviderAdapterV2RuntimePolicy;
+  },
+): Effect.Effect<
+  import("./ProviderAdapter.ts").ProviderAdapterV2RuntimePolicy,
+  ProviderTurnStartError
+> {
+  return resolveGoalWorkerContext(input).pipe(
+    Effect.flatMap((context) =>
+      resolveGoalWorkerRuntimePolicyFromContext({
+        context,
+        run: input.run,
+        inherited: input.inherited,
+      }),
+    ),
+  );
+}
+
+type GoalWorkerProviderSessionBindingInput = {
+  readonly context: GoalWorkerContext | null;
+  readonly run: GoalWorkerContextInput["run"];
+  readonly providerSessionId: ProviderSessionId;
+  readonly allocateEvent: IdAllocatorV2AllocateShape["event"];
+  readonly commitGoalAttemptCommand: EventSinkV2Shape["commitGoalAttemptCommand"];
+};
+
+const bindResolvedGoalWorkerProviderSession = Effect.fn(
+  "ProviderTurnStartService.bindResolvedGoalWorkerProviderSession",
+)(function* (input: GoalWorkerProviderSessionBindingInput) {
+  const { context } = input;
+  if (context === null || context.attempt.providerSessionId === input.providerSessionId) return;
+  if (context.attempt.providerSessionId !== null) {
+    return yield* new ProviderTurnStartError({
+      runId: input.run.id,
+      cause: "Goal worker attempt is already bound to a different provider session.",
+    });
+  }
+
+  const now = yield* DateTime.now;
+  const commandId = CommandId.make(
+    `goal-attempt-provider-session:${context.attempt.id}:${input.providerSessionId}`,
+  );
+  const event = {
+    id: yield* input
+      .allocateEvent({ threadId: context.detail.goal.rootThreadId, commandId })
+      .pipe(Effect.mapError(providerTurnStartError(input.run.id))),
+    threadId: context.detail.goal.rootThreadId,
+    type: "goal.attempt-transitioned" as const,
+    payload: {
+      ...context.attempt,
+      providerSessionId: input.providerSessionId,
+      updatedAt: DateTime.formatIso(now),
+    },
+    occurredAt: now,
+  } satisfies OrchestrationV2DomainEvent;
+  const committed = yield* input
+    .commitGoalAttemptCommand({
+      commandId,
+      threadId: context.detail.goal.rootThreadId,
+      commandType: "goal.attempt.bind-provider-session",
+      acceptedAt: now,
+      goalId: context.attempt.goalId,
+      graphVersionId: context.attempt.graphVersionId,
+      nodeId: context.attempt.nodeId,
+      attemptId: context.attempt.id,
+      expectedStatuses: [context.attempt.status],
+      expectedNodeStatuses: [context.node.status],
+      events: [event],
+      effects: [],
+    })
+    .pipe(Effect.mapError(providerTurnStartError(input.run.id)));
+  if (!committed.committed) {
+    return yield* new ProviderTurnStartError({
+      runId: input.run.id,
+      cause: "Goal worker provider-session binding lost its active-attempt fence.",
+    });
+  }
+});
+
+/** Durably bind the worker credential to its exact provider session before adapter startup. */
+export function bindGoalWorkerProviderSession(
+  input: GoalWorkerContextInput & {
+    readonly providerSessionId: ProviderSessionId;
+    readonly allocateEvent: IdAllocatorV2AllocateShape["event"];
+    readonly commitGoalAttemptCommand: EventSinkV2Shape["commitGoalAttemptCommand"];
+  },
+): Effect.Effect<void, ProviderTurnStartError> {
+  return resolveGoalWorkerContext(input).pipe(
+    Effect.flatMap((context) => bindResolvedGoalWorkerProviderSession({ ...input, context })),
+  );
 }
 
 export interface ProviderTurnStartServiceV2Shape {
@@ -240,11 +334,22 @@ export const layer: Layer.Layer<
         thread: projection.thread,
         modelSelection: run.modelSelection,
       });
-      const resolvedRuntimePolicy = yield* resolveGoalAttemptRuntimePolicy({
+      const goalWorkerContext = yield* resolveGoalWorkerContext({
         goals,
         threadId: projection.thread.id,
         run,
+      });
+      const resolvedRuntimePolicy = yield* resolveGoalWorkerRuntimePolicyFromContext({
+        context: goalWorkerContext,
+        run,
         inherited: inheritedRuntimePolicy,
+      });
+      yield* bindResolvedGoalWorkerProviderSession({
+        context: goalWorkerContext,
+        run,
+        providerSessionId,
+        allocateEvent: idAllocator.allocate.event,
+        commitGoalAttemptCommand: eventSink.commitGoalAttemptCommand,
       });
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,

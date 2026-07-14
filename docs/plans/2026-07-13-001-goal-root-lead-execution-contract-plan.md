@@ -81,14 +81,15 @@ The implementation needs selective graph sizing, completion-valid graph structur
 
 #### Failure and recovery behavior
 
-| ID  | Requirement                                                                                                                                                                                                                                                                |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| R14 | A stale graph revision causes the root lead to re-read current goal state and reconcile a new whole-graph revision instead of replaying stale input.                                                                                                                       |
-| R15 | The exact initial root run ID is persisted with launch completion; whether its terminal event arrives before or after the transition to revision-zero `planning`, one idempotent goal-state compare-and-swap records `root_lead_no_graph` and moves the goal to `blocked`. |
-| R16 | A later human Queue or Steer turn may publish a valid graph from the blocked root thread, which returns the goal to `running`; a terminal retry without a graph records a run-specific diagnostic while the goal remains blocked.                                          |
-| R17 | The happy path produces no root-lead mutation approval request; all edit authority belongs to isolated writer attempts.                                                                                                                                                    |
-| R18 | Graph activation is allowed only from `planning` or recoverable revision-zero `blocked`; the same transaction rejects `cancelled`, `completed`, and `failed` goals and validates the canonical publisher identity.                                                         |
-| R19 | The existing blocked-state UI explains that the lead ended before publishing a graph, preserves the root thread, and keeps Queue and Steer available without adding a new recovery control.                                                                                |
+| ID  | Requirement                                                                                                                                                                                                                                                                            |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R14 | A stale graph revision causes the root lead to re-read current goal state and reconcile a new whole-graph revision instead of replaying stale input.                                                                                                                                   |
+| R15 | The exact initial root run ID is persisted with launch completion; whether its terminal event arrives before or after the transition to revision-zero `planning`, one idempotent goal-state compare-and-swap records `root_lead_no_graph` and moves the goal to `blocked`.             |
+| R16 | A later human Queue or Steer turn may publish a valid graph from the blocked root thread, which returns the goal to `running`; a terminal retry without a graph records a run-specific diagnostic while the goal remains blocked.                                                      |
+| R17 | The happy path produces no root-lead mutation approval request; all edit authority belongs to isolated writer attempts.                                                                                                                                                                |
+| R18 | Graph activation is allowed from `planning`, `running` replacement, revisioned root-controlled `paused` replacement, or recoverable revision-zero `blocked`; the same transaction rejects `cancelled`, `completed`, and `failed` goals and validates the canonical publisher identity. |
+| R19 | The existing blocked-state UI explains that the lead ended before publishing a graph, preserves the root thread, and keeps Queue and Steer available without adding a new recovery control.                                                                                            |
+| R20 | Goal worker and verifier application threads persist the goal root thread as server-owned subagent lineage and render nested beneath that parent in the project sidebar; ordinary threads and forks remain top-level.                                                                  |
 
 ### Key Flows
 
@@ -189,6 +190,12 @@ The implementation needs selective graph sizing, completion-valid graph structur
   - **When:** The activation compare-and-swap executes.
   - **Then:** The graph is rejected without changing status or launching a writer.
 
+- AE11. Goal worker sidebar hierarchy
+  - **Covers:** R20
+  - **Given:** A root lead has launched writer and verifier application threads.
+  - **When:** The project sidebar renders its thread list.
+  - **Then:** The root appears once at the top level, its worker threads appear immediately beneath it in sorted sibling order, and the parent can collapse or expand the children without changing ordinary thread placement.
+
 ### Success Criteria
 
 - A live simple-edit goal progresses from `planning` through a two-node graph to `completed` without editing the root checkout.
@@ -198,6 +205,7 @@ The implementation needs selective graph sizing, completion-valid graph structur
 - Claude and Codex receive the root contract through trusted instruction channels while objective and source content remain user-role data.
 - Root approval requests appear on the bound application thread and resume the original provider turn after a user decision.
 - Root and worker prompts expose every identifier required to invoke their scoped goal tools.
+- Goal-owned worker and verifier threads are discoverable under their root lead instead of being hidden or flattened into top-level project siblings.
 
 ### Scope Boundaries
 
@@ -213,11 +221,13 @@ The implementation needs selective graph sizing, completion-valid graph structur
 - Root-lead exec-approval routing to the bound application thread.
 - Existing blocked-state presentation and Queue or Steer retry observability.
 - Deterministic tests, workflow integration coverage, documentation, and local dogfood.
+- Persisted goal-worker thread lineage and hierarchical sidebar presentation.
 
 #### Deferred follow-ups
 
 - Finding #8: cancellation terminalization and restart recovery for orphaned planning goals.
 - Automatic root-lead wake or `goal_wait` support after a background integration conflict or worker blocker.
+- A goal-scoped, read-only attempt-timeline primitive for root-lead diagnostics; humans can inspect nested worker threads today, while the lead currently receives durable attempt, artifact, evidence, and failure projections through `goal_read`.
 - Durable artifact-content publication and ancestor-scoped reads required for independently verified research-only goals.
 
 #### Explicit non-goals
@@ -226,6 +236,7 @@ The implementation needs selective graph sizing, completion-valid graph structur
 - A hidden `goal_do_direct_work` shortcut outside `goal_replace_graph`.
 - Generic `delegate_task` use from goal-bound credentials.
 - New goal UI controls beyond the existing blocked-state and Queue or Steer behavior.
+- Arbitrary drag-and-drop thread reparenting or treating forks as goal-worker children.
 
 ### Dependencies and Research Sources
 
@@ -291,6 +302,11 @@ The implementation needs selective graph sizing, completion-valid graph structur
   - The activation compare-and-swap accepts only `planning` and recoverable revision-zero `blocked` states.
   - It rejects terminal goal states and publisher spoofing in the same transaction, preventing stale credentials from resurrecting a goal or corrupting audit provenance.
 
+- KTD-11. Persist hierarchy as server-owned lineage and derive presentation from it.
+  - Goal attempt execution creates each worker application thread with the goal root thread as its parent; client-authored `thread.create` commands cannot claim parent lineage, and parent/child projects must match.
+  - The sidebar attaches only `relationshipToParent = subagent` rows to present parents, leaving forks and missing-parent threads at the root level.
+  - Preview limits count root rows, active descendants reveal their ancestor chain, and each parent owns a local expand/collapse affordance.
+
 ### High-Level Technical Design
 
 ```mermaid
@@ -347,6 +363,7 @@ sequenceDiagram
 - Add `non_terminal_graph` to `GoalProjectionValidationError.reason` for corrective graph-publication failures.
 - Normalize root runtime-request thread identity before domain-event persistence while retaining provider request identity for responses.
 - Derive `publishedByNodeId` from the authenticated goal-lead scope and keep public MCP input schemas backward-compatible by rejecting or overwriting spoofed provenance at the server boundary.
+- Extend server-created `thread.create` commands with optional parent lineage, set it for goal attempt threads, and flatten visible sidebar threads into parent-first hierarchy rows.
 
 ### System-Wide Impact
 
@@ -357,6 +374,7 @@ sequenceDiagram
 - **Security:** Trusted instructions prevent same-role source text from competing with the control-plane contract, while runtime sandbox, workspace bindings, and authenticated graph publication remain the authority boundary.
 - **Scheduling:** Valid graphs always expose a terminal evidence path, so the scheduler cannot activate empty or writer-only dead ends.
 - **Observability:** Root approvals attach to the application thread, and an initial lead or corrective retry that ends without a graph creates a durable, user-facing blocked diagnostic.
+- **Navigation:** Goal workers remain ordinary routable application threads, but the sidebar presents their durable parent relationship instead of hiding or flattening them.
 
 ### Sequencing
 
@@ -367,10 +385,12 @@ flowchart LR
   U1 --> U4["U4 No-graph supervision"]
   U1 --> U5["U5 Approval routing"]
   U2 --> U6["U6 MCP metadata"]
+  U2 --> U8["U8 Worker thread hierarchy"]
   U3 --> U7["U7 Lifecycle proof and docs"]
   U4 --> U7
   U5 --> U7
   U6 --> U7
+  U8 --> U7
 ```
 
 ### Risks and Mitigations
@@ -387,6 +407,7 @@ flowchart LR
 | A stale goal-lead credential activates a terminal goal  | Cancelled or completed work launches new writers               | Restrict activation to `planning` or recoverable revision-zero `blocked` in the same transaction and add cancellation-versus-activation race coverage.                           |
 | The model spoofs an external graph publisher            | Durable provenance and later policy checks become unreliable   | Derive the canonical publisher from authenticated goal scope and reject mismatches.                                                                                              |
 | A conflict blocks after the root turn ended             | No agent automatically publishes a resolver revision           | Surface blocked state and use existing human Queue or Steer controls; automatic wake remains deferred.                                                                           |
+| A client forges parent lineage or crosses projects      | Unrelated conversations appear inside a trusted goal hierarchy | Accept parent lineage only on server-created threads, require the parent to exist in the same project, and test both rejection boundaries.                                       |
 
 ---
 
@@ -440,6 +461,7 @@ flowchart LR
   - Build a pure execution capsule from that fresh projection.
   - Include goal ID, graph version and revision, node ID, active attempt ID, workspace mode, and `workspace.baseSha`.
   - Walk the active graph backwards from the node and include only transitive ancestor node IDs, their current attempts, and artifacts owned by those attempts.
+  - Reject ancestor artifact context above a bounded count or serialized byte budget instead of constructing an unbounded provider prompt.
   - Select the succeeded ancestor writer whose integrated record has `integrationAfterSha === workspace.baseSha`.
   - Require exactly one deterministic producer candidate and fail launch when the projection cannot supply one.
   - Tell all workers to call `goal_node_read` and `goal_result_publish` with their supplied identities.
@@ -451,6 +473,7 @@ flowchart LR
   - A verifier without a usable producer context fails launch with a typed service error instead of receiving an impossible prompt.
   - Attempt, workspace, and goal SHA disagreement fails launch before provider startup.
   - Superseded revisions, sibling attempts, and unrelated artifacts do not enter the capsule.
+  - Oversized ancestor artifact sets fail with a typed corrective error before prompt construction.
   - Existing launch fencing and workspace-binding tests remain green.
 - **Verification:** `vp test run apps/server/src/orchestration-v2/GoalPrompts.test.ts apps/server/src/orchestration-v2/GoalAttemptExecutionService.test.ts`
 
@@ -471,7 +494,7 @@ flowchart LR
   - Require at least one verifier with at least one transitive producer ancestor.
   - Require at least one verifier for which every writer node is a transitive ancestor, so that verifier cannot run before the final integration SHA exists.
   - When persisting accepted evidence, require the named producer attempt to be a succeeded transitive ancestor in the same active graph.
-  - Fence activation in the same compare-and-swap to `planning` or recoverable revision-zero `blocked`; reject `cancelled`, `completed`, and `failed` goals.
+  - Fence activation in the same compare-and-swap to `planning`, `running` replacement, revisioned root-controlled `paused` replacement, or recoverable revision-zero `blocked`; reject `cancelled`, `completed`, and `failed` goals.
   - Preserve existing node limits, missing-dependency checks, cycle detection, policy narrowing, and workspace validation.
   - Update goal test fixtures to use external publisher IDs and completion-valid graphs where activation success is under test.
 - **Test Scenarios:**
@@ -554,6 +577,7 @@ flowchart LR
   - `apps/server/src/mcp/OrchestratorMcpToolkit.integration.test.ts`
 - **Approach:**
   - Add concise descriptions and titles to all eight goal tools.
+  - Source `goal_capabilities` route candidates from the scheduler's shared catalog so capability snapshots and policy constraints describe the exact routing decision space.
   - Explain lead-only graph replacement, expected-revision compare-and-swap, worker-only result and evidence publication, exact ownership, current-SHA evidence, and independent producer requirements.
   - Preserve existing read-only and destructive annotations.
   - Add a focused metadata test modeled on the preview toolkit and retain one integration assertion that MCP registration exposes the descriptions and annotations.
@@ -563,6 +587,7 @@ flowchart LR
   - `goal_replace_graph` describes full replacement and stale-revision recovery.
   - `goal_result_publish` and `goal_evidence_submit` describe worker ownership and required identities.
   - MCP server registration preserves the metadata.
+  - `goal_capabilities` returns sorted real capability snapshots and goal-policy allowlist constraints rather than empty placeholder arrays.
 - **Verification:** `vp test run apps/server/src/mcp/toolkits/orchestrator/tools.test.ts apps/server/src/mcp/OrchestratorMcpToolkit.integration.test.ts`
 
 ### U7. Lifecycle proof, documentation, and dogfood
@@ -593,6 +618,35 @@ flowchart LR
   - A live approval-required root command appears on the application thread and resumes graph publication after approval.
 - **Verification:** Run the focused lifecycle tests, the full server suite, and the manual acceptance matrix in the Verification Contract.
 
+### U8. Goal worker thread hierarchy
+
+- **Goal:** Keep goal worker and verifier threads visible while nesting them beneath their root lead in the project sidebar.
+- **Requirements:** R20
+- **Dependencies:** U2
+- **Files:**
+  - `packages/contracts/src/orchestrationV2.ts`
+  - `apps/server/src/orchestration-v2/Orchestrator.ts`
+  - `apps/server/src/orchestration-v2/GoalAttemptExecutionService.ts`
+  - `apps/server/src/orchestration-v2/GoalAttemptExecutionService.test.ts`
+  - `apps/server/src/orchestration-v2/runtimeLayer.test.ts`
+  - `apps/web/src/components/Sidebar.logic.ts`
+  - `apps/web/src/components/Sidebar.logic.test.ts`
+  - `apps/web/src/components/Sidebar.tsx`
+- **Approach:**
+  - Add optional `parentThreadId` only to the internal `thread.create` command and accept it only for `createdBy: system` plus `creationSource: server`.
+  - Resolve the parent projection before creation, require the same project, and persist subagent lineage with the parent's root identity.
+  - Set every goal attempt thread's parent to `goal.rootThreadId`; normal user threads and forks retain their existing lineage behavior.
+  - Convert each project's sorted visible threads into parent-first hierarchy rows, retaining sibling sort order and treating missing parents or non-subagent relationships as roots.
+  - Count only root rows against the sidebar preview limit, indent descendants, add per-parent disclosure controls, and force the active descendant's ancestor chain visible.
+- **Test Scenarios:**
+  - Goal attempt launch dispatches a worker thread with the goal root parent ID.
+  - Production orchestration persists the expected subagent/root lineage for a server-created child.
+  - User-authored parent claims and cross-project parent claims are rejected.
+  - Sidebar hierarchy nests direct and nested subagents while preserving sibling order.
+  - Forks and orphaned subagents remain top-level, and ordinary thread ordering is unchanged.
+  - A browser dogfood goal shows writer and verifier rows under the root and the disclosure control hides and restores them.
+- **Verification:** `vp test run apps/server/src/orchestration-v2/GoalAttemptExecutionService.test.ts apps/server/src/orchestration-v2/runtimeLayer.test.ts apps/web/src/components/Sidebar.logic.test.ts`
+
 ---
 
 ## Verification Contract
@@ -604,6 +658,7 @@ flowchart LR
 | Approval-routing tests            | `vp test run apps/server/src/orchestration-v2/ProviderEventIngestor.test.ts apps/server/src/orchestration-v2/RunExecutionService.test.ts`                                                                                                                                                                                             | Provider-thread requests bind to the correct application thread and responses resume the original provider turn.                                        | U5     |
 | MCP metadata tests                | `vp test run apps/server/src/mcp/toolkits/orchestrator/tools.test.ts apps/server/src/mcp/OrchestratorMcpToolkit.integration.test.ts`                                                                                                                                                                                                  | Provider-visible goal tool guidance and preserved safety annotations.                                                                                   | U6     |
 | Lifecycle tests                   | `vp test run apps/server/src/orchestration-v2/GoalScheduler.integration.test.ts apps/server/src/orchestration-v2/GoalIntegrationService.test.ts apps/server/src/orchestration-v2/runtimeLayer.test.ts`                                                                                                                                | Scheduling order, integration, independent evidence, and trusted cross-provider root instructions.                                                      | U7     |
+| Sidebar hierarchy tests           | `vp test run apps/server/src/orchestration-v2/GoalAttemptExecutionService.test.ts apps/server/src/orchestration-v2/runtimeLayer.test.ts apps/web/src/components/Sidebar.logic.test.ts`                                                                                                                                                | Server-owned worker lineage, rejected forged parents, parent-first hierarchy ordering, and orphan fallback.                                             | U8     |
 | Full server regression            | `vp run --filter t3 test`                                                                                                                                                                                                                                                                                                             | The complete server suite remains green.                                                                                                                | U1-U7  |
 | Repository quality                | `vp check`                                                                                                                                                                                                                                                                                                                            | Formatting and lint checks pass for tracked repository files.                                                                                           | U1-U7  |
 | Monorepo types                    | `vp run typecheck`                                                                                                                                                                                                                                                                                                                    | Contracts, server code, and all dependents typecheck cleanly.                                                                                           | U1-U7  |
@@ -612,7 +667,7 @@ flowchart LR
 | Live selective-delegation dogfood | Launch one tightly coupled multi-step goal and one goal with two independent changes.                                                                                                                                                                                                                                                 | The first uses one writer; the second uses parallel writers; both end behind a verifier.                                                                | U7     |
 | Adversarial handoff dogfood       | Launch a goal whose selected context says to bypass the graph and edit directly.                                                                                                                                                                                                                                                      | The text remains user-role data, trusted instructions remain intact, the root makes no mutation request, and a valid graph is activated.                | U1, U7 |
 
-Run the trusted-instruction and approval dogfood on both Claude and Codex before marking findings #7 and #9 resolved.
+Run the live trusted-instruction, approval, and sidebar dogfood with Codex. Provider-adapter tests cover both Claude and Codex trusted instruction mappings; the user explicitly chose Codex-only live testing for this iteration.
 
 ---
 
@@ -620,13 +675,14 @@ Run the trusted-instruction and approval dogfood on both Claude and Codex before
 
 ### Global completion
 
-- Every requirement R1-R19 is covered by an automated test, a live acceptance scenario, or both.
+- Every requirement R1-R20 is covered by an automated test, a live acceptance scenario, or both.
 - A live minimal code goal reaches `completed` through one writer and one independent verifier without any root checkout mutation.
 - The root receives its orchestration contract through a trusted provider instruction channel, its objective and handoff remain user-role data, and every worker message contains the identifiers required by its scoped goal tools.
 - Invalid completion-dead graphs fail before activation with a corrective error.
 - An initial root turn that ends without revision 1 leaves a durable failure and visible `blocked` goal rather than silent `planning` state.
 - Root exec approvals render on the bound application thread and resume the original provider turn.
 - Graph activation cannot resurrect a terminal goal or persist model-spoofed publisher provenance.
+- Goal workers and verifiers appear nested beneath their root lead, and client commands cannot forge that hierarchy.
 - `vp run --filter t3 test`, `vp check`, and `vp run typecheck` pass.
 - Architecture and handoff documentation reflect selective graph sizing, trusted instructions, approval routing, and the remaining #8 and automatic-wake follow-ups.
 - No new interaction mode, writable root path, or direct-integration shortcut is introduced.
@@ -640,4 +696,5 @@ Run the trusted-instruction and approval dogfood on both Claude and Codex before
 - U4 is complete when both initial-run event orderings block idempotently, the UI explains recovery, failed retries remain observable, and later valid graph publication reactivates the goal.
 - U5 is complete when provider-thread approvals bind to the correct application thread and user responses resume the original provider turn.
 - U6 is complete when all goal tools expose tested titles, descriptions, and unchanged safety annotations.
-- U7 is complete when minimal and decomposed workflows are proven, live approval resumes, and the live minimal-code goal reaches `completed` on Claude and Codex.
+- U7 is complete when minimal and decomposed workflows are proven, live approval resumes, and the live minimal-code goal reaches `completed` on Codex; deterministic adapter tests prove Claude trusted-channel parity.
+- U8 is complete when server-owned lineage is persisted, forged and cross-project parents are rejected, and goal worker rows render beneath a collapsible root in automated and browser verification.

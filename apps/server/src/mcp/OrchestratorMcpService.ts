@@ -72,6 +72,10 @@ import * as Schema from "effect/Schema";
 
 import { isBuiltInProviderAdapterDriverV2 } from "../orchestration-v2/builtInProviderAdapterDrivers.ts";
 import { goalGraphPublisherIssue } from "../orchestration-v2/GoalGraphSemantics.ts";
+import {
+  describeGoalRoutingCatalog,
+  GoalRoutingService,
+} from "../orchestration-v2/GoalRoutingService.ts";
 import { subagentResultForRun } from "../orchestration-v2/SubagentProjection.ts";
 import {
   isActiveRun,
@@ -84,7 +88,7 @@ import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
 import { ScheduledTaskService } from "../scheduledTasks/ScheduledTaskService.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import { goalAuthority } from "./McpInvocationContext.ts";
-import { validateGoalWorkerBinding } from "./GoalMcpAuthorization.ts";
+import { selectGoalNodeForAuthority, validateGoalWorkerBinding } from "./GoalMcpAuthorization.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 const MAX_WAIT_TIMEOUT_MS = 60 * 60 * 1_000;
@@ -206,14 +210,55 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function errorCauseChain(error: unknown): ReadonlyArray<unknown> {
+  const chain: Array<unknown> = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current !== undefined && current !== null && !seen.has(current)) {
+    seen.add(current);
+    chain.push(current);
+    if (typeof current !== "object" || !("cause" in current)) break;
+    current = current.cause;
+  }
+  return chain;
+}
+
 function isStaleActiveRunTarget(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "cause" in error &&
-    typeof error.cause === "string" &&
-    error.cause.startsWith("stale_active_run_target:")
+  return errorCauseChain(error).some(
+    (candidate) =>
+      typeof candidate === "string" && candidate.startsWith("stale_active_run_target:"),
   );
+}
+
+export function goalMutationFailure(error: unknown): OrchestratorMcpFailure {
+  for (const candidate of errorCauseChain(error).toReversed()) {
+    if (typeof candidate !== "object" || candidate === null) continue;
+    const tagged = candidate as {
+      readonly _tag?: unknown;
+      readonly reason?: unknown;
+      readonly detail?: unknown;
+    };
+    if (
+      tagged._tag !== "GoalProjectionValidationError" ||
+      typeof tagged.reason !== "string" ||
+      typeof tagged.detail !== "string"
+    ) {
+      continue;
+    }
+    if (tagged.reason === "goal_not_found") return failure("goal_not_found", tagged.detail);
+    if (tagged.reason === "stale_revision") return failure("stale_revision", tagged.detail);
+    if (tagged.reason === "stale_active_run_target")
+      return failure("stale_active_run_target", tagged.detail);
+    if (tagged.reason !== "persistence_error") return failure("invalid_request", tagged.detail);
+  }
+  if (isStaleActiveRunTarget(error)) {
+    const detail = errorCauseChain(error).find(
+      (candidate) =>
+        typeof candidate === "string" && candidate.startsWith("stale_active_run_target:"),
+    );
+    return failure("stale_active_run_target", String(detail));
+  }
+  return failure("orchestration_error", errorMessage(error));
 }
 
 /**
@@ -599,6 +644,7 @@ const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const threadManagement = yield* ThreadManagementService;
   const providerRegistry = yield* ProviderRegistry;
+  const goalRouting = yield* GoalRoutingService;
   const scheduledTasks = yield* ScheduledTaskService;
 
   const requireCapability = (scope: McpInvocationScope) =>
@@ -675,16 +721,7 @@ const make = Effect.gen(function* () {
     scope: McpInvocationScope,
     command: Parameters<ThreadManagementService["Service"]["dispatch"]>[0],
   ) {
-    yield* threadManagement
-      .dispatch(command)
-      .pipe(
-        Effect.mapError((error) =>
-          failure(
-            isStaleActiveRunTarget(error) ? "stale_active_run_target" : "orchestration_error",
-            errorMessage(error),
-          ),
-        ),
-      );
+    yield* threadManagement.dispatch(command).pipe(Effect.mapError(goalMutationFailure));
     return { accepted: true as const };
   });
 
@@ -921,26 +958,21 @@ const make = Effect.gen(function* () {
         const authority = goalAuthority(scope);
         if (authority.kind === "ordinary")
           return yield* failure("goal_scope_mismatch", "Credential is not goal scoped.");
-        yield* loadGoal(scope, authority.goalId);
-        const providers = yield* loadProviders;
-        const routeCandidates = providers
-          .flatMap((provider) =>
-            provider.models.map((model) => ({
-              providerInstanceId: provider.instanceId,
-              model: model.slug,
-              capabilities: [],
-              unmetConstraints: [
-                ...(isProviderAvailable(provider) ? [] : ["provider_not_installed"]),
-                ...(provider.installed ? [] : ["provider_not_installed"]),
-                ...(provider.enabled ? [] : ["provider_disabled"]),
-                ...(provider.auth.status === "authenticated" ? [] : ["provider_not_authenticated"]),
-              ].filter((value, index, values) => values.indexOf(value) === index),
-            })),
-          )
-          .toSorted((left, right) => {
-            const providerOrder = left.providerInstanceId.localeCompare(right.providerInstanceId);
-            return providerOrder === 0 ? left.model.localeCompare(right.model) : providerOrder;
-          });
+        const { detail } = yield* loadGoal(scope, authority.goalId);
+        const routeCandidates = yield* goalRouting.catalog.pipe(
+          Effect.map((catalog) =>
+            describeGoalRoutingCatalog({
+              catalog,
+              providerAllowlist: detail.goal.policy.providerAllowlist,
+            }),
+          ),
+          Effect.mapError((cause) =>
+            failure(
+              "orchestration_error",
+              `Could not load goal route capabilities: ${errorMessage(cause)}`,
+            ),
+          ),
+        );
         return {
           goalId: authority.goalId,
           role: authority.kind === "goal_lead" ? "lead" : "worker",
@@ -974,7 +1006,7 @@ const make = Effect.gen(function* () {
             "capability_denied",
             "Workers may only read their owning goal node.",
           );
-        const node = detail.nodes.find((candidate) => candidate.node.id === input.nodeId);
+        const node = selectGoalNodeForAuthority(detail, authority, input.nodeId);
         return node ?? (yield* failure("goal_not_found", `Node ${input.nodeId} was not found.`));
       }),
     goalNodeCancel: (scope, input) =>
@@ -1027,18 +1059,14 @@ const make = Effect.gen(function* () {
         const attempt = detail.attempts.find((candidate) => candidate.id === input.attemptId);
         if (
           attempt === undefined ||
-          (authority.kind === "goal_worker" &&
-            (authority.attemptId !== attempt.id || authority.nodeId !== attempt.nodeId))
+          authority.attemptId !== attempt.id ||
+          authority.nodeId !== attempt.nodeId
         )
           return yield* failure(
             "capability_denied",
             "Attempt does not belong to the credential's owning node.",
           );
-        const node = detail.nodes.find(
-          (candidate) =>
-            candidate.graphVersionId === attempt.graphVersionId &&
-            candidate.node.id === attempt.nodeId,
-        );
+        const node = selectGoalNodeForAuthority(detail, authority, attempt.nodeId);
         if (node?.status === "cancelled" || node?.status === "superseded")
           return yield* failure(
             "stale_active_run_target",
@@ -1089,18 +1117,14 @@ const make = Effect.gen(function* () {
         );
         if (
           attempt === undefined ||
-          (authority.kind === "goal_worker" &&
-            (authority.attemptId !== attempt.id || authority.nodeId !== attempt.nodeId))
+          authority.attemptId !== attempt.id ||
+          authority.nodeId !== attempt.nodeId
         )
           return yield* failure(
             "capability_denied",
             "Evidence attempt does not belong to the credential's owning node.",
           );
-        const node = detail.nodes.find(
-          (candidate) =>
-            candidate.graphVersionId === attempt.graphVersionId &&
-            candidate.node.id === attempt.nodeId,
-        );
+        const node = selectGoalNodeForAuthority(detail, authority, attempt.nodeId);
         if (node?.status === "cancelled" || node?.status === "superseded")
           return yield* failure(
             "stale_active_run_target",
@@ -1743,5 +1767,9 @@ const make = Effect.gen(function* () {
 export const layer: Layer.Layer<
   OrchestratorMcpService,
   never,
-  Crypto.Crypto | ThreadManagementService | ProviderRegistry | ScheduledTaskService
+  | Crypto.Crypto
+  | ThreadManagementService
+  | ProviderRegistry
+  | ScheduledTaskService
+  | GoalRoutingService
 > = Layer.effect(OrchestratorMcpService, make);

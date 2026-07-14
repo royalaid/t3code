@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 import { ProviderInstanceId } from "@t3tools/contracts";
 
-import { resolveGoalRoute, type GoalRoutingCatalogEntry } from "./GoalRoutingService.ts";
+import {
+  describeGoalRoutingCatalog,
+  resolveGoalRoute,
+  type GoalRoutingCatalogEntry,
+} from "./GoalRoutingService.ts";
 
 const entry = (
   instanceId: string,
@@ -21,6 +25,31 @@ const entry = (
 });
 
 describe("resolveGoalRoute", () => {
+  it("describes the scheduler catalog with capabilities and goal policy constraints", () => {
+    expect(
+      describeGoalRoutingCatalog({
+        catalog: [
+          entry("codex", "gpt-5.4", ["workspace.patch", "analysis", "tools.shell"]),
+          entry("claudeAgent", "claude-sonnet-4-6", ["tools.shell", "analysis"]),
+        ],
+        providerAllowlist: ["codex"],
+      }),
+    ).toEqual([
+      {
+        providerInstanceId: "claudeAgent",
+        model: "claude-sonnet-4-6",
+        capabilities: ["analysis", "tools.shell"],
+        unmetConstraints: ["provider_allowlist:claudeAgent"],
+      },
+      {
+        providerInstanceId: "codex",
+        model: "gpt-5.4",
+        capabilities: ["analysis", "tools.shell", "workspace.patch"],
+        unmetConstraints: [],
+      },
+    ]);
+  });
+
   it("resolves an exact authenticated policy-compliant route", () => {
     const requested = {
       type: "exact" as const,

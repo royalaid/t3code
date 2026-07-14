@@ -1,18 +1,24 @@
 import { assert, it } from "@effect/vitest";
 import {
+  EventId,
   type GoalDetail,
   GoalAttemptId,
   GoalGraphVersionId,
   GoalId,
   GoalNodeId,
   ProviderInstanceId,
+  ProviderSessionId,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
+import type { EventSinkV2Shape } from "./EventSink.ts";
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
-import { resolveGoalAttemptRuntimePolicy } from "./ProviderTurnStartService.ts";
+import {
+  bindGoalWorkerProviderSession,
+  resolveGoalAttemptRuntimePolicy,
+} from "./ProviderTurnStartService.ts";
 import { ProviderAdapterV2RuntimePolicy } from "./ProviderAdapter.ts";
 
 const goalId = GoalId.make("goal:provider-runtime-policy");
@@ -40,12 +46,19 @@ const untrustedWriterPolicy = {
 
 function goalDetail(input: { readonly activeAttemptId?: typeof attemptId | null }): GoalDetail {
   return {
-    goal: { policy: rootPolicy },
+    goal: {
+      id: goalId,
+      rootThreadId: ThreadId.make("goal-root:provider-runtime-policy"),
+      policy: rootPolicy,
+    },
     attempts: [
       {
         id: attemptId,
+        goalId,
         graphVersionId,
         nodeId,
+        status: "launching",
+        providerSessionId: null,
         executionThreadId: threadId,
         runId,
         resolvedRoute: {
@@ -128,6 +141,54 @@ it.effect("refuses to start a goal worker after its active-attempt binding chang
         inherited,
       }),
     );
+
+    assert.equal(exit._tag, "Failure");
+  }),
+);
+
+it.effect("binds the exact worker provider session before issuing its MCP credential", () =>
+  Effect.gen(function* () {
+    const providerSessionId = ProviderSessionId.make("provider-session:goal-worker");
+    const committedInputs: Array<Parameters<EventSinkV2Shape["commitGoalAttemptCommand"]>[0]> = [];
+
+    yield* bindGoalWorkerProviderSession({
+      goals: goals(goalDetail({})),
+      threadId,
+      run,
+      providerSessionId,
+      allocateEvent: () => Effect.succeed(EventId.make("event:bind-goal-worker-session")),
+      commitGoalAttemptCommand: (input) => {
+        committedInputs.push(input);
+        return Effect.succeed({ committed: true, stale: false, storedEvents: [] });
+      },
+    });
+
+    const committedInput = committedInputs[0];
+    assert.isDefined(committedInput);
+    if (committedInput === undefined) return;
+    assert.equal(committedInput?.commandType, "goal.attempt.bind-provider-session");
+    assert.deepEqual(committedInput?.expectedStatuses, ["launching"]);
+    assert.equal(committedInput?.events[0]?.type, "goal.attempt-transitioned");
+    assert.equal(
+      committedInput?.events[0]?.type === "goal.attempt-transitioned"
+        ? committedInput.events[0].payload.providerSessionId
+        : null,
+      providerSessionId,
+    );
+  }),
+);
+
+it.effect("fails worker startup when provider-session binding loses its active-attempt fence", () =>
+  Effect.gen(function* () {
+    const exit = yield* bindGoalWorkerProviderSession({
+      goals: goals(goalDetail({})),
+      threadId,
+      run,
+      providerSessionId: ProviderSessionId.make("provider-session:stale-goal-worker"),
+      allocateEvent: () => Effect.succeed(EventId.make("event:stale-goal-worker-session")),
+      commitGoalAttemptCommand: () =>
+        Effect.succeed({ committed: false, stale: true, storedEvents: [] }),
+    }).pipe(Effect.exit);
 
     assert.equal(exit._tag, "Failure");
   }),

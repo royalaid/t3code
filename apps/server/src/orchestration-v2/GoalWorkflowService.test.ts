@@ -22,7 +22,12 @@ import { EventSinkV2 } from "./EventSink.ts";
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
 import { GoalScheduler } from "./GoalScheduler.ts";
 import { layer as idAllocatorLayer } from "./IdAllocator.ts";
-import { GoalWorkflowService, layer, rootNoGraphTerminalStatus } from "./GoalWorkflowService.ts";
+import {
+  GoalWorkflowService,
+  layer,
+  rootControlRunStatusAction,
+  rootNoGraphTerminalStatus,
+} from "./GoalWorkflowService.ts";
 import { planUnboundGoalAttemptCancellation } from "./Orchestrator.ts";
 import { ThreadManagementService } from "./ThreadManagementService.ts";
 
@@ -108,6 +113,14 @@ it("classifies only diagnostic no-graph terminal statuses", () => {
   expect(rootNoGraphTerminalStatus("running")).toBeNull();
 });
 
+it("pauses only once per active root run while preserving explicit Stop", () => {
+  expect(rootControlRunStatusAction("running", false)).toBe("pause_and_track");
+  expect(rootControlRunStatusAction("waiting", true)).toBe("ignore");
+  expect(rootControlRunStatusAction("waiting", false)).toBe("ignore");
+  expect(rootControlRunStatusAction("interrupted", true)).toBe("pause_and_clear");
+  expect(rootControlRunStatusAction("completed", true)).toBe("clear");
+});
+
 it.effect("blocks the exact initial root run from the live boundary after it terminalizes", () =>
   Effect.gen(function* () {
     const goalId = GoalId.make("goal:initial-no-graph-live");
@@ -140,7 +153,7 @@ it.effect("blocks the exact initial root run from the live boundary after it ter
       id: "event:unrelated-no-graph-live",
       payload: { id: RunId.make("run:unrelated-no-graph-live"), status: "failed" },
     } as unknown as OrchestrationV2DomainEvent;
-    const committedInput = yield* Ref.make<unknown>(null);
+    const committedInputs = yield* Ref.make<ReadonlyArray<unknown>>([]);
     const observed = yield* Deferred.make<void>();
     let subscribedAfterSequence: number | undefined;
     const dependencies = Layer.mergeAll(
@@ -159,8 +172,10 @@ it.effect("blocks the exact initial root run from the live boundary after it ter
           ] as never);
         },
         commitGoalNoGraphCommand: (input) =>
-          Ref.set(committedInput, input).pipe(
-            Effect.andThen(Deferred.succeed(observed, undefined)),
+          Ref.update(committedInputs, (current) => [...current, input]).pipe(
+            Effect.andThen(
+              input.runId === runId ? Deferred.succeed(observed, undefined) : Effect.void,
+            ),
             Effect.as({ committed: true, stale: false, storedEvents: [] }),
           ),
       }),
@@ -186,13 +201,15 @@ it.effect("blocks the exact initial root run from the live boundary after it ter
         Option.isSome(yield* Deferred.await(observed).pipe(Effect.timeoutOption("1 second"))),
       ).toBe(true);
       expect(subscribedAfterSequence).toBe(41);
-      expect(yield* Ref.get(committedInput)).toMatchObject({
+      const captured = yield* Ref.get(committedInputs);
+      expect(captured).toHaveLength(1);
+      expect(captured[0]).toMatchObject({
         goalId,
         runId,
         expectedStatus: "planning",
         requireInitialRootRun: true,
       });
-      const input = (yield* Ref.get(committedInput)) as {
+      const input = captured[0] as {
         readonly events: ReadonlyArray<{ readonly type: string; readonly payload: unknown }>;
       };
       expect(input.events.map((event) => event.type)).toEqual([

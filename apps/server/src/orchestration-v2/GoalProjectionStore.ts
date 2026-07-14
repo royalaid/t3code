@@ -628,10 +628,36 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
               goal.status === "blocked" &&
               goal.currentRevision === 0 &&
               goal.currentGraphVersionId === null;
-            if (goal.status !== "planning" && goal.status !== "running" && !recoverableBlocked)
+            const rootControlledPaused =
+              goal.status === "paused" &&
+              goal.currentRevision > 0 &&
+              goal.currentGraphVersionId !== null;
+            const integratingWriter =
+              goal.currentGraphVersionId === null
+                ? []
+                : yield* sql<{ readonly writer_commit_id: string }>`
+                    SELECT writer_commit_id
+                    FROM goal_writer_commits
+                    WHERE goal_id=${goal.id}
+                      AND graph_version_id=${goal.currentGraphVersionId}
+                      AND state='integrating'
+                    LIMIT 1
+                  `;
+            if (integratingWriter.length > 0)
+              return yield* new GoalProjectionValidationError({
+                reason: "stale_revision",
+                detail:
+                  "The active graph has a writer integration in progress; re-read the goal and retry after it settles.",
+              });
+            if (
+              goal.status !== "planning" &&
+              goal.status !== "running" &&
+              !recoverableBlocked &&
+              !rootControlledPaused
+            )
               return yield* new GoalProjectionValidationError({
                 reason: "invalid_revision",
-                detail: `Goal ${goal.id} is ${goal.status}; graph activation requires planning, running replacement, or recoverable revision-zero blocked state.`,
+                detail: `Goal ${goal.id} is ${goal.status}; graph activation requires planning, running replacement, root-controlled paused replacement, or recoverable revision-zero blocked state.`,
               });
           }
           const nextGoal = {
@@ -653,6 +679,7 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
                   ? sql``
                   : sql`AND (
                 status IN ('planning', 'running') OR
+                (status = 'paused' AND current_revision > 0 AND current_graph_version_id IS NOT NULL) OR
                 (status = 'blocked' AND current_revision = 0 AND current_graph_version_id IS NULL)
               )`
               }
@@ -806,15 +833,33 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
                 reason: "referential_integrity",
                 detail: "Attempt event cannot change immutable attempt identity.",
               });
+            const conflictingBinding = [
+              [existingAttempt.providerSessionId, event.payload.providerSessionId],
+              [existingAttempt.executionThreadId, event.payload.executionThreadId],
+              [existingAttempt.runId, event.payload.runId],
+              [existingAttempt.rootExecutionNodeId, event.payload.rootExecutionNodeId],
+              [existingAttempt.workspacePath, event.payload.workspacePath],
+            ].some(
+              ([existing, incoming]) =>
+                existing !== null && incoming !== null && existing !== incoming,
+            );
+            if (conflictingBinding)
+              return yield* new GoalProjectionValidationError({
+                reason: "referential_integrity",
+                detail: "Attempt execution bindings are monotonic and cannot be replaced.",
+              });
             payload = {
               ...existingAttempt,
               status: event.payload.status,
               resolvedRoute: event.payload.resolvedRoute,
-              providerSessionId: event.payload.providerSessionId,
-              executionThreadId: event.payload.executionThreadId,
-              runId: event.payload.runId,
-              rootExecutionNodeId: event.payload.rootExecutionNodeId,
-              workspacePath: event.payload.workspacePath,
+              providerSessionId:
+                event.payload.providerSessionId ?? existingAttempt.providerSessionId,
+              executionThreadId:
+                event.payload.executionThreadId ?? existingAttempt.executionThreadId,
+              runId: event.payload.runId ?? existingAttempt.runId,
+              rootExecutionNodeId:
+                event.payload.rootExecutionNodeId ?? existingAttempt.rootExecutionNodeId,
+              workspacePath: event.payload.workspacePath ?? existingAttempt.workspacePath,
               leaseOwner: event.payload.leaseOwner,
               leaseExpiresAt: event.payload.leaseExpiresAt,
               usage: event.payload.usage,
@@ -877,11 +922,6 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
               reason: "referential_integrity",
               detail: `Writer commit ${event.payload.id} belongs to non-writer node ${event.payload.nodeId}.`,
             });
-          const cancellation = rejectCancelledNodePublication(
-            owningNode,
-            `Writer commit ${event.payload.id}`,
-          );
-          if (cancellation !== null) return yield* cancellation;
           if (!event.payload.cleanSingleCommit)
             return yield* new GoalProjectionValidationError({
               reason: "referential_integrity",
@@ -897,9 +937,20 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
             });
           const existingRows =
             yield* sql<PayloadRow>`SELECT payload_json FROM goal_writer_commits WHERE writer_commit_id=${event.payload.id}`;
+          const existing =
+            existingRows[0] === undefined
+              ? undefined
+              : yield* decodeWriterCommit(existingRows[0].payload_json);
+          const settlesClaimedIntegration =
+            existing?.state === "integrating" &&
+            (event.payload.state === "integrated" || event.payload.state === "conflicted");
+          const cancellation = rejectCancelledNodePublication(
+            owningNode,
+            `Writer commit ${event.payload.id}`,
+          );
+          if (cancellation !== null && !settlesClaimedIntegration) return yield* cancellation;
           let payload = event.payload;
-          if (existingRows[0] !== undefined) {
-            const existing = yield* decodeWriterCommit(existingRows[0].payload_json);
+          if (existing !== undefined) {
             const incomingWithExistingMutable = {
               ...event.payload,
               integrationAfterSha: existing.integrationAfterSha,

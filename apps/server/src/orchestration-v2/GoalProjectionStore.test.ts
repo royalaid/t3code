@@ -7,6 +7,8 @@ import {
   GoalEdgeId,
   GoalId,
   GoalNodeId,
+  ProviderSessionId,
+  RunId,
   ThreadId,
   type GoalGraphNode,
 } from "@t3tools/contracts";
@@ -276,10 +278,27 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
       });
       assert.equal((yield* store.getDetail(goalId)).goal.currentRevision, 2);
 
+      const runningGoal = (yield* store.getDetail(goalId)).goal;
+      yield* store.apply({
+        type: "goal.updated",
+        payload: {
+          ...runningGoal,
+          status: "paused",
+          updatedAt: "2026-07-11T00:00:02.000Z",
+        },
+      });
+      yield* store.activateGraph({
+        goalId,
+        expectedRevision: 2,
+        graph: makeCompletionGraph({ goalId, rootThreadId, revision: 3 }),
+      });
+      const resumedGoal = (yield* store.getDetail(goalId)).goal;
+      assert.equal(resumedGoal.status, "running");
+      assert.equal(resumedGoal.currentRevision, 3);
+
       for (const lifecycleStatus of [
         "waiting_for_source",
         "provisioning",
-        "paused",
         "verifying",
         "completed",
         "failed",
@@ -1024,6 +1043,33 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         )).reason,
         "referential_integrity",
       );
+      const providerSessionId = ProviderSessionId.make("provider-session:records");
+      const runId = RunId.make("run:records");
+      yield* store.apply({
+        type: "goal.attempt-transitioned",
+        payload: { ...attempt, providerSessionId, updatedAt: "2026-07-11T00:00:03.000Z" },
+      });
+      yield* store.apply({
+        type: "goal.attempt-transitioned",
+        payload: { ...attempt, runId, updatedAt: "2026-07-11T00:00:04.000Z" },
+      });
+      const mergedAttempt = (yield* store.getDetail(goalId)).attempts.find(
+        (candidate) => candidate.id === attemptId,
+      );
+      assert.equal(mergedAttempt?.providerSessionId, providerSessionId);
+      assert.equal(mergedAttempt?.runId, runId);
+      assert.equal(
+        (yield* Effect.flip(
+          store.apply({
+            type: "goal.attempt-transitioned",
+            payload: {
+              ...attempt,
+              providerSessionId: ProviderSessionId.make("provider-session:records:replacement"),
+            },
+          }),
+        )).reason,
+        "referential_integrity",
+      );
       const writerCommit = {
         id: GoalArtifactId.make("commit-record:1"),
         goalId,
@@ -1067,8 +1113,27 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
       );
       yield* store.apply({
         type: "goal.writer-commit-recorded",
-        payload: writerCommit,
+        payload: {
+          ...writerCommit,
+          integrationAfterSha: null,
+          state: "integrating",
+        },
       });
+      const replacementDuringIntegration = yield* Effect.flip(
+        store.activateGraph({
+          goalId,
+          expectedRevision: 1,
+          expectedStatus: "running",
+          graph: makeCompletionGraph({
+            goalId,
+            rootThreadId: ThreadId.make("root:records"),
+            revision: 2,
+            id: "graph:records:replacement",
+          }),
+        }),
+      );
+      assert.equal(replacementDuringIntegration.reason, "stale_revision");
+      yield* store.apply({ type: "goal.writer-commit-recorded", payload: writerCommit });
       yield* store.apply({
         type: "goal.failure-recorded",
         payload: {

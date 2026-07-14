@@ -36,6 +36,15 @@ import { ThreadManagementService } from "./ThreadManagementService.ts";
 const ACTIVE_RUN_STATUSES = new Set(["preparing", "queued", "starting", "running", "waiting"]);
 const ACTIVE_ATTEMPT_STATUSES = new Set(["leased", "launching", "running", "stalled"]);
 const NODE_CANCELLATION_STATUSES = new Set(["cancelled", "superseded"]);
+export function rootControlRunStatusAction(
+  status: OrchestrationV2RunStatus,
+  alreadyTracked: boolean,
+): "pause_and_track" | "pause_and_clear" | "ignore" | "clear" {
+  if (status === "interrupted") return "pause_and_clear";
+  if (status === "waiting") return "ignore";
+  if (ACTIVE_RUN_STATUSES.has(status)) return alreadyTracked ? "ignore" : "pause_and_track";
+  return "clear";
+}
 type RootNoGraphTerminalStatus = Extract<
   GoalFailureReason,
   { readonly type: "root_lead_no_graph" }
@@ -87,6 +96,7 @@ export const layer = Layer.effect(
     const ids = yield* IdAllocatorV2;
     const threads = yield* ThreadManagementService;
     const trackedBlockedRootRuns = yield* Ref.make(new Map<RunId, GoalId>());
+    const trackedRootControlRuns = yield* Ref.make(new Set<RunId>());
 
     const trackBlockedRootRun = (runId: RunId, goalId: GoalId) =>
       Ref.update(trackedBlockedRootRuns, (current) => {
@@ -858,31 +868,64 @@ export const layer = Layer.effect(
       domainEvent: OrchestrationV2DomainEvent,
     ) {
       if (domainEvent.type !== "run.updated") return;
-      if (
-        !ACTIVE_RUN_STATUSES.has(domainEvent.payload.status) &&
-        domainEvent.payload.status !== "interrupted"
-      )
+      const observedAction = yield* Ref.get(trackedRootControlRuns).pipe(
+        Effect.map((current) =>
+          rootControlRunStatusAction(
+            domainEvent.payload.status,
+            current.has(domainEvent.payload.id),
+          ),
+        ),
+      );
+      if (observedAction === "clear") {
+        yield* Ref.update(trackedRootControlRuns, (current) => {
+          if (!current.has(domainEvent.payload.id)) return current;
+          const next = new Set(current);
+          next.delete(domainEvent.payload.id);
+          return next;
+        });
         return;
+      }
+      if (observedAction === "ignore") return;
       const binding = yield* goals
         .resolveMcpBinding(domainEvent.threadId)
         .pipe(Effect.mapError(workflowError("resolve-root-control")));
       if (binding?.kind !== "lead") return;
+      const action = yield* Ref.modify(trackedRootControlRuns, (current) => {
+        const action = rootControlRunStatusAction(
+          domainEvent.payload.status,
+          current.has(domainEvent.payload.id),
+        );
+        if (action === "ignore") return [action, current] as const;
+        const next = new Set(current);
+        if (action === "pause_and_track") next.add(domainEvent.payload.id);
+        else next.delete(domainEvent.payload.id);
+        return [action, next] as const;
+      });
+      if (action === "ignore") return;
       const detail = yield* goals
         .getDetail(binding.goalId)
         .pipe(Effect.mapError(workflowError("read-root-control-goal")));
       if (detail.goal.status !== "running") return;
       const now = yield* DateTime.now;
       const timestamp = DateTime.formatIso(now);
-      const commandId = CommandId.make(`goal-root-control-pause:${domainEvent.id}`);
+      const commandId = CommandId.make(
+        action === "pause_and_track"
+          ? `goal-root-control-pause:${detail.goal.id}:${domainEvent.payload.id}`
+          : `goal-root-control-stop:${domainEvent.id}`,
+      );
       const eventId = yield* ids.allocate
         .event({ threadId: detail.goal.rootThreadId, commandId })
         .pipe(Effect.mapError(workflowError("allocate-root-control-event")));
       yield* eventSink
-        .commitCommand({
+        .commitGoalLifecycleCommand({
           commandId,
           threadId: detail.goal.rootThreadId,
           commandType: "goal.root-control.pause",
           acceptedAt: now,
+          goalId: detail.goal.id,
+          expectedStatus: "running",
+          expectedRevision: detail.goal.currentRevision,
+          expectedGraphVersionId: detail.goal.currentGraphVersionId,
           events: [
             {
               id: eventId,
