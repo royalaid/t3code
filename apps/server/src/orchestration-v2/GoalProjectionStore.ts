@@ -455,6 +455,9 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         ...(event.payload.sourceActiveRunId === undefined
           ? {}
           : { sourceActiveRunId: event.payload.sourceActiveRunId }),
+        ...(event.payload.initialRootRunId === undefined
+          ? {}
+          : { initialRootRunId: event.payload.initialRootRunId }),
         ...(event.payload.pendingLaunchClaimId === undefined
           ? {}
           : { pendingLaunchClaimId: event.payload.pendingLaunchClaimId }),

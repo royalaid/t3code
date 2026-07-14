@@ -309,6 +309,8 @@ export const Goal = Schema.Struct({
   rootThreadId: ThreadId,
   /** Run that must settle before the source capsule may be finalized. */
   sourceActiveRunId: Schema.optional(Schema.NullOr(RunId)),
+  /** Exact first provider run launched for the root lead. Optional for legacy projections. */
+  initialRootRunId: Schema.optional(RunId),
   pendingLaunchClaimId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   /** Immutable, client-supplied inputs captured before any provider launch. */
   sourceInput: Schema.optional(
@@ -397,12 +399,19 @@ export const GoalFailureReason = Schema.Union([
   Schema.Struct({ type: Schema.Literal("unsupported_queue_steer"), detail: TrimmedNonEmptyString }),
   Schema.Struct({ type: Schema.Literal("stale_active_run_target"), detail: TrimmedNonEmptyString }),
   Schema.Struct({
+    type: Schema.Literal("root_lead_no_graph"),
+    runId: RunId,
+    terminalStatus: Schema.Literals(["completed", "failed", "interrupted", "rolled_back"]),
+    detail: TrimmedNonEmptyString.check(Schema.isMaxLength(4_000)),
+  }),
+  Schema.Struct({
     type: Schema.Literal("resource_backstop"),
     limit: PositiveInt,
     observed: NonNegativeInt,
     warning: Schema.Boolean,
   }),
 ]);
+export type GoalFailureReason = typeof GoalFailureReason.Type;
 
 export const GoalFailureRecord = Schema.Struct({
   id: GoalEvidenceId,
@@ -454,6 +463,7 @@ export const GoalWorkflowCommand = Schema.Union([
     ...commandBase,
     handoff: GoalSourceHandoff,
     claimId: TrimmedNonEmptyString,
+    initialRootRunId: RunId,
   }),
   Schema.Struct({
     type: Schema.Literal("goal.graph.replace"),

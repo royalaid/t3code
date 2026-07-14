@@ -1,20 +1,28 @@
 import {
   CommandId,
+  EventId,
+  type Goal,
   GoalEvidenceId,
   type GoalAttempt,
   type GoalDetail,
+  type GoalFailureReason,
+  type GoalId,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2RunStatus,
+  type RunId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { EventSinkV2 } from "./EventSink.ts";
 import { EffectOutboxV2 } from "./EffectOutbox.ts";
+import { goalRootLaunchClaimId } from "./GoalLaunchService.ts";
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
 import { GoalScheduler } from "./GoalScheduler.ts";
 import {
@@ -28,6 +36,23 @@ import { ThreadManagementService } from "./ThreadManagementService.ts";
 const ACTIVE_RUN_STATUSES = new Set(["preparing", "queued", "starting", "running", "waiting"]);
 const ACTIVE_ATTEMPT_STATUSES = new Set(["leased", "launching", "running", "stalled"]);
 const NODE_CANCELLATION_STATUSES = new Set(["cancelled", "superseded"]);
+type RootNoGraphTerminalStatus = Extract<
+  GoalFailureReason,
+  { readonly type: "root_lead_no_graph" }
+>["terminalStatus"];
+const ROOT_NO_GRAPH_TERMINAL_STATUSES = new Set<RootNoGraphTerminalStatus>([
+  "completed",
+  "failed",
+  "interrupted",
+  "rolled_back",
+]);
+export function rootNoGraphTerminalStatus(
+  status: OrchestrationV2RunStatus,
+): RootNoGraphTerminalStatus | null {
+  return ROOT_NO_GRAPH_TERMINAL_STATUSES.has(status as RootNoGraphTerminalStatus)
+    ? (status as RootNoGraphTerminalStatus)
+    : null;
+}
 const ATTEMPT_ACTIVITY_EVENTS = new Set<OrchestrationV2DomainEvent["type"]>([
   "run.updated",
   "node.updated",
@@ -61,6 +86,31 @@ export const layer = Layer.effect(
     const scheduler = yield* GoalScheduler;
     const ids = yield* IdAllocatorV2;
     const threads = yield* ThreadManagementService;
+    const trackedBlockedRootRuns = yield* Ref.make(new Map<RunId, GoalId>());
+
+    const trackBlockedRootRun = (runId: RunId, goalId: GoalId) =>
+      Ref.update(trackedBlockedRootRuns, (current) => {
+        const next = new Map(current);
+        next.set(runId, goalId);
+        return next;
+      });
+
+    const takeBlockedRootRun = (runId: RunId) =>
+      Ref.modify(trackedBlockedRootRuns, (current) => {
+        if (!current.has(runId)) return [false, current] as const;
+        const next = new Map(current);
+        next.delete(runId);
+        return [true, next] as const;
+      });
+
+    const clearBlockedRootRunsForGoal = (goalId: GoalId) =>
+      Ref.update(trackedBlockedRootRuns, (current) => {
+        const next = new Map(current);
+        for (const [runId, trackedGoalId] of current) {
+          if (trackedGoalId === goalId) next.delete(runId);
+        }
+        return next;
+      });
 
     const schedule = scheduler.tick.pipe(Effect.asVoid, Effect.mapError(workflowError("schedule")));
 
@@ -257,6 +307,180 @@ export const layer = Layer.effect(
       );
     });
     const reconcile = recover.pipe(Effect.andThen(schedule));
+
+    const persistRootLeadNoGraph = Effect.fn("GoalWorkflowService.persistRootLeadNoGraph")(
+      function* (input: {
+        readonly goal: Goal;
+        readonly runId: RunId;
+        readonly terminalStatus: RootNoGraphTerminalStatus;
+        readonly initial: boolean;
+      }) {
+        const goal = input.goal;
+        const now = yield* DateTime.now;
+        const timestamp = DateTime.formatIso(now);
+        const commandId = CommandId.make(`goal-root-no-graph:${goal.id}:${input.runId}`);
+        const diagnostic = input.initial
+          ? `Root lead run ${input.runId} ended with ${input.terminalStatus} before publishing a valid graph.`
+          : `Corrective root lead run ${input.runId} ended with ${input.terminalStatus} without publishing a valid graph.`;
+        const failureId = GoalEvidenceId.make(`goal-root-no-graph:${goal.id}:${input.runId}`);
+        yield* eventSink
+          .commitGoalNoGraphCommand({
+            commandId,
+            threadId: goal.rootThreadId,
+            commandType: input.initial
+              ? "goal.root-lead.initial-no-graph"
+              : "goal.root-lead.retry-no-graph",
+            acceptedAt: now,
+            goalId: goal.id,
+            runId: input.runId,
+            pendingLaunchClaimId: goal.pendingLaunchClaimId ?? goalRootLaunchClaimId(goal.id),
+            expectedStatus: input.initial ? "planning" : "blocked",
+            requireInitialRootRun: input.initial,
+            events: [
+              {
+                id: EventId.make(`event:${failureId}:failure`),
+                threadId: goal.rootThreadId,
+                type: "goal.failure-recorded",
+                payload: {
+                  id: failureId,
+                  goalId: goal.id,
+                  graphVersionId: null,
+                  nodeId: null,
+                  attemptId: null,
+                  reason: {
+                    type: "root_lead_no_graph",
+                    runId: input.runId,
+                    terminalStatus: input.terminalStatus,
+                    detail: diagnostic.slice(0, 4_000),
+                  },
+                  recoveryState: "retryable",
+                  blocker: "Send a corrective message in the root thread.",
+                  occurredAt: timestamp,
+                },
+                occurredAt: now,
+              },
+              {
+                id: EventId.make(`event:${failureId}:goal`),
+                threadId: goal.rootThreadId,
+                type: "goal.updated",
+                payload: {
+                  ...goal,
+                  status: "blocked",
+                  updatedAt: timestamp,
+                },
+                occurredAt: now,
+              },
+            ],
+            effects: [],
+          })
+          .pipe(Effect.mapError(workflowError("persist-root-lead-no-graph")));
+      },
+    );
+
+    const superviseRootLeadNoGraph = Effect.fn("GoalWorkflowService.superviseRootLeadNoGraph")(
+      function* (domainEvent: OrchestrationV2DomainEvent) {
+        if (domainEvent.type === "goal.graph-version-activated") {
+          yield* clearBlockedRootRunsForGoal(domainEvent.payload.goalId);
+          return;
+        }
+        if (
+          domainEvent.type === "goal.cancelled" ||
+          domainEvent.type === "goal.completed" ||
+          domainEvent.type === "goal.reopened" ||
+          domainEvent.type === "goal.integration-updated" ||
+          domainEvent.type === "goal.integration-conflicted"
+        ) {
+          yield* clearBlockedRootRunsForGoal(domainEvent.payload.id);
+          return;
+        }
+        if (domainEvent.type === "goal.updated") {
+          const projected = domainEvent.payload;
+          if (
+            projected.status !== "planning" ||
+            projected.currentRevision !== 0 ||
+            projected.currentGraphVersionId !== null ||
+            projected.initialRootRunId === undefined
+          ) {
+            if (
+              projected.status !== "blocked" ||
+              projected.currentRevision !== 0 ||
+              projected.currentGraphVersionId !== null
+            ) {
+              yield* clearBlockedRootRunsForGoal(projected.id);
+            }
+            return;
+          }
+          const root = yield* threads
+            .getThreadProjection(projected.rootThreadId)
+            .pipe(Effect.mapError(workflowError("read-planning-no-graph-root")));
+          const run = root.runs.find((candidate) => candidate.id === projected.initialRootRunId);
+          const settled = run === undefined ? null : rootNoGraphTerminalStatus(run.status);
+          if (run === undefined || settled === null) return;
+          yield* persistRootLeadNoGraph({
+            goal: projected,
+            runId: run.id,
+            terminalStatus: settled,
+            initial: true,
+          });
+          return;
+        }
+
+        if (domainEvent.type !== "run.created" && domainEvent.type !== "run.updated") return;
+        const settled =
+          domainEvent.type === "run.updated"
+            ? rootNoGraphTerminalStatus(domainEvent.payload.status)
+            : null;
+        if (domainEvent.type === "run.updated" && settled === null) {
+          if (domainEvent.payload.status === "cancelled") {
+            yield* takeBlockedRootRun(domainEvent.payload.id);
+          }
+          return;
+        }
+        const binding = yield* goals
+          .resolveMcpBinding(domainEvent.threadId)
+          .pipe(Effect.mapError(workflowError("resolve-root-no-graph")));
+        if (binding?.kind !== "lead") return;
+        const detail = yield* goals
+          .getDetail(binding.goalId)
+          .pipe(Effect.mapError(workflowError("read-root-no-graph-goal")));
+        const noGraphAtRevisionZero =
+          detail.goal.currentRevision === 0 && detail.goal.currentGraphVersionId === null;
+
+        if (
+          domainEvent.type === "run.created" &&
+          detail.goal.status === "blocked" &&
+          noGraphAtRevisionZero &&
+          domainEvent.payload.id !== detail.goal.initialRootRunId
+        ) {
+          yield* trackBlockedRootRun(domainEvent.payload.id, detail.goal.id);
+          return;
+        }
+        if (domainEvent.type !== "run.updated") return;
+        if (settled === null) return;
+        const tracked = yield* takeBlockedRootRun(domainEvent.payload.id);
+        if (
+          detail.goal.status === "planning" &&
+          noGraphAtRevisionZero &&
+          detail.goal.initialRootRunId === domainEvent.payload.id
+        ) {
+          yield* persistRootLeadNoGraph({
+            goal: detail.goal,
+            runId: domainEvent.payload.id,
+            terminalStatus: settled,
+            initial: true,
+          });
+          return;
+        }
+        if (tracked && detail.goal.status === "blocked" && noGraphAtRevisionZero) {
+          yield* persistRootLeadNoGraph({
+            goal: detail.goal,
+            runId: domainEvent.payload.id,
+            terminalStatus: settled,
+            initial: false,
+          });
+        }
+      },
+    );
 
     const updateAttempt = Effect.fn("GoalWorkflowService.updateAttempt")(function* (
       domainEvent: OrchestrationV2DomainEvent,
@@ -673,9 +897,13 @@ export const layer = Layer.effect(
         .pipe(Effect.mapError(workflowError("persist-root-control-pause")));
     });
 
-    const observe = eventSink.stream().pipe(
+    const liveBoundary = yield* eventSink
+      .latestSequence()
+      .pipe(Effect.mapError(workflowError("read-live-boundary")));
+    const observe = eventSink.stream({ afterSequence: liveBoundary }).pipe(
       Stream.runForEach((stored) =>
-        cancelGoalRuns(stored.event).pipe(
+        superviseRootLeadNoGraph(stored.event).pipe(
+          Effect.andThen(cancelGoalRuns(stored.event)),
           Effect.andThen(cancelNodeAttempt(stored.event)),
           Effect.andThen(pauseForRootControl(stored.event)),
           Effect.andThen(updateAttempt(stored.event)),

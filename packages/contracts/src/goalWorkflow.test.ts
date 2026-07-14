@@ -81,6 +81,104 @@ describe("goal workflow contracts", () => {
       }),
     ).toThrow();
   });
+
+  it("keeps legacy goals readable while persisting an exact initial root run", () => {
+    const legacy = decodeGoal({
+      id: "goal:legacy-root-run",
+      objective: "remain readable",
+      status: "planning",
+      sourceThreadId: "thread:source",
+      rootThreadId: "thread:root",
+      policy,
+      currentGraphVersionId: null,
+      currentRevision: 0,
+      integrationBranch: "goal/integration",
+      integrationWorktreePath: "/repo/.worktrees/goal",
+      integrationSha: "sha:integration",
+      verifiedSha: null,
+      createdAt: "2026-07-11T00:00:00.000Z",
+      updatedAt: "2026-07-11T00:00:00.000Z",
+    });
+    expect(legacy.initialRootRunId).toBeUndefined();
+    expect(decodeGoal({ ...legacy, initialRootRunId: "run:initial-root" }).initialRootRunId).toBe(
+      "run:initial-root",
+    );
+  });
+
+  it("requires pending launch completion to identify the exact initial root run", () => {
+    const complete = decodeGoalWorkflowCommand({
+      type: "goal.pending-launch.complete",
+      commandId: "command:complete",
+      threadId: "thread:root",
+      goalId: "goal:1",
+      claimId: "claim:root",
+      initialRootRunId: "run:initial-root",
+      handoff: {
+        objective: "ship it",
+        attachments: [],
+        selectedContextText: [],
+        sourceSummary: null,
+        projectInstructions: [],
+        branchState: null,
+        relevantCheckpoints: [],
+      },
+    });
+    if (complete.type !== "goal.pending-launch.complete")
+      throw new Error("Expected pending launch completion command.");
+    expect(complete.initialRootRunId).toBe("run:initial-root");
+    expect(() => decodeGoalWorkflowCommand({ ...complete, initialRootRunId: undefined })).toThrow();
+  });
+
+  it("bounds root lead no-graph diagnostics and excludes cancellation", () => {
+    const failure = {
+      type: "goal.failure-recorded",
+      payload: {
+        id: "evidence:no-graph",
+        goalId: "goal:1",
+        graphVersionId: null,
+        nodeId: null,
+        attemptId: null,
+        reason: {
+          type: "root_lead_no_graph",
+          runId: "run:initial-root",
+          terminalStatus: "completed",
+          detail: "The root lead ended before publishing a graph.",
+        },
+        recoveryState: "retryable",
+        blocker: "Send a corrective root-thread message.",
+        occurredAt: "2026-07-11T00:00:00.000Z",
+      },
+    } as const;
+    for (const terminalStatus of ["completed", "failed", "interrupted", "rolled_back"] as const) {
+      expect(
+        decodeGoalWorkflowEvent({
+          ...failure,
+          payload: {
+            ...failure.payload,
+            reason: { ...failure.payload.reason, terminalStatus },
+          },
+        }).type,
+      ).toBe("goal.failure-recorded");
+    }
+    expect(() =>
+      decodeGoalWorkflowEvent({
+        ...failure,
+        payload: {
+          ...failure.payload,
+          reason: { ...failure.payload.reason, terminalStatus: "cancelled" },
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeGoalWorkflowEvent({
+        ...failure,
+        payload: {
+          ...failure.payload,
+          reason: { ...failure.payload.reason, detail: "x".repeat(4_001) },
+        },
+      }),
+    ).toThrow();
+  });
   it("decodes immutable graph versions and root graph replacement commands", () => {
     const graph = decodeGoalGraphVersion({
       id: "goal-graph:1",

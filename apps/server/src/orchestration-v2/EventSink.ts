@@ -151,6 +151,26 @@ export interface EventSinkV2Shape {
     },
     EventSinkV2Error
   >;
+  readonly commitGoalNoGraphCommand: (input: {
+    readonly commandId: CommandId;
+    readonly threadId: ThreadId;
+    readonly commandType: string;
+    readonly acceptedAt: DateTime.Utc;
+    readonly goalId: GoalId;
+    readonly runId: RunId;
+    readonly pendingLaunchClaimId: string;
+    readonly expectedStatus: "planning" | "blocked";
+    readonly requireInitialRootRun: boolean;
+    readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
+    readonly effects: ReadonlyArray<PendingOrchestrationEffectV2>;
+  }) => Effect.Effect<
+    {
+      readonly committed: boolean;
+      readonly stale: boolean;
+      readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
+    },
+    EventSinkV2Error
+  >;
   readonly commitCommand: (input: {
     readonly commandId: CommandId;
     readonly threadId: ThreadId;
@@ -566,6 +586,43 @@ const baseLayer: Layer.Layer<
       );
     });
 
+    const commitGoalNoGraphCommandEffect = Effect.fn(
+      "orchestrationV2.EventSink.commitGoalNoGraphCommand",
+    )(function* (input: Parameters<EventSinkV2Shape["commitGoalNoGraphCommand"]>[0]) {
+      return yield* commitGoalCasCommandEffect(
+        input,
+        sql<{
+          readonly status: string;
+          readonly current_revision: number;
+          readonly current_graph_version_id: string | null;
+          readonly initial_root_run_id: string | null;
+          readonly pending_launch_claim_id: string | null;
+        }>`
+          SELECT
+            status,
+            current_revision,
+            current_graph_version_id,
+            json_extract(payload_json, '$.initialRootRunId') AS initial_root_run_id,
+            json_extract(payload_json, '$.pendingLaunchClaimId') AS pending_launch_claim_id
+          FROM goals
+          WHERE goal_id = ${input.goalId}
+          LIMIT 1
+        `.pipe(
+          Effect.map((rows) => {
+            const current = rows[0];
+            return (
+              current !== undefined &&
+              current.status === input.expectedStatus &&
+              current.current_revision === 0 &&
+              current.current_graph_version_id === null &&
+              current.pending_launch_claim_id === input.pendingLaunchClaimId &&
+              (!input.requireInitialRootRun || current.initial_root_run_id === input.runId)
+            );
+          }),
+        ),
+      );
+    });
+
     const commitRejectedCommandEffect = Effect.fn(
       "orchestrationV2.EventSink.commitRejectedCommand",
     )(function* (input: Parameters<EventSinkV2Shape["commitRejectedCommand"]>[0]) {
@@ -705,6 +762,17 @@ const baseLayer: Layer.Layer<
         ),
       commitGoalAttemptCommand: (input) =>
         commitGoalAttemptCommandEffect(input).pipe(
+          Effect.mapError(
+            (cause) =>
+              new EventSinkWriteError({
+                commandId: input.commandId,
+                eventCount: input.events.length,
+                cause,
+              }),
+          ),
+        ),
+      commitGoalNoGraphCommand: (input) =>
+        commitGoalNoGraphCommandEffect(input).pipe(
           Effect.mapError(
             (cause) =>
               new EventSinkWriteError({

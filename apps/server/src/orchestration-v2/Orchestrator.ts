@@ -5245,6 +5245,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ...detail.goal,
             status: "planning",
             sourceHandoff: command.handoff,
+            initialRootRunId: command.initialRootRunId,
             updatedAt: now,
           },
         });
@@ -5457,6 +5458,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           sourceThreadId: command.threadId,
           rootThreadId,
           sourceActiveRunId: activeRun?.id ?? null,
+          initialRootRunId: undefined,
           pendingLaunchClaimId: null,
           sourceInput: {
             messageId: command.messageId,

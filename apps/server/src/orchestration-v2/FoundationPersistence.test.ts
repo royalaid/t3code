@@ -7,6 +7,7 @@ import {
   ContextTransferId,
   EventId,
   GoalId,
+  GoalEvidenceId,
   GoalAttemptId,
   GoalEdgeId,
   GoalGraphVersionId,
@@ -30,6 +31,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -92,6 +94,99 @@ const modelSelection = {
   instanceId: providerInstanceId,
   model: "gpt-5.4",
 } satisfies ModelSelection;
+const foundationGoalPolicy = {
+  sandboxMode: "workspace-write" as const,
+  approvalPolicy: "on-request" as const,
+  writableRoots: ["/workspace"],
+  providerAllowlist: ["codex"],
+  toolAllowlist: ["shell"],
+};
+
+function makeGoalNode(id: string) {
+  return {
+    id: GoalNodeId.make(id),
+    role: id,
+    persona: id,
+    objective: id,
+    successCriteria: ["done"],
+    contextPacket: {
+      schemaVersion: 1,
+      digest: null,
+      objective: id,
+      artifacts: [],
+      dependencyOutputs: [],
+      notes: [],
+    },
+    outputContract: {
+      kind: "structured_result" as const,
+      description: "result",
+      requiredFields: [],
+    },
+    requiredCapabilities: ["tools"],
+    workspaceMode: "read_only" as const,
+    routingRequest: {
+      type: "requirements" as const,
+      capabilities: ["tools"],
+      latencyClass: "standard" as const,
+      costClass: "standard" as const,
+    },
+    evidenceRequirements: [],
+    policy: {
+      ...foundationGoalPolicy,
+      sandboxMode: "read-only" as const,
+      writableRoots: [],
+    },
+  };
+}
+
+function makeCompletionGraph(input: {
+  readonly goalId: GoalId;
+  readonly rootThreadId: ThreadId;
+  readonly graphId: string;
+  readonly writerId: string;
+  readonly verifierId: string;
+  readonly edgeId: string;
+  readonly createdAt: string;
+}) {
+  const writer = {
+    ...makeGoalNode(input.writerId),
+    workspaceMode: "writer" as const,
+    outputContract: {
+      kind: "commit" as const,
+      description: "commit",
+      requiredFields: [],
+    },
+    policy: foundationGoalPolicy,
+  };
+  const verifier = {
+    ...makeGoalNode(input.verifierId),
+    outputContract: {
+      kind: "verification" as const,
+      description: "verification",
+      requiredFields: ["verdict"],
+    },
+    evidenceRequirements: [{ kind: "command" as const, description: "test log", required: true }],
+  };
+  const edge = {
+    id: GoalEdgeId.make(input.edgeId),
+    fromNodeId: writer.id,
+    toNodeId: verifier.id,
+  };
+  return {
+    graph: {
+      id: GoalGraphVersionId.make(input.graphId),
+      goalId: input.goalId,
+      revision: 1,
+      publishedByNodeId: canonicalGoalLeadPublisherId(input.rootThreadId),
+      nodes: [writer, verifier],
+      edges: [edge],
+      createdAt: input.createdAt,
+    },
+    writer,
+    verifier,
+    edge,
+  } as const;
+}
 
 function makeThread(threadId: ThreadId, now: DateTime.Utc): OrchestrationV2AppThread {
   return {
@@ -136,6 +231,279 @@ function threadCreatedEvent(input: {
 }
 
 it.layer(TestLayer)("orchestration V2 foundation persistence", (it) => {
+  it.effect("commits an initial no-graph failure only after the exact planning fence", () =>
+    Effect.gen(function* () {
+      const eventSink = yield* EventSinkV2;
+      const goalStore = yield* GoalProjectionStore;
+      const receipts = yield* CommandReceiptStoreV2;
+      const now = yield* DateTime.now;
+      const timestamp = DateTime.formatIso(now);
+      const threadId = ThreadId.make("thread:foundation-no-graph");
+      const goalId = GoalId.make("goal:foundation-no-graph");
+      const runId = RunId.make("run:foundation-no-graph");
+      const claimId = `goal-root-launch:${goalId}`;
+      const commandId = CommandId.make(`goal-root-no-graph:${goalId}:${runId}`);
+      const goal = {
+        id: goalId,
+        objective: "publish a graph",
+        status: "provisioning" as const,
+        sourceThreadId: ThreadId.make("thread:foundation-no-graph-source"),
+        rootThreadId: threadId,
+        sourceActiveRunId: null,
+        initialRootRunId: runId,
+        pendingLaunchClaimId: claimId,
+        policy: {
+          sandboxMode: "workspace-write" as const,
+          approvalPolicy: "on-request" as const,
+          writableRoots: ["/workspace"],
+          providerAllowlist: ["codex"],
+          toolAllowlist: ["shell"],
+        },
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: "goal/no-graph",
+        integrationWorktreePath: "/workspace/no-graph",
+        integrationSha: "sha:no-graph",
+        verifiedSha: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      yield* eventSink.write({
+        events: [
+          threadCreatedEvent({
+            id: "event:foundation-no-graph:thread",
+            thread: makeThread(threadId, now),
+            now,
+          }),
+          {
+            id: EventId.make("event:foundation-no-graph:create"),
+            type: "goal.created",
+            threadId,
+            occurredAt: now,
+            payload: goal,
+          },
+        ],
+      });
+      const blocked = { ...goal, status: "blocked" as const, updatedAt: timestamp };
+      const events = [
+        {
+          id: EventId.make(`event:goal-root-no-graph:${goalId}:${runId}:failure`),
+          type: "goal.failure-recorded" as const,
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: GoalEvidenceId.make(`goal-root-no-graph:${goalId}:${runId}`),
+            goalId,
+            graphVersionId: null,
+            nodeId: null,
+            attemptId: null,
+            reason: {
+              type: "root_lead_no_graph" as const,
+              runId,
+              terminalStatus: "completed" as const,
+              detail: "Root lead run completed before publishing a valid graph.",
+            },
+            recoveryState: "retryable" as const,
+            blocker: "Send a corrective root-thread message.",
+            occurredAt: timestamp,
+          },
+        },
+        {
+          id: EventId.make(`event:goal-root-no-graph:${goalId}:${runId}:goal`),
+          type: "goal.updated" as const,
+          threadId,
+          occurredAt: now,
+          payload: blocked,
+        },
+      ];
+      const input = {
+        commandId,
+        threadId,
+        commandType: "goal.root-lead.no-graph",
+        acceptedAt: now,
+        goalId,
+        runId,
+        pendingLaunchClaimId: claimId,
+        expectedStatus: "planning" as const,
+        requireInitialRootRun: true,
+        events,
+        effects: [],
+      };
+
+      const tooEarly = yield* eventSink.commitGoalNoGraphCommand(input);
+      assert.isTrue(tooEarly.stale);
+      assert.isTrue(Option.isNone(yield* receipts.getByCommandId(commandId)));
+
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("event:foundation-no-graph:planning"),
+            type: "goal.updated",
+            threadId,
+            occurredAt: now,
+            payload: { ...goal, status: "planning", updatedAt: timestamp },
+          },
+        ],
+      });
+      const committed = yield* eventSink.commitGoalNoGraphCommand(input);
+      const duplicate = yield* eventSink.commitGoalNoGraphCommand(input);
+      assert.isTrue(committed.committed);
+      assert.isFalse(duplicate.committed);
+      assert.isFalse(duplicate.stale);
+      const detail = yield* goalStore.getDetail(goalId);
+      assert.equal(detail.goal.status, "blocked");
+      assert.lengthOf(detail.failures, 1);
+    }),
+  );
+
+  it.effect("allows exactly one winner when graph activation races no-graph supervision", () =>
+    Effect.gen(function* () {
+      const eventSink = yield* EventSinkV2;
+      const goalStore = yield* GoalProjectionStore;
+      const now = yield* DateTime.now;
+      const timestamp = DateTime.formatIso(now);
+      const threadId = ThreadId.make("thread:foundation-no-graph-race");
+      const goalId = GoalId.make("goal:foundation-no-graph-race");
+      const runId = RunId.make("run:foundation-no-graph-race");
+      const claimId = `goal-root-launch:${goalId}`;
+      const goal = {
+        id: goalId,
+        objective: "publish a graph without racing supervision",
+        status: "planning" as const,
+        sourceThreadId: ThreadId.make("thread:foundation-no-graph-race-source"),
+        rootThreadId: threadId,
+        sourceActiveRunId: null,
+        initialRootRunId: runId,
+        pendingLaunchClaimId: claimId,
+        policy: foundationGoalPolicy,
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: "goal/no-graph-race",
+        integrationWorktreePath: "/workspace/no-graph-race",
+        integrationSha: "sha:no-graph-race",
+        verifiedSha: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      yield* eventSink.write({
+        events: [
+          threadCreatedEvent({
+            id: "event:foundation-no-graph-race:thread",
+            thread: makeThread(threadId, now),
+            now,
+          }),
+          {
+            id: EventId.make("event:foundation-no-graph-race:create"),
+            type: "goal.created",
+            threadId,
+            occurredAt: now,
+            payload: goal,
+          },
+        ],
+      });
+
+      const { graph } = makeCompletionGraph({
+        goalId,
+        rootThreadId: threadId,
+        graphId: "graph:foundation-no-graph-race",
+        writerId: "node:foundation-no-graph-race:writer",
+        verifierId: "node:foundation-no-graph-race:verifier",
+        edgeId: "edge:foundation-no-graph-race",
+        createdAt: timestamp,
+      });
+      const graphId = graph.id;
+      const blocked = { ...goal, status: "blocked" as const };
+      const noGraphEvents = [
+        {
+          id: EventId.make("event:foundation-no-graph-race:failure"),
+          type: "goal.failure-recorded" as const,
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: GoalEvidenceId.make("goal-root-no-graph:race"),
+            goalId,
+            graphVersionId: null,
+            nodeId: null,
+            attemptId: null,
+            reason: {
+              type: "root_lead_no_graph" as const,
+              runId,
+              terminalStatus: "completed" as const,
+              detail: "Root lead run completed before publishing a valid graph.",
+            },
+            recoveryState: "retryable" as const,
+            blocker: "Send a corrective root-thread message.",
+            occurredAt: timestamp,
+          },
+        },
+        {
+          id: EventId.make("event:foundation-no-graph-race:blocked"),
+          type: "goal.updated" as const,
+          threadId,
+          occurredAt: now,
+          payload: blocked,
+        },
+      ];
+
+      const [graphExit, noGraphResult] = yield* Effect.all(
+        [
+          Effect.exit(
+            eventSink.write({
+              events: [
+                {
+                  id: EventId.make("event:foundation-no-graph-race:graph"),
+                  type: "goal.graph-version-activated",
+                  threadId,
+                  occurredAt: now,
+                  payload: {
+                    goalId,
+                    expectedRevision: 0,
+                    expectedStatus: "planning",
+                    graph,
+                    activatedAt: timestamp,
+                  },
+                },
+              ],
+            }),
+          ),
+          eventSink.commitGoalNoGraphCommand({
+            commandId: CommandId.make("command:foundation-no-graph-race"),
+            threadId,
+            commandType: "goal.root-lead.no-graph",
+            acceptedAt: now,
+            goalId,
+            runId,
+            pendingLaunchClaimId: claimId,
+            expectedStatus: "planning",
+            requireInitialRootRun: true,
+            events: noGraphEvents,
+            effects: [],
+          }),
+        ] as const,
+        { concurrency: "unbounded" },
+      );
+
+      const graphWon = Exit.isSuccess(graphExit);
+      assert.equal(Number(graphWon) + Number(noGraphResult.committed), 1);
+      const detail = yield* goalStore.getDetail(goalId);
+      if (graphWon) {
+        assert.isTrue(noGraphResult.stale);
+        assert.equal(detail.goal.status, "running");
+        assert.equal(detail.goal.currentGraphVersionId, graphId);
+        assert.lengthOf(detail.failures, 0);
+      } else {
+        assert.isTrue(noGraphResult.committed);
+        assert.equal(detail.goal.status, "blocked");
+        assert.isNull(detail.goal.currentGraphVersionId);
+        assert.lengthOf(detail.failures, 1);
+      }
+      const verification = yield* ProjectionMaintenanceV2.pipe(
+        Effect.flatMap((maintenance) => maintenance.verify),
+      );
+      assert.isTrue(verification.valid);
+    }),
+  );
+
   it.effect("rebuilds goal projections and detects unreadable goal state", () =>
     Effect.gen(function* () {
       const eventSink = yield* EventSinkV2;
@@ -192,75 +560,21 @@ it.layer(TestLayer)("orchestration V2 foundation persistence", (it) => {
       assert.isTrue((yield* maintenance.rebuild).valid);
       assert.equal((yield* goalStore.getDetail(goalId)).goal.id, goalId);
 
-      const graphId = GoalGraphVersionId.make("graph:foundation-rebuild");
-      const makeGoalNode = (id: string) => ({
-        id: GoalNodeId.make(id),
-        role: id,
-        persona: id,
-        objective: id,
-        successCriteria: ["done"],
-        contextPacket: {
-          schemaVersion: 1,
-          digest: null,
-          objective: id,
-          artifacts: [],
-          dependencyOutputs: [],
-          notes: [],
-        },
-        outputContract: {
-          kind: "structured_result" as const,
-          description: "result",
-          requiredFields: [],
-        },
-        requiredCapabilities: ["tools"],
-        workspaceMode: "read_only" as const,
-        routingRequest: {
-          type: "requirements" as const,
-          capabilities: ["tools"],
-          latencyClass: "standard" as const,
-          costClass: "standard" as const,
-        },
-        evidenceRequirements: [],
-        policy: {
-          sandboxMode: "read-only" as const,
-          approvalPolicy: "on-request" as const,
-          writableRoots: [],
-          providerAllowlist: ["codex"],
-          toolAllowlist: ["shell"],
-        },
+      const {
+        graph,
+        writer: firstNode,
+        verifier: secondNode,
+        edge,
+      } = makeCompletionGraph({
+        goalId,
+        rootThreadId: threadId,
+        graphId: "graph:foundation-rebuild",
+        writerId: "node:foundation-rebuild:first",
+        verifierId: "node:foundation-rebuild:second",
+        edgeId: "edge:foundation-rebuild",
+        createdAt: timestamp,
       });
-      const firstNode = {
-        ...makeGoalNode("node:foundation-rebuild:first"),
-        workspaceMode: "writer" as const,
-        outputContract: {
-          kind: "commit" as const,
-          description: "commit",
-          requiredFields: [],
-        },
-        policy: {
-          sandboxMode: "workspace-write" as const,
-          approvalPolicy: "on-request" as const,
-          writableRoots: ["/workspace"],
-          providerAllowlist: ["codex"],
-          toolAllowlist: ["shell"],
-        },
-      };
-      const secondNode = {
-        ...makeGoalNode("node:foundation-rebuild:second"),
-        outputContract: {
-          kind: "verification" as const,
-          description: "verification",
-          requiredFields: ["verdict"],
-        },
-        evidenceRequirements: [
-          { kind: "command" as const, description: "test log", required: true },
-        ],
-      };
-      const edge = {
-        id: GoalEdgeId.make("edge:foundation-rebuild"),
-        fromNodeId: firstNode.id,
-        toNodeId: secondNode.id,
-      };
+      const graphId = graph.id;
       const attemptId = GoalAttemptId.make("attempt:foundation-rebuild");
       yield* eventSink.write({
         events: [
@@ -273,15 +587,7 @@ it.layer(TestLayer)("orchestration V2 foundation persistence", (it) => {
               goalId,
               expectedRevision: 0,
               expectedStatus: "planning",
-              graph: {
-                id: graphId,
-                goalId,
-                revision: 1,
-                publishedByNodeId: canonicalGoalLeadPublisherId(threadId),
-                nodes: [firstNode, secondNode],
-                edges: [edge],
-                createdAt: timestamp,
-              },
+              graph,
               activatedAt: timestamp,
             },
           },

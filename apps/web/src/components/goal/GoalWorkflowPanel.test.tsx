@@ -5,6 +5,42 @@ import { describe, expect, it } from "vite-plus/test";
 import { GoalWorkflowPanel } from "./GoalWorkflowPanel";
 
 describe("GoalWorkflowPanel", () => {
+  it("explains a recoverable revision-zero root lead no-graph failure", () => {
+    const detail = {
+      goal: {
+        id: "goal:no-graph",
+        objective: "Publish a worker graph",
+        status: "blocked",
+        currentRevision: 0,
+        currentGraphVersionId: null,
+        integrationSha: "abcdef1234567890",
+        verifiedSha: null,
+      },
+      nodes: [],
+      attempts: [],
+      writerCommits: [],
+      evidence: [],
+      failures: [
+        {
+          id: "failure:no-graph",
+          reason: {
+            type: "root_lead_no_graph",
+            runId: "run:root",
+            terminalStatus: "failed",
+            detail: "Provider exited before the graph call completed.",
+          },
+        },
+      ],
+    } as unknown as GoalDetail;
+
+    const markup = renderToStaticMarkup(<GoalWorkflowPanel detail={detail} />);
+    expect(markup).toContain("lead ended before publishing a worker graph");
+    expect(markup).toContain("Provider exited before the graph call completed.");
+    expect(markup).toContain("corrective message");
+    expect(markup).toContain("Queue or Steer");
+    expect(markup).toContain("resumes automatically");
+  });
+
   it("renders authoritative revision, role, route, blocker, and evidence state", () => {
     const detail = {
       goal: {

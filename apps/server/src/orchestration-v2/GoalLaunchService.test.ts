@@ -4,8 +4,11 @@ import { GoalId } from "@t3tools/contracts";
 import {
   GOAL_ROOT_LEAD_RUNTIME_MODE,
   buildGoalSourceHandoff,
+  goalRootLaunchClaimId,
   goalPendingLaunchClaimIsCurrent,
   goalRootLeadWorkspaceBindingError,
+  findRunForInitialMessage,
+  initialRootMessageId,
   makeGoalLaunchCoordinator,
   shouldFinalizeGoalAfterEvent,
   sourceRunIsSettled,
@@ -74,6 +77,23 @@ describe("goal source handoff", () => {
 });
 
 describe("GoalLaunchService settlement gate", () => {
+  it("uses a stable root message identity and selects its exact run", () => {
+    const goalId = GoalId.make("goal:exact-root-run");
+    const messageId = initialRootMessageId(goalId);
+    expect(messageId).toBe("goal-root-message:goal:exact-root-run");
+    expect(goalRootLaunchClaimId(goalId)).toBe("goal-root-launch:goal:exact-root-run");
+    expect(
+      findRunForInitialMessage(
+        [
+          { id: "run:older", userMessageId: messageId },
+          { id: "run:unrelated-latest", userMessageId: "message:unrelated" },
+        ],
+        messageId,
+      )?.id,
+    ).toBe("run:older");
+    expect(findRunForInitialMessage([], messageId)).toBeUndefined();
+  });
+
   it("recognizes a captured run that settled before startup rescan", () => {
     expect(sourceRunIsSettled("run:source", [{ id: "run:source", status: "completed" }])).toBe(
       true,

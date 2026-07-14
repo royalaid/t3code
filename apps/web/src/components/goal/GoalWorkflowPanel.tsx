@@ -24,6 +24,12 @@ export function GoalWorkflowPanel({ detail }: { readonly detail: GoalDetail }) {
     (evidence) =>
       evidence.verdict === "accepted" && evidence.integrationSha === detail.goal.integrationSha,
   );
+  const rootLeadNoGraphFailure =
+    detail.goal.status === "blocked" &&
+    detail.goal.currentRevision === 0 &&
+    detail.goal.currentGraphVersionId === null
+      ? (detail.failures ?? []).findLast((failure) => failure.reason.type === "root_lead_no_graph")
+      : undefined;
   const usage = detail.attempts.reduce(
     (total, attempt) => ({
       input: total.input + (attempt.usage.inputTokens ?? 0),
@@ -71,6 +77,29 @@ export function GoalWorkflowPanel({ detail }: { readonly detail: GoalDetail }) {
           </div>
         </dl>
       </header>
+
+      {rootLeadNoGraphFailure?.reason.type === "root_lead_no_graph" ? (
+        <section
+          className="my-4 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs"
+          aria-label="Root lead recovery"
+        >
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+            <div>
+              <p className="font-semibold text-amber-900 dark:text-amber-100">
+                The root lead ended before publishing a worker graph.
+              </p>
+              <p className="mt-1 leading-relaxed text-amber-800 dark:text-amber-200">
+                {rootLeadNoGraphFailure.reason.detail}
+              </p>
+              <p className="mt-2 leading-relaxed text-muted-foreground">
+                Send a corrective message in the root thread. Queue or Steer remain available, and
+                the goal resumes automatically when the lead publishes a valid graph.
+              </p>
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       <section className="py-4" aria-labelledby="goal-nodes-heading">
         <div className="mb-2 flex items-center justify-between">

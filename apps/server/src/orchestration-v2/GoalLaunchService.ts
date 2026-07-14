@@ -2,6 +2,8 @@ import {
   type ChatAttachment,
   CommandId,
   type GoalDetail,
+  type GoalId,
+  MessageId,
   type OrchestrationV2StoredEvent,
   type RunId,
 } from "@t3tools/contracts";
@@ -32,6 +34,21 @@ type SettlementEvent = {
 };
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "interrupted", "rolled_back"]);
+
+export function initialRootMessageId(goalId: GoalId): MessageId {
+  return MessageId.make(`goal-root-message:${goalId}`);
+}
+
+export function goalRootLaunchClaimId(goalId: GoalId): string {
+  return `goal-root-launch:${goalId}`;
+}
+
+export function findRunForInitialMessage<T extends { readonly userMessageId: MessageId | string }>(
+  runs: ReadonlyArray<T>,
+  messageId: MessageId,
+): T | undefined {
+  return runs.find((run) => run.userMessageId === messageId);
+}
 
 /**
  * The root lead only plans and steers the durable workflow. Keep its provider
@@ -207,7 +224,7 @@ export const layer = Layer.effect(
       if (current.goal.status === "cancelled" || current.goal.status === "failed") return;
       const input = current.goal.sourceInput;
       if (input === undefined) return;
-      const claimId = `goal-root-launch:${current.goal.id}`;
+      const claimId = goalRootLaunchClaimId(current.goal.id);
       if (current.goal.status === "waiting_for_source") {
         yield* threads.dispatch({
           type: "goal.pending-launch.claim",
@@ -293,8 +310,9 @@ export const layer = Layer.effect(
       // message dispatch. This pre-flight check avoids even scheduling that
       // launch if Cancel Goal won while the read-only workspace was prepared.
       if (!(yield* claimStillCurrent())) return;
-      yield* launches.launch({
-        commandId: CommandId.make(`goal-root-launch:${current.goal.id}`),
+      const rootMessageId = initialRootMessageId(current.goal.id);
+      const launch = yield* launches.launch({
+        commandId: CommandId.make(goalRootLaunchClaimId(current.goal.id)),
         threadId: current.goal.rootThreadId,
         reuseExistingThread: true,
         projectId:
@@ -313,6 +331,7 @@ export const layer = Layer.effect(
           branch: rootLeadWorkspace.branch,
         },
         initialMessage: {
+          messageId: rootMessageId,
           text: prompts.userMessage,
           attachments: handoff.attachments,
           trustedInstructions: prompts.trustedInstructions,
@@ -321,6 +340,12 @@ export const layer = Layer.effect(
         createdBy: "system",
         creationSource: "server",
       });
+      const initialRootRun = findRunForInitialMessage(launch.projection.runs, rootMessageId);
+      if (initialRootRun === undefined) {
+        return yield* Effect.die(
+          `Goal root launch did not return the run for initial message ${rootMessageId}.`,
+        );
+      }
       if (!(yield* claimStillCurrent())) return;
       yield* threads.dispatch({
         type: "goal.pending-launch.complete",
@@ -329,6 +354,7 @@ export const layer = Layer.effect(
         goalId: current.goal.id,
         handoff,
         claimId,
+        initialRootRunId: initialRootRun.id,
       });
     });
 
@@ -355,7 +381,7 @@ export const layer = Layer.effect(
                     commandId: CommandId.make(`goal-pending-launch-fail:${detail.goal.id}`),
                     threadId: detail.goal.rootThreadId,
                     goalId: detail.goal.id,
-                    claimId: `goal-root-launch:${detail.goal.id}`,
+                    claimId: goalRootLaunchClaimId(detail.goal.id),
                     detail: String(cause).slice(0, 4_000),
                   })
                   .pipe(
