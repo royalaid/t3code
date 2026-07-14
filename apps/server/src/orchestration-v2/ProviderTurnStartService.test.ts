@@ -20,6 +20,7 @@ import {
   resolveGoalAttemptRuntimePolicy,
 } from "./ProviderTurnStartService.ts";
 import { ProviderAdapterV2RuntimePolicy } from "./ProviderAdapter.ts";
+import { goalWorkspaceAuthorityRoot } from "./RuntimePolicy.ts";
 
 const goalId = GoalId.make("goal:provider-runtime-policy");
 const graphVersionId = GoalGraphVersionId.make("goal-graph:provider-runtime-policy");
@@ -28,27 +29,35 @@ const attemptId = GoalAttemptId.make("goal-attempt:provider-runtime-policy");
 const threadId = ThreadId.make("goal-worker:provider-runtime-policy");
 const runId = RunId.make("run:provider-runtime-policy");
 const providerInstanceId = ProviderInstanceId.make("codex");
+const workspacePath = "/repo/.t3/goals/worker";
+const workspaceAuthorityRoot = goalWorkspaceAuthorityRoot(goalId);
 
 const rootPolicy = {
   sandboxMode: "workspace-write" as const,
   approvalPolicy: "on-request" as const,
-  writableRoots: ["/repo"],
+  writableRoots: [workspaceAuthorityRoot, "/repo"],
   providerAllowlist: ["codex"],
   toolAllowlist: ["*"],
 };
 const untrustedWriterPolicy = {
   sandboxMode: "workspace-write" as const,
   approvalPolicy: "untrusted" as const,
-  writableRoots: ["/repo/packages/goal"],
+  writableRoots: [workspaceAuthorityRoot],
   providerAllowlist: ["codex"],
   toolAllowlist: ["*"],
 };
 
-function goalDetail(input: { readonly activeAttemptId?: typeof attemptId | null }): GoalDetail {
+function goalDetail(input: {
+  readonly activeAttemptId?: typeof attemptId | null;
+  readonly workspacePath?: string | null;
+}): GoalDetail {
   return {
     goal: {
       id: goalId,
       rootThreadId: ThreadId.make("goal-root:provider-runtime-policy"),
+      repositoryRoot: "/repo",
+      sourceWorkspacePath: "/repo/source",
+      integrationWorktreePath: "/repo/.t3/goals/integration",
       policy: rootPolicy,
     },
     attempts: [
@@ -61,6 +70,7 @@ function goalDetail(input: { readonly activeAttemptId?: typeof attemptId | null 
         providerSessionId: null,
         executionThreadId: threadId,
         runId,
+        workspacePath: input.workspacePath === undefined ? workspacePath : input.workspacePath,
         resolvedRoute: {
           requested: {
             type: "exact",
@@ -109,7 +119,7 @@ const run = { id: runId, modelSelection: { instanceId: providerInstanceId, model
 const inherited = ProviderAdapterV2RuntimePolicy.make({
   runtimeMode: "auto-accept-edits",
   interactionMode: "default",
-  cwd: "/repo/.t3/goals/worker",
+  cwd: workspacePath,
 });
 
 it.effect("starts a goal worker with its active node's narrowed provider policy", () =>
@@ -125,9 +135,25 @@ it.effect("starts a goal worker with its active node's narrowed provider policy"
     assert.equal(resolved.approvalPolicy, "untrusted");
     assert.deepEqual(resolved.sandboxPolicy, {
       type: "workspaceWrite",
-      writableRoots: ["/repo/packages/goal"],
+      writableRoots: [workspacePath],
     });
+    assert.equal(resolved.cwd, workspacePath);
     assert.deepEqual(resolved.toolAllowlist, ["*"]);
+  }),
+);
+
+it.effect("refuses to start a writer without its durable isolated workspace", () =>
+  Effect.gen(function* () {
+    const exit = yield* Effect.exit(
+      resolveGoalAttemptRuntimePolicy({
+        goals: goals(goalDetail({ workspacePath: null })),
+        threadId,
+        run,
+        inherited,
+      }),
+    );
+
+    assert.equal(exit._tag, "Failure");
   }),
 );
 

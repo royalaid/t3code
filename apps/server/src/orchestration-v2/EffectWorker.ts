@@ -31,9 +31,9 @@ export class OrchestrationEffectExecutionError extends Schema.TaggedErrorClass<O
 const isOrchestrationEffectExecutionError = Schema.is(OrchestrationEffectExecutionError);
 
 /**
- * A provider-start effect normally retries infrastructure failures. A rejected
- * restricted tool allowlist is durable policy state, not infrastructure, so
- * fail it once with a structured outbox error for lead recovery.
+ * A provider-start effect normally retries infrastructure failures. A goal
+ * policy rejection is durable state, not infrastructure, so fail it once with
+ * a structured outbox error for lead recovery.
  */
 export function terminalGoalPolicyFailureForEffectCause(cause: Cause.Cause<unknown>) {
   for (const reason of cause.reasons) {

@@ -109,21 +109,28 @@ function resolveGoalWorkerRuntimePolicyFromContext(input: {
   if (input.context === null) return Effect.succeed(input.inherited);
   return resolveGoalWorkerRuntimePolicy({
     inherited: input.inherited,
+    goalId: input.context.detail.goal.id,
     rootPolicy: input.context.detail.goal.policy,
     nodePolicy: input.context.node.node.policy,
     workspaceMode: input.context.node.node.workspaceMode,
+    workspacePath: input.context.attempt.workspacePath,
+    prohibitedWorkspacePaths: [
+      input.context.detail.goal.repositoryRoot,
+      input.context.detail.goal.sourceWorkspacePath,
+      input.context.detail.goal.integrationWorktreePath,
+    ].filter((path): path is string => path !== undefined && path !== null),
     providerInstanceId: input.run.modelSelection.instanceId,
   }).pipe(Effect.mapError(providerTurnStartError(input.run.id)));
 }
 
-/** Returns the policy rejection that must terminalize its durable launch effect. */
+/** Returns deterministic policy rejection that must terminalize its durable launch effect. */
 export function terminalGoalPolicyFailureForProviderTurnStart(
   cause: unknown,
 ): GoalRuntimePolicyResolveError | undefined {
   if (!isProviderTurnStartError(cause) || !isGoalRuntimePolicyResolveError(cause.cause)) {
     return undefined;
   }
-  return cause.cause.reason === "tool_allowlist_unsupported" ? cause.cause : undefined;
+  return cause.cause;
 }
 
 /**

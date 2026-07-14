@@ -1,4 +1,5 @@
 import {
+  type GoalId,
   type GoalWorkflowPolicy,
   type GoalGraphNode,
   ModelSelection,
@@ -100,6 +101,8 @@ const subsetOf = (child: ReadonlyArray<string>, parent: ReadonlyArray<string>) =
   parent.includes("*") || child.every((value) => parent.includes(value));
 const writableRootsNarrow = (child: ReadonlyArray<string>, parent: ReadonlyArray<string>) =>
   child.every((root) => parent.some((allowed) => rootContains(allowed, root)));
+const rootsEqual = (left: string, right: string) =>
+  rootContains(left, right) && rootContains(right, left);
 const intersectToolAllowlist = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) => {
   if (left.includes("*")) return [...right];
   if (right.includes("*")) return [...left];
@@ -202,11 +205,22 @@ function goalRuntimePolicyFailure(
   });
 }
 
+export function goalWorkspaceAuthorityRoot(goalId: GoalId): string {
+  return `goal-workspace://${goalId}`;
+}
+
+function requireGoalWorkerPath(value: string | null | undefined, detail: string): string {
+  return value ?? goalRuntimePolicyFailure("workspace_policy_mismatch", detail);
+}
+
 export interface GoalWorkerRuntimePolicyInput {
   readonly inherited: ProviderAdapterV2RuntimePolicyType;
+  readonly goalId: GoalId;
   readonly rootPolicy: GoalWorkflowPolicy;
   readonly nodePolicy: GoalWorkflowPolicy;
   readonly workspaceMode: GoalGraphNode["workspaceMode"];
+  readonly workspacePath: string | null;
+  readonly prohibitedWorkspacePaths: ReadonlyArray<string>;
   readonly providerInstanceId: ProviderInstanceId;
 }
 
@@ -268,6 +282,43 @@ export function resolveGoalWorkerRuntimePolicy(
         );
       }
 
+      const workspacePath = requireGoalWorkerPath(
+        input.workspacePath,
+        "Goal worker attempt has no concrete isolated workspace binding.",
+      );
+      const inheritedCwd = requireGoalWorkerPath(
+        inherited.cwd,
+        "Goal worker thread has no concrete workspace cwd.",
+      );
+      if (!rootsEqual(inheritedCwd, workspacePath)) {
+        return goalRuntimePolicyFailure(
+          "workspace_policy_mismatch",
+          "Goal worker thread cwd does not match its durable attempt workspace.",
+        );
+      }
+
+      const workspaceAuthorityRoot = goalWorkspaceAuthorityRoot(input.goalId);
+      if (
+        input.workspaceMode === "writer" &&
+        (nodePolicy.writableRoots.length !== 1 ||
+          nodePolicy.writableRoots[0] !== workspaceAuthorityRoot ||
+          !rootPolicy.writableRoots.includes(workspaceAuthorityRoot))
+      ) {
+        return goalRuntimePolicyFailure(
+          "workspace_policy_mismatch",
+          "Writer policy must contain only the goal's logical workspace authority root.",
+        );
+      }
+      if (
+        input.workspaceMode === "writer" &&
+        input.prohibitedWorkspacePaths.some((path) => rootsEqual(path, workspacePath))
+      ) {
+        return goalRuntimePolicyFailure(
+          "workspace_policy_mismatch",
+          "Writer attempt workspace resolves to a source or server-reserved checkout.",
+        );
+      }
+
       const sandboxMode =
         sandboxRank[inheritedSandboxMode(inherited)] < sandboxRank[nodePolicy.sandboxMode]
           ? inheritedSandboxMode(inherited)
@@ -276,13 +327,26 @@ export function resolveGoalWorkerRuntimePolicy(
         approvalRank[inheritedApprovalPolicy(inherited)] < approvalRank[nodePolicy.approvalPolicy]
           ? inheritedApprovalPolicy(inherited)
           : nodePolicy.approvalPolicy;
+      if (input.workspaceMode === "writer" && sandboxMode !== "workspace-write") {
+        return goalRuntimePolicyFailure(
+          "workspace_policy_mismatch",
+          "Inherited provider policy removes the writer attempt's isolated workspace authority.",
+        );
+      }
       const inheritedRoots = inheritedWritableRoots(inherited);
+      const concreteNodeRoots = input.workspaceMode === "writer" ? [workspacePath] : [];
       const writableRoots =
         sandboxMode === "workspace-write"
           ? inheritedRoots === undefined
-            ? nodePolicy.writableRoots
-            : intersectWritableRoots(nodePolicy.writableRoots, inheritedRoots)
+            ? concreteNodeRoots
+            : intersectWritableRoots(concreteNodeRoots, inheritedRoots)
           : [];
+      if (input.workspaceMode === "writer" && writableRoots.length !== 1) {
+        return goalRuntimePolicyFailure(
+          "workspace_policy_mismatch",
+          "Inherited provider writable roots do not contain the isolated attempt workspace.",
+        );
+      }
       const toolAllowlist =
         inherited.toolAllowlist === undefined
           ? nodePolicy.toolAllowlist
@@ -290,6 +354,7 @@ export function resolveGoalWorkerRuntimePolicy(
 
       return ProviderAdapterV2RuntimePolicy.make({
         ...inherited,
+        cwd: workspacePath,
         runtimeMode: runtimeModeForGoalPolicy(sandboxMode, approvalPolicy),
         approvalPolicy,
         sandboxPolicy: providerSandboxPolicy(sandboxMode, writableRoots),

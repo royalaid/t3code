@@ -49,7 +49,7 @@ it("limits goal attempt infrastructure launch to one retry", () => {
   assert.equal(orchestrationEffectAttemptLimit("provider-turn.start", 5), 5);
 });
 
-it("terminalizes a restricted goal tool policy without retrying its provider start", () => {
+it("terminalizes deterministic goal policy failures without retrying provider start", () => {
   const policyFailure = new GoalRuntimePolicyResolveError({
     reason: "tool_allowlist_unsupported",
     detail: "Restricted goal tool allowlists require an adapter-native enforcement mapping.",
@@ -92,6 +92,21 @@ it("terminalizes a restricted goal tool policy without retrying its provider sta
     ),
   );
   assert.equal(genericFailure, undefined);
+
+  const workspaceFailure = new GoalRuntimePolicyResolveError({
+    reason: "workspace_policy_mismatch",
+    detail: "Goal worker attempt has no concrete isolated workspace binding.",
+  });
+  const resolvedWorkspaceFailure = terminalGoalPolicyFailureForEffectCause(
+    Cause.fail(
+      new OrchestrationEffectExecutionError({
+        effectId: "effect:goal-workspace-policy",
+        effectType: "provider-turn.start",
+        cause: new ProviderTurnStartError({ runId, cause: workspaceFailure }),
+      }),
+    ),
+  );
+  assert.equal(resolvedWorkspaceFailure?.reason, "workspace_policy_mismatch");
 });
 
 function restartEffect(

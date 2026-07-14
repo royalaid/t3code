@@ -57,7 +57,7 @@ import {
 import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
-import { RuntimePolicyV2 } from "./RuntimePolicy.ts";
+import { goalWorkspaceAuthorityRoot, RuntimePolicyV2 } from "./RuntimePolicy.ts";
 import {
   makeSubagentChildThread,
   subagentResultForRun,
@@ -5512,7 +5512,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           policy: {
             ...runtimePolicy,
             writableRoots: [
-              `goal-workspace://${goalId}`,
+              goalWorkspaceAuthorityRoot(goalId),
               ...(source.thread.worktreePath === null ? [] : [source.thread.worktreePath]),
             ],
             providerAllowlist,

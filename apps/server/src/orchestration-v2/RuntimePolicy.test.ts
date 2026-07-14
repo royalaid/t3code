@@ -3,6 +3,7 @@ import {
   type ModelSelection,
   type OrchestrationV2AppThread,
   type GoalWorkflowPolicy,
+  GoalId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -16,13 +17,17 @@ import * as Option from "effect/Option";
 import * as ProjectionProjects from "../persistence/Services/ProjectionProjects.ts";
 import {
   isGoalRuntimePolicyResolveError,
+  goalWorkspaceAuthorityRoot,
   layerFromProjectRepository,
   resolveGoalWorkerRuntimePolicy,
   RuntimePolicyV2,
 } from "./RuntimePolicy.ts";
 
 const projectId = ProjectId.make("project:runtime-policy");
+const goalId = GoalId.make("goal:runtime-policy");
 const providerInstanceId = ProviderInstanceId.make("codex");
+const workspacePath = "/repo/.t3/goals/worker";
+const workspaceAuthorityRoot = goalWorkspaceAuthorityRoot(goalId);
 const modelSelection = {
   instanceId: providerInstanceId,
   model: "gpt-5.5",
@@ -31,7 +36,7 @@ const modelSelection = {
 const rootGoalPolicy = {
   sandboxMode: "danger-full-access",
   approvalPolicy: "never",
-  writableRoots: ["/repo"],
+  writableRoots: [workspaceAuthorityRoot, "/repo"],
   providerAllowlist: ["codex"],
   toolAllowlist: ["*"],
 } satisfies GoalWorkflowPolicy;
@@ -39,7 +44,7 @@ const rootGoalPolicy = {
 const writerPolicy = {
   sandboxMode: "workspace-write",
   approvalPolicy: "untrusted",
-  writableRoots: ["/repo/packages/goal"],
+  writableRoots: [workspaceAuthorityRoot],
   providerAllowlist: ["codex"],
   toolAllowlist: ["*"],
 } satisfies GoalWorkflowPolicy;
@@ -55,8 +60,14 @@ const readerPolicy = {
 const unrestrictedRuntimePolicy = {
   runtimeMode: "full-access" as const,
   interactionMode: "default" as const,
-  cwd: "/repo/.t3/goals/worker",
+  cwd: workspacePath,
 };
+
+const workerWorkspaceBinding = {
+  goalId,
+  workspacePath,
+  prohibitedWorkspacePaths: ["/repo", "/repo/.t3/goals/integration"],
+} as const;
 
 function makeThread(input: {
   readonly now: DateTime.Utc;
@@ -137,6 +148,7 @@ it.layer(TestLayer)("RuntimePolicyV2", (it) => {
   it.effect("narrows an untrusted writer instead of auto-accepting its edits", () =>
     Effect.gen(function* () {
       const resolved = yield* resolveGoalWorkerRuntimePolicy({
+        ...workerWorkspaceBinding,
         inherited: unrestrictedRuntimePolicy,
         rootPolicy: rootGoalPolicy,
         nodePolicy: writerPolicy,
@@ -148,8 +160,9 @@ it.layer(TestLayer)("RuntimePolicyV2", (it) => {
       assert.equal(resolved.approvalPolicy, "untrusted");
       assert.deepEqual(resolved.sandboxPolicy, {
         type: "workspaceWrite",
-        writableRoots: ["/repo/packages/goal"],
+        writableRoots: [workspacePath],
       });
+      assert.equal(resolved.cwd, workspacePath);
       assert.deepEqual(resolved.toolAllowlist, ["*"]);
     }),
   );
@@ -157,6 +170,7 @@ it.layer(TestLayer)("RuntimePolicyV2", (it) => {
   it.effect("keeps reader nodes read-only even under an inherited full-access thread", () =>
     Effect.gen(function* () {
       const resolved = yield* resolveGoalWorkerRuntimePolicy({
+        ...workerWorkspaceBinding,
         inherited: unrestrictedRuntimePolicy,
         rootPolicy: rootGoalPolicy,
         nodePolicy: readerPolicy,
@@ -174,6 +188,7 @@ it.layer(TestLayer)("RuntimePolicyV2", (it) => {
   it.effect("intersects inherited workspace and tool authority without broadening either", () =>
     Effect.gen(function* () {
       const resolved = yield* resolveGoalWorkerRuntimePolicy({
+        ...workerWorkspaceBinding,
         inherited: {
           ...unrestrictedRuntimePolicy,
           sandboxPolicy: { type: "workspaceWrite", writableRoots: ["/repo"] },
@@ -187,7 +202,7 @@ it.layer(TestLayer)("RuntimePolicyV2", (it) => {
 
       assert.deepEqual(resolved.sandboxPolicy, {
         type: "workspaceWrite",
-        writableRoots: ["/repo/packages/goal"],
+        writableRoots: [workspacePath],
       });
       assert.deepEqual(resolved.toolAllowlist, ["*"]);
     }),
@@ -197,10 +212,11 @@ it.layer(TestLayer)("RuntimePolicyV2", (it) => {
     Effect.gen(function* () {
       const exit = yield* Effect.exit(
         resolveGoalWorkerRuntimePolicy({
+          ...workerWorkspaceBinding,
           inherited: unrestrictedRuntimePolicy,
           rootPolicy: {
             ...writerPolicy,
-            writableRoots: ["/repo"],
+            writableRoots: [workspaceAuthorityRoot],
             toolAllowlist: ["shell"],
           },
           nodePolicy: {
@@ -222,6 +238,7 @@ it.layer(TestLayer)("RuntimePolicyV2", (it) => {
     Effect.gen(function* () {
       const exit = yield* Effect.exit(
         resolveGoalWorkerRuntimePolicy({
+          ...workerWorkspaceBinding,
           inherited: unrestrictedRuntimePolicy,
           rootPolicy: rootGoalPolicy,
           nodePolicy: { ...writerPolicy, toolAllowlist: ["shell"] },
@@ -237,6 +254,60 @@ it.layer(TestLayer)("RuntimePolicyV2", (it) => {
         if (isGoalRuntimePolicyResolveError(failure)) {
           assert.equal(failure.reason, "tool_allowlist_unsupported");
           assert.deepEqual(failure.toolAllowlist, ["shell"]);
+        }
+      }
+    }),
+  );
+
+  it.effect("rejects a writer that substitutes a filesystem path for logical goal authority", () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        resolveGoalWorkerRuntimePolicy({
+          ...workerWorkspaceBinding,
+          inherited: unrestrictedRuntimePolicy,
+          rootPolicy: rootGoalPolicy,
+          nodePolicy: { ...writerPolicy, writableRoots: ["/repo/packages/goal"] },
+          workspaceMode: "writer",
+          providerInstanceId,
+        }),
+      );
+
+      assert.equal(exit._tag, "Failure");
+      if (exit._tag === "Failure") {
+        const failure = exit.cause.reasons.find(Cause.isFailReason)?.error;
+        assert.isTrue(isGoalRuntimePolicyResolveError(failure));
+        if (isGoalRuntimePolicyResolveError(failure)) {
+          assert.equal(failure.reason, "workspace_policy_mismatch");
+        }
+      }
+    }),
+  );
+
+  it.effect("rejects missing, source, and integration worker workspace bindings", () =>
+    Effect.gen(function* () {
+      for (const candidate of [null, "/repo", "/repo/.t3/goals/integration"] as const) {
+        const exit = yield* Effect.exit(
+          resolveGoalWorkerRuntimePolicy({
+            ...workerWorkspaceBinding,
+            workspacePath: candidate,
+            inherited: {
+              ...unrestrictedRuntimePolicy,
+              ...(candidate === null ? {} : { cwd: candidate }),
+            },
+            rootPolicy: rootGoalPolicy,
+            nodePolicy: writerPolicy,
+            workspaceMode: "writer",
+            providerInstanceId,
+          }),
+        );
+
+        assert.equal(exit._tag, "Failure");
+        if (exit._tag === "Failure") {
+          const failure = exit.cause.reasons.find(Cause.isFailReason)?.error;
+          assert.isTrue(isGoalRuntimePolicyResolveError(failure));
+          if (isGoalRuntimePolicyResolveError(failure)) {
+            assert.equal(failure.reason, "workspace_policy_mismatch");
+          }
         }
       }
     }),
