@@ -1,3 +1,5 @@
+import * as NodeCrypto from "node:crypto";
+
 import {
   CommandId,
   EventId,
@@ -5,8 +7,10 @@ import {
   GoalEvidenceId,
   type GoalAttempt,
   type GoalDetail,
+  type GoalFailureRecord,
   type GoalFailureReason,
   type GoalId,
+  MessageId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2RunStatus,
   type RunId,
@@ -73,6 +77,47 @@ const ATTEMPT_ACTIVITY_EVENTS = new Set<OrchestrationV2DomainEvent["type"]>([
   "plan.updated",
 ]);
 
+export const GOAL_FAILURE_RECOVERY_MAX_ATTEMPTS = 3;
+
+const normalizeRecoveryText = (value: string): string =>
+  value
+    .toLowerCase()
+    .replace(/\b[0-9a-f]{7,64}\b/gu, "<sha>")
+    .replace(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gu, "<id>")
+    .replace(/\s+/gu, " ")
+    .trim();
+
+export function goalFailureRecoveryFingerprint(reason: GoalFailureReason): string | null {
+  const fingerprint = (() => {
+    switch (reason.type) {
+      case "stale_revision":
+        return "stale_revision";
+      case "policy_rejection":
+        return `policy_rejection:${normalizeRecoveryText(reason.detail)}`;
+      case "ambiguous_routing":
+        return `ambiguous_routing:${[...reason.unmetConstraints].sort().join("|")}`;
+      case "integration_conflict":
+        return `integration_conflict:${normalizeRecoveryText(reason.detail)}`;
+      case "stale_evidence":
+        return "stale_evidence";
+      case "root_lead_no_graph":
+        return "root_lead_no_graph";
+      case "worker_failure":
+        return `worker_failure:${normalizeRecoveryText(reason.detail)}`;
+      case "dependency_failure":
+      case "native_descendant_overage":
+      case "resource_backstop":
+      case "unsupported_queue_steer":
+      case "stale_active_run_target":
+        return null;
+    }
+  })();
+  return fingerprint === null ? null : fingerprint.slice(0, 512);
+}
+
+const recoveryFingerprintDigest = (fingerprint: string): string =>
+  NodeCrypto.createHash("sha256").update(fingerprint).digest("hex").slice(0, 20);
+
 export class GoalWorkflowServiceError extends Schema.TaggedErrorClass<GoalWorkflowServiceError>()(
   "GoalWorkflowServiceError",
   { operation: Schema.String, cause: Schema.optional(Schema.Defect()) },
@@ -121,6 +166,229 @@ export const layer = Layer.effect(
         }
         return next;
       });
+
+    const persistFailureRecovery = Effect.fn("GoalWorkflowService.persistFailureRecovery")(
+      function* (input: {
+        readonly detail: GoalDetail;
+        readonly failure: GoalFailureRecord;
+        readonly fingerprint: string;
+        readonly attemptCount: number;
+        readonly recoveryState: "retryable" | "resolved" | "terminal";
+        readonly lastCorrectiveRootRunId: RunId | null;
+        readonly blocker: string | null;
+        readonly commandSuffix: string;
+      }) {
+        const now = yield* DateTime.now;
+        const timestamp = DateTime.formatIso(now);
+        const commandId = CommandId.make(
+          `goal-failure-recovery:${input.failure.id}:${input.commandSuffix}`,
+        );
+        yield* eventSink
+          .commitCommand({
+            commandId,
+            threadId: input.detail.goal.rootThreadId,
+            commandType: "goal.failure.recovery.update",
+            acceptedAt: now,
+            events: [
+              {
+                id: EventId.make(`event:${commandId}`),
+                threadId: input.detail.goal.rootThreadId,
+                type: "goal.failure-recovery-updated",
+                payload: {
+                  goalId: input.detail.goal.id,
+                  failureId: input.failure.id,
+                  recoveryState: input.recoveryState,
+                  recovery: {
+                    fingerprint: input.fingerprint,
+                    attemptCount: input.attemptCount,
+                    maxAttempts: GOAL_FAILURE_RECOVERY_MAX_ATTEMPTS,
+                    lastCorrectiveRootRunId: input.lastCorrectiveRootRunId,
+                  },
+                  blocker: input.blocker,
+                  updatedAt: timestamp,
+                },
+                occurredAt: now,
+              },
+            ],
+            effects: [],
+          })
+          .pipe(Effect.mapError(workflowError("persist-failure-recovery")));
+      },
+    );
+
+    const recoverFailure = Effect.fn("GoalWorkflowService.recoverFailure")(function* (
+      detail: GoalDetail,
+      failure: GoalFailureRecord,
+    ) {
+      if (failure.recovery !== undefined || failure.recoveryState === "terminal") return;
+      const fingerprint = goalFailureRecoveryFingerprint(failure.reason);
+      if (fingerprint === null) return;
+      const matching = detail.failures
+        .filter((candidate) => goalFailureRecoveryFingerprint(candidate.reason) === fingerprint)
+        .toSorted((left, right) => {
+          const timeOrder = left.occurredAt.localeCompare(right.occurredAt);
+          return timeOrder === 0 ? left.id.localeCompare(right.id) : timeOrder;
+        });
+      const occurrence = matching.findIndex((candidate) => candidate.id === failure.id) + 1;
+      if (occurrence === 0) return;
+      const previousRootRunId = matching
+        .slice(0, occurrence - 1)
+        .findLast(
+          (candidate) =>
+            candidate.recovery?.lastCorrectiveRootRunId !== undefined &&
+            candidate.recovery.lastCorrectiveRootRunId !== null,
+        )?.recovery?.lastCorrectiveRootRunId;
+      if (occurrence > GOAL_FAILURE_RECOVERY_MAX_ATTEMPTS) {
+        yield* persistFailureRecovery({
+          detail,
+          failure,
+          fingerprint,
+          attemptCount: GOAL_FAILURE_RECOVERY_MAX_ATTEMPTS,
+          recoveryState: "terminal",
+          lastCorrectiveRootRunId: previousRootRunId ?? null,
+          blocker: `Automatic recovery exhausted after ${GOAL_FAILURE_RECOVERY_MAX_ATTEMPTS} corrective root runs for ${fingerprint}.`,
+          commandSuffix: "exhausted",
+        });
+        return;
+      }
+
+      const digest = recoveryFingerprintDigest(fingerprint);
+      const commandId = CommandId.make(
+        `goal-corrective-root:${detail.goal.id}:${digest}:${occurrence}`,
+      );
+      const messageId = MessageId.make(
+        `goal-corrective-root-message:${detail.goal.id}:${digest}:${occurrence}`,
+      );
+      const root = yield* threads
+        .getThreadProjection(detail.goal.rootThreadId)
+        .pipe(Effect.mapError(workflowError("read-corrective-root")));
+      yield* threads
+        .dispatch({
+          type: "message.dispatch",
+          createdBy: "system",
+          creationSource: "server",
+          commandId,
+          threadId: detail.goal.rootThreadId,
+          messageId,
+          text: `Automatic goal recovery ${occurrence}/${GOAL_FAILURE_RECOVERY_MAX_ATTEMPTS}. Re-read goal ${detail.goal.id}, inspect failure ${failure.id} (${fingerprint}), correct the durable graph or blocker, publish any required revision, and continue pursuing the goal. Do not report success until an attempt is running or the goal is terminal.`,
+          attachments: [],
+          modelSelection: root.thread.modelSelection,
+          dispatchMode: { type: "queue_after_active" },
+        })
+        .pipe(Effect.mapError(workflowError("dispatch-corrective-root")));
+      const updatedRoot = yield* threads
+        .getThreadProjection(detail.goal.rootThreadId)
+        .pipe(Effect.mapError(workflowError("read-dispatched-corrective-root")));
+      const correctiveRunId =
+        updatedRoot.runs.find((run) => run.userMessageId === messageId)?.id ?? null;
+      if (correctiveRunId === null) {
+        return yield* new GoalWorkflowServiceError({
+          operation: "locate-corrective-root-run",
+          cause: `Corrective message ${messageId} has no durable run.`,
+        });
+      }
+      yield* persistFailureRecovery({
+        detail,
+        failure,
+        fingerprint,
+        attemptCount: occurrence,
+        recoveryState: "retryable",
+        lastCorrectiveRootRunId: correctiveRunId,
+        blocker: `Automatic recovery ${occurrence}/${GOAL_FAILURE_RECOVERY_MAX_ATTEMPTS} queued in root run ${correctiveRunId}.`,
+        commandSuffix: `attempt:${occurrence}`,
+      });
+    });
+
+    const recoverFailures = Effect.gen(function* () {
+      const details = yield* goals.listNonterminal.pipe(
+        Effect.mapError(workflowError("list-nonterminal-recovery-goals")),
+      );
+      yield* Effect.forEach(
+        details,
+        (detail) =>
+          Effect.forEach(
+            detail.failures.filter(
+              (failure) =>
+                failure.recovery === undefined &&
+                failure.recoveryState !== "terminal" &&
+                goalFailureRecoveryFingerprint(failure.reason) !== null,
+            ),
+            (failure) => recoverFailure(detail, failure),
+            { concurrency: 1, discard: true },
+          ),
+        { concurrency: 1, discard: true },
+      );
+    });
+
+    const resolveFailureAudits = Effect.fn("GoalWorkflowService.resolveFailureAudits")(function* (
+      domainEvent: OrchestrationV2DomainEvent,
+    ) {
+      const resolution = (() => {
+        switch (domainEvent.type) {
+          case "goal.graph-version-activated":
+            return {
+              goalId: domainEvent.payload.goalId,
+              reasonTypes: new Set<GoalFailureReason["type"]>([
+                "stale_revision",
+                "policy_rejection",
+                "ambiguous_routing",
+                "dependency_failure",
+                "root_lead_no_graph",
+                "worker_failure",
+              ]),
+            };
+          case "goal.integration-updated":
+            return {
+              goalId: domainEvent.payload.id,
+              reasonTypes: new Set<GoalFailureReason["type"]>([
+                "integration_conflict",
+                "stale_evidence",
+              ]),
+            };
+          case "goal.evidence-submitted":
+          case "goal.verdict-recorded":
+            return {
+              goalId: domainEvent.payload.goalId,
+              reasonTypes: new Set<GoalFailureReason["type"]>(["stale_evidence"]),
+            };
+          case "goal.completed":
+            return {
+              goalId: domainEvent.payload.id,
+              reasonTypes: null,
+            };
+          default:
+            return null;
+        }
+      })();
+      if (resolution === null) return;
+      const detail = yield* goals
+        .getDetail(resolution.goalId)
+        .pipe(Effect.mapError(workflowError("read-resolved-recovery-goal")));
+      yield* Effect.forEach(
+        detail.failures.filter(
+          (failure) =>
+            failure.recoveryState !== "resolved" &&
+            failure.recoveryState !== "terminal" &&
+            (resolution.reasonTypes === null || resolution.reasonTypes.has(failure.reason.type)) &&
+            goalFailureRecoveryFingerprint(failure.reason) !== null,
+        ),
+        (failure) => {
+          const fingerprint = goalFailureRecoveryFingerprint(failure.reason);
+          if (fingerprint === null) return Effect.void;
+          return persistFailureRecovery({
+            detail,
+            failure,
+            fingerprint,
+            attemptCount: failure.recovery?.attemptCount ?? 0,
+            recoveryState: "resolved",
+            lastCorrectiveRootRunId: failure.recovery?.lastCorrectiveRootRunId ?? null,
+            blocker: null,
+            commandSuffix: `resolved:${domainEvent.id}`,
+          });
+        },
+        { concurrency: 1, discard: true },
+      );
+    });
 
     const schedule = scheduler.tick.pipe(Effect.asVoid, Effect.mapError(workflowError("schedule")));
 
@@ -316,7 +584,7 @@ export const layer = Layer.effect(
         { concurrency: 1 },
       );
     });
-    const reconcile = recover.pipe(Effect.andThen(schedule));
+    const reconcile = recover.pipe(Effect.andThen(recoverFailures), Effect.andThen(schedule));
 
     const persistRootLeadNoGraph = Effect.fn("GoalWorkflowService.persistRootLeadNoGraph")(
       function* (input: {
@@ -364,7 +632,7 @@ export const layer = Layer.effect(
                     detail: diagnostic.slice(0, 4_000),
                   },
                   recoveryState: "retryable",
-                  blocker: "Send a corrective message in the root thread.",
+                  blocker: "Automatic recovery will queue a corrective root turn.",
                   occurredAt: timestamp,
                 },
                 occurredAt: now,
@@ -631,6 +899,30 @@ export const layer = Layer.effect(
             }),
           ]
         : [];
+      const workerFailureEvents =
+        status === "failed" && !nodeCancelled && !overage
+          ? [
+              yield* makeEvent("goal.failure-recorded", {
+                id: GoalEvidenceId.make(`goal-worker-failure:${attempt.id}`),
+                goalId: detail.goal.id,
+                graphVersionId: attempt.graphVersionId,
+                nodeId: attempt.nodeId,
+                attemptId: attempt.id,
+                reason: {
+                  type: "worker_failure",
+                  detail: (updated.failureReason ?? "provider_run_failed").slice(0, 4_000),
+                },
+                recoveryState: "unresolved",
+                blocker: updated.failureReason ?? "Provider worker run failed.",
+                occurredAt: timestamp,
+              }),
+              yield* makeEvent("goal.updated", {
+                ...detail.goal,
+                status: "blocked",
+                updatedAt: timestamp,
+              }),
+            ]
+          : [];
       const committed = yield* eventSink
         .commitGoalAttemptCommand({
           commandId,
@@ -642,7 +934,7 @@ export const layer = Layer.effect(
           nodeId: attempt.nodeId,
           attemptId: attempt.id,
           expectedStatuses: [attempt.status],
-          events: [attemptEvent, ...nodeEvents, ...overageEvents],
+          events: [attemptEvent, ...nodeEvents, ...overageEvents, ...workerFailureEvents],
           effects: [],
         })
         .pipe(Effect.mapError(workflowError("persist-attempt")));
@@ -945,7 +1237,8 @@ export const layer = Layer.effect(
       .pipe(Effect.mapError(workflowError("read-live-boundary")));
     const observe = eventSink.stream({ afterSequence: liveBoundary }).pipe(
       Stream.runForEach((stored) =>
-        superviseRootLeadNoGraph(stored.event).pipe(
+        resolveFailureAudits(stored.event).pipe(
+          Effect.andThen(superviseRootLeadNoGraph(stored.event)),
           Effect.andThen(cancelGoalRuns(stored.event)),
           Effect.andThen(cancelNodeAttempt(stored.event)),
           Effect.andThen(pauseForRootControl(stored.event)),

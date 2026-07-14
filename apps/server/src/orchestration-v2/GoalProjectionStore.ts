@@ -447,6 +447,10 @@ export interface GoalProjectionStoreShape {
     ReadonlyArray<GoalDetailType>,
     GoalProjectionValidationError
   >;
+  readonly listNonterminal: Effect.Effect<
+    ReadonlyArray<GoalDetailType>,
+    GoalProjectionValidationError
+  >;
   readonly resolveMcpBinding: (threadId: ThreadId) => Effect.Effect<
     | { readonly kind: "lead"; readonly goalId: GoalId; readonly rootThreadId: ThreadId }
     | {
@@ -1220,6 +1224,7 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
             const incomingWithExistingMutable = {
               ...event.payload,
               recoveryState: existing.recoveryState,
+              ...(existing.recovery === undefined ? {} : { recovery: existing.recovery }),
               blocker: existing.blocker,
             };
             if (
@@ -1230,12 +1235,38 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
             payload = {
               ...existing,
               recoveryState: event.payload.recoveryState,
+              ...(event.payload.recovery === undefined ? {} : { recovery: event.payload.recovery }),
               blocker: event.payload.blocker,
             };
           }
           yield* sql`INSERT INTO goal_failures (failure_id, goal_id, graph_version_id, node_id, attempt_id, recovery_state, blocker, payload_json, occurred_at)
             VALUES (${payload.id}, ${payload.goalId}, ${payload.graphVersionId}, ${payload.nodeId}, ${payload.attemptId}, ${payload.recoveryState}, ${payload.blocker}, ${yield* encodeFailure(payload)}, ${payload.occurredAt})
             ON CONFLICT(failure_id) DO UPDATE SET recovery_state=excluded.recovery_state, blocker=excluded.blocker, payload_json=excluded.payload_json`;
+          return;
+        }
+        case "goal.failure-recovery-updated": {
+          const rows =
+            yield* sql<PayloadRow>`SELECT payload_json FROM goal_failures WHERE failure_id=${event.payload.failureId} AND goal_id=${event.payload.goalId} LIMIT 1`;
+          if (rows[0] === undefined)
+            return yield* new GoalProjectionValidationError({
+              reason: "referential_integrity",
+              detail: `Failure ${event.payload.failureId} does not exist for goal ${event.payload.goalId}.`,
+            });
+          const existing = yield* decodeFailure(rows[0].payload_json);
+          if (
+            existing.recovery !== undefined &&
+            existing.recovery.fingerprint !== event.payload.recovery.fingerprint
+          )
+            return yield* identityConflict("Failure recovery", event.payload.failureId);
+          const payload = {
+            ...existing,
+            recoveryState: event.payload.recoveryState,
+            recovery: event.payload.recovery,
+            blocker: event.payload.blocker,
+          };
+          yield* sql`UPDATE goal_failures
+            SET recovery_state=${payload.recoveryState}, blocker=${payload.blocker}, payload_json=${yield* encodeFailure(payload)}
+            WHERE failure_id=${payload.id}`;
           return;
         }
       }
@@ -1262,6 +1293,14 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
               )
             )
           ORDER BY created_at, goal_id`;
+      return yield* Effect.forEach(rows, (row) =>
+        decodeGoal(row.payload_json).pipe(Effect.flatMap((goal) => getDetail(goal.id))),
+      );
+    });
+    const listNonterminal = Effect.gen(function* () {
+      const rows = yield* sql<PayloadRow>`SELECT payload_json FROM goals
+        WHERE status NOT IN ('completed', 'failed', 'cancelled')
+        ORDER BY created_at, goal_id`;
       return yield* Effect.forEach(rows, (row) =>
         decodeGoal(row.payload_json).pipe(Effect.flatMap((goal) => getDetail(goal.id))),
       );
@@ -1299,6 +1338,7 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
       getDetail: (goalId) => mapStoreError(getDetail(goalId)),
       listPendingLaunches: mapStoreError(listPendingLaunches),
       listSchedulable: mapStoreError(listSchedulable),
+      listNonterminal: mapStoreError(listNonterminal),
       resolveMcpBinding: (threadId) => mapStoreError(resolveMcpBinding(threadId)),
     });
   }),

@@ -384,6 +384,16 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         assert.equal(error.reason, "invalid_revision", lifecycleStatus);
         assert.equal((yield* store.getDetail(terminalGoalId)).goal.status, lifecycleStatus);
       }
+      const nonterminalIds = new Set(
+        (yield* store.listNonterminal).map((detail) => detail.goal.id),
+      );
+      for (const lifecycleStatus of ["completed", "failed", "cancelled"] as const) {
+        assert.equal(
+          nonterminalIds.has(GoalId.make(`goal:lifecycle:${lifecycleStatus}`)),
+          false,
+          `${lifecycleStatus} goals must not be eligible for automatic recovery`,
+        );
+      }
 
       const blockedGoalId = GoalId.make("goal:lifecycle:blocked");
       const blockedRoot = ThreadId.make("thread:lifecycle:blocked");
@@ -1203,6 +1213,29 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
           blocker: "resolve conflict",
           occurredAt: "2026-07-11T00:00:05.000Z",
         },
+      });
+      const recoveryTransition = {
+        type: "goal.failure-recovery-updated" as const,
+        payload: {
+          goalId,
+          failureId: GoalEvidenceId.make("failure:1"),
+          recoveryState: "retryable" as const,
+          recovery: {
+            fingerprint: "integration_conflict:conflict",
+            attemptCount: 1,
+            maxAttempts: 3,
+            lastCorrectiveRootRunId: RunId.make("run:failure-recovery:1"),
+          },
+          blocker: "Automatic recovery 1/3 queued.",
+          updatedAt: "2026-07-11T00:00:05.500Z",
+        },
+      };
+      yield* store.apply(recoveryTransition);
+      yield* store.applyTrustedReplay(recoveryTransition);
+      assert.deepInclude((yield* store.getDetail(goalId)).failures[0], {
+        recoveryState: "retryable",
+        recovery: recoveryTransition.payload.recovery,
+        blocker: "Automatic recovery 1/3 queued.",
       });
       const artifact = {
         id: GoalArtifactId.make("artifact:records"),

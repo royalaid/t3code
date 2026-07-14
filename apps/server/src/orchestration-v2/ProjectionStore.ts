@@ -308,6 +308,7 @@ export function applyToProjection(
     case "goal.evidence-submitted":
     case "goal.verdict-recorded":
     case "goal.failure-recorded":
+    case "goal.failure-recovery-updated":
       return base;
   }
 }
@@ -1780,6 +1781,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           case "goal.evidence-submitted":
           case "goal.verdict-recorded":
           case "goal.failure-recorded":
+          case "goal.failure-recovery-updated":
             break;
         }
 

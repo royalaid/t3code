@@ -409,6 +409,10 @@ export const GoalFailureReason = Schema.Union([
   }),
   Schema.Struct({ type: Schema.Literal("dependency_failure"), dependencyNodeId: GoalNodeId }),
   Schema.Struct({
+    type: Schema.Literal("worker_failure"),
+    detail: TrimmedNonEmptyString.check(Schema.isMaxLength(4_000)),
+  }),
+  Schema.Struct({
     type: Schema.Literal("native_descendant_overage"),
     limit: PositiveInt,
     observed: PositiveInt,
@@ -440,6 +444,14 @@ export const GoalFailureReason = Schema.Union([
 ]);
 export type GoalFailureReason = typeof GoalFailureReason.Type;
 
+export const GoalFailureRecoveryMetadata = Schema.Struct({
+  fingerprint: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+  attemptCount: NonNegativeInt,
+  maxAttempts: PositiveInt,
+  lastCorrectiveRootRunId: Schema.NullOr(RunId),
+});
+export type GoalFailureRecoveryMetadata = typeof GoalFailureRecoveryMetadata.Type;
+
 export const GoalFailureRecord = Schema.Struct({
   id: GoalEvidenceId,
   goalId: GoalId,
@@ -448,9 +460,11 @@ export const GoalFailureRecord = Schema.Struct({
   attemptId: Schema.NullOr(GoalAttemptId),
   reason: GoalFailureReason,
   recoveryState: Schema.Literals(["unresolved", "retryable", "resolved", "terminal"]),
+  recovery: Schema.optionalKey(GoalFailureRecoveryMetadata),
   blocker: Schema.NullOr(Schema.String),
   occurredAt: GoalTimestamp,
 });
+export type GoalFailureRecord = typeof GoalFailureRecord.Type;
 
 const commandBase = { commandId: CommandId, threadId: ThreadId, goalId: GoalId };
 export const GoalWorkflowCommand = Schema.Union([
@@ -542,8 +556,17 @@ export const GoalFailureRecordedPayload = Schema.Struct({
   attemptId: Schema.NullOr(GoalAttemptId),
   reason: GoalFailureReason,
   recoveryState: Schema.Literals(["unresolved", "retryable", "resolved", "terminal"]),
+  recovery: Schema.optionalKey(GoalFailureRecoveryMetadata),
   blocker: Schema.NullOr(Schema.String),
   occurredAt: GoalTimestamp,
+});
+export const GoalFailureRecoveryUpdatedPayload = Schema.Struct({
+  goalId: GoalId,
+  failureId: GoalEvidenceId,
+  recoveryState: Schema.Literals(["unresolved", "retryable", "resolved", "terminal"]),
+  recovery: GoalFailureRecoveryMetadata,
+  blocker: Schema.NullOr(Schema.String),
+  updatedAt: GoalTimestamp,
 });
 export const GoalWorkflowEvent = Schema.Union([
   Schema.Struct({ type: Schema.Literal("goal.created"), payload: Goal }),
@@ -580,6 +603,10 @@ export const GoalWorkflowEvent = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("goal.failure-recorded"),
     payload: GoalFailureRecordedPayload,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("goal.failure-recovery-updated"),
+    payload: GoalFailureRecoveryUpdatedPayload,
   }),
 ]);
 export type GoalWorkflowEvent = typeof GoalWorkflowEvent.Type;

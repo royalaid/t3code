@@ -51,6 +51,7 @@ import {
   GoalEvidence,
   GoalSurface,
   GoalFailureRecordedPayload,
+  GoalFailureRecoveryUpdatedPayload,
   GoalGraphActivatedPayload,
   GoalNodeProjection,
   GoalSummary,
@@ -1157,6 +1158,11 @@ export const OrchestrationV2DomainEvent = Schema.Union([
     type: Schema.Literal("goal.failure-recorded"),
     payload: GoalFailureRecordedPayload,
   }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
+    type: Schema.Literal("goal.failure-recovery-updated"),
+    payload: GoalFailureRecoveryUpdatedPayload,
+  }),
 ]);
 export type OrchestrationV2DomainEvent = typeof OrchestrationV2DomainEvent.Type;
 
@@ -1784,6 +1790,11 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
     ...OrchestrationV2JsonEventBaseFields,
     type: Schema.Literal("goal.failure-recorded"),
     payload: GoalFailureRecordedPayload,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literal("goal.failure-recovery-updated"),
+    payload: GoalFailureRecoveryUpdatedPayload,
   }),
 ]);
 export type OrchestrationV2DomainEventJson = typeof OrchestrationV2DomainEventJson.Type;
