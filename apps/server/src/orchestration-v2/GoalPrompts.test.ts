@@ -154,6 +154,11 @@ describe("goal root prompts", () => {
     expect(trustedInstructions).toContain("goal_evidence_submit");
     expect(trustedInstructions).toContain("integration");
     expect(trustedInstructions).toContain("delegate_task");
+    expect(trustedInstructions).toContain("goal-workspace://goal:selective-graph");
+    expect(trustedInstructions).toContain("exactly that one logical authority root");
+    expect(trustedInstructions).toContain("must use an empty writableRoots array");
+    expect(trustedInstructions).toContain("Never copy a source checkout");
+    expect(trustedInstructions).toContain("graph id that includes goal:selective-graph");
   });
 });
 

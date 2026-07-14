@@ -98,6 +98,20 @@ const DEFAULT_THREAD_READ_LIMIT = 50;
 const DEFAULT_THREAD_RUN_LIMIT = 10;
 const DEFAULT_THREAD_ITEM_MAX_CHARS = 20_000;
 
+export function goalGraphIdentityIssue(goalId: GoalId, graphId: string): string | null {
+  return graphId.includes(goalId)
+    ? null
+    : `Graph id ${graphId} must include its goal id ${goalId}.`;
+}
+
+export function goalGraphMutationCommandId(
+  providerSessionId: string,
+  goalId: GoalId,
+  graphId: string,
+): CommandId {
+  return CommandId.make(`mcp:${providerSessionId}:goal:${goalId}:goal-graph:${graphId}`);
+}
+
 interface ResolvedTarget {
   readonly modelSelection: ModelSelection;
 }
@@ -987,11 +1001,17 @@ const make = Effect.gen(function* () {
         const { authority, detail } = yield* loadGoal(scope, input.goalId);
         if (authority.kind !== "goal_lead")
           return yield* failure("capability_denied", "Only the root lead may replace the graph.");
+        const identityIssue = goalGraphIdentityIssue(input.goalId, input.graph.id);
+        if (identityIssue !== null) return yield* failure("invalid_request", identityIssue);
         const publisherIssue = goalGraphPublisherIssue(input.graph, detail.goal.rootThreadId);
         if (publisherIssue !== null) return yield* failure("invalid_request", publisherIssue);
         return yield* dispatchGoalMutation(scope, {
           type: "goal.graph.replace",
-          commandId: CommandId.make(`mcp:${scope.providerSessionId}:goal-graph:${input.graph.id}`),
+          commandId: goalGraphMutationCommandId(
+            scope.providerSessionId,
+            input.goalId,
+            input.graph.id,
+          ),
           threadId: scope.threadId,
           goalId: input.goalId,
           expectedRevision: input.expectedRevision,
@@ -1038,7 +1058,7 @@ const make = Effect.gen(function* () {
         return yield* dispatchGoalMutation(scope, {
           type: "goal.node.cancel",
           commandId: CommandId.make(
-            `mcp:${scope.providerSessionId}:goal-node-cancel:${input.graphVersionId}:${input.nodeId}:${input.disposition ?? "cancelled"}`,
+            `mcp:${scope.providerSessionId}:goal:${input.goalId}:goal-node-cancel:${input.graphVersionId}:${input.nodeId}:${input.disposition ?? "cancelled"}`,
           ),
           threadId: scope.threadId,
           goalId: input.goalId,
@@ -1086,7 +1106,7 @@ const make = Effect.gen(function* () {
         return yield* dispatchGoalMutation(scope, {
           type: "goal.result.publish",
           commandId: CommandId.make(
-            `mcp:${scope.providerSessionId}:goal-result:${input.attemptId}:${publicationKey}`,
+            `mcp:${scope.providerSessionId}:goal:${input.goalId}:goal-result:${input.attemptId}:${publicationKey}`,
           ),
           threadId: authority.rootThreadId,
           goalId: input.goalId,
@@ -1141,7 +1161,7 @@ const make = Effect.gen(function* () {
         return yield* dispatchGoalMutation(scope, {
           type: "goal.evidence.publish",
           commandId: CommandId.make(
-            `mcp:${scope.providerSessionId}:goal-evidence:${input.evidence.id}`,
+            `mcp:${scope.providerSessionId}:goal:${input.goalId}:goal-evidence:${input.evidence.id}`,
           ),
           threadId: authority.rootThreadId,
           goalId: input.goalId,

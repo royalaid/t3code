@@ -69,7 +69,7 @@ export const GoalCapabilitiesTool = Tool.make("goal_capabilities", {
   .annotate(Tool.Readonly, true);
 export const GoalReplaceGraphTool = Tool.make("goal_replace_graph", {
   description:
-    "Root-lead only: atomically publish the complete next goal graph, not a patch. Use expectedRevision from the latest goal_read; if rejected as stale, re-read and reconcile a new whole-graph revision. Set graph.publishedByNodeId to the authenticated root thread ID, and use writer nodes followed by an independent read-only verifier that transitively depends on every writer.",
+    "Root-lead only: atomically publish the complete next goal graph, not a patch. Use expectedRevision from the latest goal_read; if rejected as stale, re-read and reconcile a new whole-graph revision. Use a globally unique graph.id that contains the exact goalId and revision, set graph.publishedByNodeId to the authenticated root thread ID, and use writer nodes followed by an independent read-only verifier that transitively depends on every writer.",
   parameters: GoalMcpReplaceGraphInput,
   success: GoalMcpMutationResult,
   failure: OrchestratorMcpFailure,

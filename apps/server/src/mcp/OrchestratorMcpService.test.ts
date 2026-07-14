@@ -1,10 +1,14 @@
 import { assert, it } from "@effect/vitest";
-import { CommandId } from "@t3tools/contracts";
+import { CommandId, GoalId } from "@t3tools/contracts";
 
 import { EventSinkWriteError } from "../orchestration-v2/EventSink.ts";
 import { GoalProjectionValidationError } from "../orchestration-v2/GoalProjectionStore.ts";
 import { OrchestratorDispatchError } from "../orchestration-v2/Orchestrator.ts";
-import { goalMutationFailure } from "./OrchestratorMcpService.ts";
+import {
+  goalGraphIdentityIssue,
+  goalGraphMutationCommandId,
+  goalMutationFailure,
+} from "./OrchestratorMcpService.ts";
 
 function nestedGoalError(reason: GoalProjectionValidationError["reason"], detail: string) {
   return new OrchestratorDispatchError({
@@ -28,5 +32,20 @@ it("preserves caller-correctable goal mutation error codes through wrapped failu
       code: "invalid_request",
       message: "add a terminal verifier",
     },
+  );
+});
+
+it("requires goal-scoped graph ids and goal-scopes graph mutation receipts", () => {
+  const firstGoalId = GoalId.make("goal:first");
+  const secondGoalId = GoalId.make("goal:second");
+
+  assert.equal(
+    goalGraphIdentityIssue(firstGoalId, "graph-rev-1"),
+    "Graph id graph-rev-1 must include its goal id goal:first.",
+  );
+  assert.equal(goalGraphIdentityIssue(firstGoalId, "graph:goal:first:revision:1"), null);
+  assert.notEqual(
+    goalGraphMutationCommandId("provider-session:shared", firstGoalId, "graph-rev-1"),
+    goalGraphMutationCommandId("provider-session:shared", secondGoalId, "graph-rev-1"),
   );
 });
