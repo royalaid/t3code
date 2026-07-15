@@ -36,6 +36,7 @@ import {
   type GoalRecoveryAction,
 } from "./GoalRecoveryService.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
+import { isStartupRuntimeReconciliationCommand } from "./RuntimeReconciliationCommand.ts";
 import { ThreadManagementService } from "./ThreadManagementService.ts";
 
 const ACTIVE_RUN_STATUSES = new Set(["preparing", "queued", "starting", "running", "waiting"]);
@@ -630,12 +631,6 @@ export const layer = Layer.effect(
       });
     });
 
-    const reconcile = recover.pipe(
-      Effect.andThen(recoverFailures),
-      Effect.andThen(transferTerminalGoalResults),
-      Effect.andThen(schedule),
-    );
-
     const persistRootLeadNoGraph = Effect.fn("GoalWorkflowService.persistRootLeadNoGraph")(
       function* (input: {
         readonly goal: Goal;
@@ -812,6 +807,7 @@ export const layer = Layer.effect(
 
     const updateAttempt = Effect.fn("GoalWorkflowService.updateAttempt")(function* (
       domainEvent: OrchestrationV2DomainEvent,
+      observationSource: "live" | "startup_reconciliation" = "live",
     ) {
       if (!ATTEMPT_ACTIVITY_EVENTS.has(domainEvent.type)) return;
       const binding = yield* goals
@@ -837,8 +833,11 @@ export const layer = Layer.effect(
           : domainEvent.payload.status === "completed"
             ? "succeeded"
             : domainEvent.payload.status === "cancelled" ||
-                domainEvent.payload.status === "interrupted"
-              ? "cancelled"
+                domainEvent.payload.status === "interrupted" ||
+                domainEvent.payload.status === "rolled_back"
+              ? observationSource === "startup_reconciliation"
+                ? "failed"
+                : "cancelled"
               : domainEvent.payload.status === "failed"
                 ? "failed"
                 : attempt.status;
@@ -874,7 +873,11 @@ export const layer = Layer.effect(
         leaseExpiresAt: status === "running" ? null : attempt.leaseExpiresAt,
         failureReason:
           status === "failed" && attempt.failureReason === null
-            ? "provider_run_failed"
+            ? observationSource === "startup_reconciliation" &&
+              domainEvent.type === "run.updated" &&
+              domainEvent.payload.status !== "failed"
+              ? "provider_run_lost_after_restart"
+              : "provider_run_failed"
             : attempt.failureReason,
         updatedAt: timestamp,
       };
@@ -1001,6 +1004,60 @@ export const layer = Layer.effect(
           })
           .pipe(Effect.mapError(workflowError("interrupt-overage")));
       }
+    });
+
+    const reconcileStartupTerminalAttemptRuns = Effect.gen(function* () {
+      const details = yield* goals.listNonterminal.pipe(
+        Effect.mapError(workflowError("list-terminal-attempt-run-reconciliation-goals")),
+      );
+      yield* Effect.forEach(
+        details,
+        (detail) =>
+          Effect.forEach(
+            detail.attempts.filter(
+              (attempt) =>
+                ACTIVE_ATTEMPT_STATUSES.has(attempt.status) &&
+                attempt.executionThreadId !== null &&
+                attempt.runId !== null,
+            ),
+            (attempt) =>
+              Effect.gen(function* () {
+                if (attempt.executionThreadId === null || attempt.runId === null) return;
+                const workerProjection = yield* threads
+                  .getThreadProjection(attempt.executionThreadId)
+                  .pipe(Effect.mapError(workflowError("read-terminal-attempt-run")));
+                const run = workerProjection.runs.find(
+                  (candidate) => candidate.id === attempt.runId,
+                );
+                if (run === undefined || ACTIVE_RUN_STATUSES.has(run.status)) return;
+                const now = yield* DateTime.now;
+                yield* updateAttempt(
+                  {
+                    id: EventId.make(
+                      `event:goal-attempt-run-reconcile:${attempt.id}:${run.id}:${run.status}`,
+                    ),
+                    type: "run.updated",
+                    threadId: attempt.executionThreadId,
+                    runId: run.id,
+                    providerInstanceId: run.providerInstanceId,
+                    occurredAt: now,
+                    payload: run,
+                  },
+                  "startup_reconciliation",
+                );
+              }).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Goal attempt run reconciliation failed", {
+                    goalId: detail.goal.id,
+                    attemptId: attempt.id,
+                    cause,
+                  }),
+                ),
+              ),
+            { concurrency: 1, discard: true },
+          ),
+        { concurrency: 1, discard: true },
+      );
     });
 
     const cancelNodeAttempt = Effect.fn("GoalWorkflowService.cancelNodeAttempt")(function* (
@@ -1282,6 +1339,12 @@ export const layer = Layer.effect(
         .pipe(Effect.mapError(workflowError("persist-root-control-pause")));
     });
 
+    const reconcile = recover.pipe(
+      Effect.andThen(recoverFailures),
+      Effect.andThen(transferTerminalGoalResults),
+      Effect.andThen(schedule),
+    );
+
     const liveBoundary = yield* eventSink
       .latestSequence()
       .pipe(Effect.mapError(workflowError("read-live-boundary")));
@@ -1292,7 +1355,14 @@ export const layer = Layer.effect(
           Effect.andThen(cancelGoalRuns(stored.event)),
           Effect.andThen(cancelNodeAttempt(stored.event)),
           Effect.andThen(pauseForRootControl(stored.event)),
-          Effect.andThen(updateAttempt(stored.event)),
+          Effect.andThen(
+            updateAttempt(
+              stored.event,
+              isStartupRuntimeReconciliationCommand(stored.commandId)
+                ? "startup_reconciliation"
+                : "live",
+            ),
+          ),
           Effect.andThen(stored.event.type.startsWith("goal.") ? reconcile : Effect.void),
           Effect.catchCause((cause) =>
             Effect.logError("Goal workflow event processing failed", {
@@ -1305,7 +1375,8 @@ export const layer = Layer.effect(
       ),
       Effect.catchCause((cause) => Effect.logError("Goal workflow stream failed", { cause })),
     );
-    yield* reconcile.pipe(
+    yield* reconcileStartupTerminalAttemptRuns.pipe(
+      Effect.andThen(reconcile),
       Effect.catchCause((cause) =>
         Effect.logError("Initial goal reconciliation failed", { cause }),
       ),

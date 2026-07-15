@@ -28,6 +28,7 @@ import {
   type ProviderSessionId,
   ThreadId,
 } from "@t3tools/contracts";
+import { interactiveGoalWorkerThreadIds } from "@t3tools/shared/goalAttempts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -58,6 +59,7 @@ import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
 import { goalWorkspaceAuthorityRoot, RuntimePolicyV2 } from "./RuntimePolicy.ts";
+import { isRuntimeReconciliationCommand } from "./RuntimeReconciliationCommand.ts";
 import {
   makeSubagentChildThread,
   subagentResultForRun,
@@ -4009,14 +4011,53 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) =>
     Effect.gen(function* () {
-      const projection = yield* projectionStore
+      const commandProjection = yield* projectionStore
         .getThreadProjection(command.threadId)
         .pipe(
           Effect.mapError(() => new OrchestratorProjectionError({ threadId: command.threadId })),
         );
-      const runtimeRequest = projection.runtimeRequests.find(
+      let targetThreadId = command.threadId;
+      let projection = commandProjection;
+      let runtimeRequest = projection.runtimeRequests.find(
         (candidate) => candidate.id === command.requestId,
       );
+      if (
+        runtimeRequest === undefined &&
+        commandProjection.goal !== null &&
+        commandProjection.goal !== undefined
+      ) {
+        const workerThreadIds = interactiveGoalWorkerThreadIds(commandProjection.goal.attempts);
+        const workerMatches = yield* Effect.forEach(
+          workerThreadIds,
+          (threadId) =>
+            projectionStore.getThreadProjection(threadId).pipe(
+              Effect.map((workerProjection) => {
+                const request = workerProjection.runtimeRequests.find(
+                  (candidate) => candidate.id === command.requestId,
+                );
+                return request === undefined
+                  ? null
+                  : { threadId, projection: workerProjection, request };
+              }),
+              Effect.catchTag("ProjectionStoreThreadNotFoundError", () => Effect.succeed(null)),
+              Effect.mapError(() => new OrchestratorProjectionError({ threadId })),
+            ),
+          { concurrency: "unbounded" },
+        ).pipe(Effect.map((matches) => matches.filter((match) => match !== null)));
+        if (workerMatches.length > 1) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: `Runtime request ${command.requestId} matched multiple goal worker threads.`,
+          });
+        }
+        const workerMatch = workerMatches[0];
+        if (workerMatch !== undefined) {
+          targetThreadId = workerMatch.threadId;
+          projection = workerMatch.projection;
+          runtimeRequest = workerMatch.request;
+        }
+      }
       if (runtimeRequest === undefined) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -4065,7 +4106,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : ("completed" as const);
       yield* emitEvent({
         type: "runtime-request.updated",
-        threadId: command.threadId,
+        threadId: targetThreadId,
         ...(requestNode?.runId == null ? {} : { runId: requestNode.runId }),
         nodeId: runtimeRequest.nodeId,
         driver: providerSession.driver,
@@ -4076,7 +4117,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (requestNode !== undefined) {
         yield* emitEvent({
           type: "node.updated",
-          threadId: command.threadId,
+          threadId: targetThreadId,
           ...(requestNode.runId === null ? {} : { runId: requestNode.runId }),
           nodeId: requestNode.id,
           driver: providerSession.driver,
@@ -4098,7 +4139,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (approvalTurnItem !== undefined) {
         yield* emitEvent({
           type: "turn-item.updated",
-          threadId: command.threadId,
+          threadId: targetThreadId,
           ...(approvalTurnItem.runId === null ? {} : { runId: approvalTurnItem.runId }),
           ...(approvalTurnItem.nodeId === null ? {} : { nodeId: approvalTurnItem.nodeId }),
           driver: providerSession.driver,
@@ -4117,7 +4158,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         {
           id: `effect:${command.commandId}:runtime-request.respond:${command.requestId}`,
           commandId: command.commandId,
-          threadId: command.threadId,
+          threadId: targetThreadId,
           request: {
             type: "runtime-request.respond",
             providerSessionId,
@@ -5820,7 +5861,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     Stream.filter(
       (stored) =>
         stored.event.type === "run.updated" &&
-        !String(stored.commandId).startsWith("command:runtime-reconcile:") &&
+        !isRuntimeReconciliationCommand(stored.commandId) &&
         (stored.event.payload.status === "completed" ||
           stored.event.payload.status === "interrupted" ||
           stored.event.payload.status === "failed" ||

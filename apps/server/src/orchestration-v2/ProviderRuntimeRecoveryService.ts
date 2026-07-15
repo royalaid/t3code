@@ -15,6 +15,7 @@ import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "./IdAllocator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { runtimeReconciliationCommandId } from "./RuntimeReconciliationCommand.ts";
 
 export class ProviderRuntimeRecoveryError extends Schema.TaggedErrorClass<ProviderRuntimeRecoveryError>()(
   "ProviderRuntimeRecoveryError",
@@ -105,9 +106,11 @@ export const make = Effect.gen(function* () {
       }
       const requests = projection.runtimeRequests.filter((request) => request.status === "pending");
       const detail = `Cancelled because the server ${trigger === "startup" ? "restarted" : "shut down"} before the provider work completed.`;
-      const commandId = CommandId.make(
-        `command:runtime-reconcile:${trigger}:${projection.thread.id}:${DateTime.formatIso(now)}`,
-      );
+      const commandId = runtimeReconciliationCommandId({
+        trigger,
+        threadId: projection.thread.id,
+        occurredAt: DateTime.formatIso(now),
+      });
       const allocateEventId = () =>
         ids.allocate.event({ threadId: projection.thread.id, commandId }).pipe(
           Effect.mapError(

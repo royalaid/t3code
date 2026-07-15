@@ -19,6 +19,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { EffectOutboxV2 } from "./EffectOutbox.ts";
@@ -35,6 +36,8 @@ import {
 } from "./GoalWorkflowService.ts";
 import { planUnboundGoalAttemptCancellation } from "./Orchestrator.ts";
 import { ThreadManagementService } from "./ThreadManagementService.ts";
+
+const encodeUnknownJson = Schema.encodeUnknownEffect(Schema.UnknownFromJsonString);
 
 it("normalizes recoverable blockers across runs and excludes terminal backstops", () => {
   expect(
@@ -189,6 +192,221 @@ it.effect("queues one replay-safe corrective root run and persists its recovery 
         },
       },
     });
+  }),
+);
+
+it.effect("reconciles a process-lost worker run into one durable corrective root wake", () =>
+  Effect.gen(function* () {
+    const goalId = GoalId.make("goal:restart-worker-recovery");
+    const graphVersionId = GoalGraphVersionId.make("graph:restart-worker-recovery");
+    const nodeId = GoalNodeId.make("node:restart-worker-recovery");
+    const attemptId = GoalAttemptId.make("attempt:restart-worker-recovery");
+    const rootThreadId = ThreadId.make("thread:restart-worker-recovery-root");
+    const workerThreadId = ThreadId.make("thread:restart-worker-recovery-worker");
+    const workerRunId = RunId.make("run:restart-worker-recovery-worker");
+    const correctiveRunId = RunId.make("run:restart-worker-recovery-corrective");
+    const now = "2026-07-15T00:00:00.000Z";
+    const initial = {
+      goal: {
+        id: goalId,
+        rootThreadId,
+        status: "running",
+        currentRevision: 1,
+        currentGraphVersionId: graphVersionId,
+        updatedAt: now,
+      },
+      nodes: [
+        {
+          goalId,
+          graphVersionId,
+          node: { id: nodeId },
+          status: "running",
+          activeAttemptId: attemptId,
+          blocker: null,
+          updatedAt: now,
+        },
+      ],
+      attempts: [
+        {
+          id: attemptId,
+          goalId,
+          graphVersionId,
+          nodeId,
+          status: "running",
+          executionThreadId: workerThreadId,
+          runId: workerRunId,
+          rootExecutionNodeId: null,
+          leaseExpiresAt: null,
+          usage: { nativeDescendantCount: 0 },
+          failureReason: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ],
+      failures: [],
+    } as unknown as GoalDetail;
+    const currentDetail = yield* Ref.make(initial);
+    const rootRuns = yield* Ref.make<
+      ReadonlyArray<{ readonly id: RunId; readonly userMessageId: string }>
+    >([]);
+    const commands = yield* Ref.make<ReadonlyArray<OrchestrationV2Command>>([]);
+    const attemptCommits = yield* Ref.make<ReadonlyArray<unknown>>([]);
+    const auditCommits = yield* Ref.make<ReadonlyArray<unknown>>([]);
+    const dependencies = Layer.mergeAll(
+      Layer.mock(GoalProjectionStore)({
+        listSchedulable: Effect.succeed([]),
+        listNonterminal: Ref.get(currentDetail).pipe(Effect.map((detail) => [detail])),
+        listTerminalPendingSourceResult: Effect.succeed([]),
+        getDetail: () => Ref.get(currentDetail),
+        resolveMcpBinding: (threadId) =>
+          Effect.succeed(
+            threadId === workerThreadId
+              ? { kind: "worker" as const, goalId, rootThreadId, nodeId, attemptId }
+              : threadId === rootThreadId
+                ? { kind: "lead" as const, goalId, rootThreadId }
+                : null,
+          ),
+      }),
+      Layer.mock(EventSinkV2)({
+        latestSequence: () => Effect.succeed(0),
+        stream: () => Stream.empty,
+        commitGoalAttemptCommand: (input) =>
+          Effect.gen(function* () {
+            yield* Ref.update(attemptCommits, (current) => [...current, input]);
+            const attempt = input.events.find(
+              (event) => event.type === "goal.attempt-transitioned",
+            )?.payload;
+            const node = input.events.find(
+              (event) => event.type === "goal.node-transitioned",
+            )?.payload;
+            const failure = input.events.find(
+              (event) => event.type === "goal.failure-recorded",
+            )?.payload;
+            const goal = input.events.find((event) => event.type === "goal.updated")?.payload;
+            yield* Ref.update(
+              currentDetail,
+              (detail) =>
+                ({
+                  ...detail,
+                  goal: goal ?? detail.goal,
+                  attempts: attempt === undefined ? detail.attempts : [attempt],
+                  nodes: node === undefined ? detail.nodes : [node],
+                  failures: failure === undefined ? detail.failures : [failure],
+                }) as GoalDetail,
+            );
+            return { committed: true, stale: false, storedEvents: [] } as never;
+          }),
+        commitCommand: (input) =>
+          Effect.gen(function* () {
+            yield* Ref.update(auditCommits, (current) => [...current, input]);
+            const recovery = input.events.find(
+              (event) => event.type === "goal.failure-recovery-updated",
+            );
+            if (recovery?.type === "goal.failure-recovery-updated") {
+              yield* Ref.update(currentDetail, (detail) => ({
+                ...detail,
+                failures: detail.failures.map((failure) =>
+                  failure.id === recovery.payload.failureId
+                    ? {
+                        ...failure,
+                        recoveryState: recovery.payload.recoveryState,
+                        recovery: recovery.payload.recovery,
+                        blocker: recovery.payload.blocker,
+                      }
+                    : failure,
+                ),
+              }));
+            }
+            return { committed: true } as never;
+          }),
+      }),
+      Layer.mock(EffectOutboxV2)({}),
+      Layer.succeed(
+        GoalScheduler,
+        GoalScheduler.of({
+          tick: Effect.succeed({
+            plan: { launches: [], transitions: [], warnings: [] },
+            leasedAttempts: [],
+          }),
+        }),
+      ),
+      Layer.mock(ThreadManagementService)({
+        getThreadProjection: (threadId) =>
+          threadId === workerThreadId
+            ? Effect.succeed({
+                thread: {
+                  modelSelection: {
+                    instanceId: ProviderInstanceId.make("codex"),
+                    model: "gpt-5.4",
+                  },
+                },
+                runs: [
+                  {
+                    id: workerRunId,
+                    status: "cancelled",
+                    providerInstanceId: ProviderInstanceId.make("codex"),
+                    rootNodeId: null,
+                  },
+                ],
+                subagents: [],
+              } as never)
+            : Ref.get(rootRuns).pipe(
+                Effect.map((runs) => ({
+                  thread: {
+                    modelSelection: {
+                      instanceId: ProviderInstanceId.make("codex"),
+                      model: "gpt-5.4",
+                    },
+                  },
+                  runs,
+                })) as never,
+              ),
+        dispatch: (command) =>
+          Ref.update(commands, (current) => [...current, command]).pipe(
+            Effect.andThen(
+              command.type === "message.dispatch"
+                ? Ref.set(rootRuns, [{ id: correctiveRunId, userMessageId: command.messageId }])
+                : Effect.void,
+            ),
+            Effect.as({ sequence: 1, storedEvents: [], effects: [], cancelledEffectCount: 0 }),
+          ),
+      }),
+      idAllocatorLayer,
+    );
+
+    const makeService = GoalWorkflowService.pipe(
+      Effect.provide(layer.pipe(Layer.provide(dependencies))),
+    );
+    const service = yield* makeService;
+    yield* service.reconcile;
+    yield* makeService;
+
+    expect(yield* Ref.get(attemptCommits)).toHaveLength(1);
+    const attemptCommit = (yield* Ref.get(attemptCommits))[0] as {
+      readonly events: ReadonlyArray<{ readonly type: string; readonly payload: unknown }>;
+    };
+    expect(attemptCommit.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "goal.attempt-transitioned",
+          payload: expect.objectContaining({
+            status: "failed",
+            failureReason: "provider_run_lost_after_restart",
+          }),
+        }),
+        expect.objectContaining({
+          type: "goal.failure-recorded",
+          payload: expect.objectContaining({
+            reason: {
+              type: "worker_failure",
+              detail: "provider_run_lost_after_restart",
+            },
+          }),
+        }),
+      ]),
+    );
+    expect(yield* Ref.get(commands)).toHaveLength(1);
+    expect(yield* Ref.get(auditCommits)).toHaveLength(1);
   }),
 );
 
@@ -515,7 +733,7 @@ it.effect("transfers one bounded source result for each terminal goal status", (
           },
         },
       });
-      const serialized = JSON.stringify(command?.events[0]?.payload.result);
+      const serialized = yield* encodeUnknownJson(command?.events[0]?.payload.result);
       expect(serialized).not.toContain("provider-session");
       expect(serialized).not.toContain("thread:source-result");
       expect(serialized).not.toContain("run:source-result");

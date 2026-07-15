@@ -3,13 +3,24 @@ import { assert, it } from "@effect/vitest";
 import {
   type ApplicationStoredEvent,
   CommandId,
+  EventId,
+  GoalAttemptId,
+  GoalEdgeId,
+  GoalGraphVersionId,
+  GoalId,
+  GoalNodeId,
   MessageId,
   type ModelSelection,
+  NodeId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
+  RuntimeRequestId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -31,9 +42,15 @@ import type { ProviderInstance } from "../provider/ProviderDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import { OrchestratorV2 } from "./Orchestrator.ts";
+import { layer as effectOutboxLayer, EffectOutboxV2 } from "./EffectOutbox.ts";
+import { layer as eventSinkLayer, EventSinkV2 } from "./EventSink.ts";
+import { layer as eventStoreLayer } from "./EventStore.ts";
+import { canonicalGoalLeadPublisherId } from "./GoalGraphSemantics.ts";
+import { GoalProjectionStore } from "./GoalProjectionStore.ts";
 import { OrchestrationEffectWorkerV2 } from "./EffectWorker.ts";
 import type { ProviderAdapterV2Shape } from "./ProviderAdapter.ts";
 import { OrchestrationV2LayerLive } from "./runtimeLayer.ts";
+import { layer as projectionStoreLayer } from "./ProjectionStore.ts";
 import { shellStreamItemFromSnapshot } from "./ShellStream.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import { ThreadManagementService } from "./ThreadManagementService.ts";
@@ -157,6 +174,11 @@ const SharedApplicationDataPlaneTestLayer = Layer.merge(
   Layer.provide(TestProviderInstanceRegistry),
   Layer.provide(NodeServices.layer),
 );
+
+const GoalApprovalInspectionLayer = Layer.mergeAll(
+  effectOutboxLayer,
+  eventSinkLayer.pipe(Layer.provide(Layer.merge(eventStoreLayer, projectionStoreLayer))),
+).pipe(Layer.provideMerge(SharedApplicationDataPlaneTestLayer));
 
 it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
   it.effect("creates and reads a thread through the production V2 composition", () =>
@@ -517,7 +539,302 @@ it.layer(SharedApplicationDataPlaneTestLayer)("pending provider interruption", (
   );
 });
 
-it.layer(SharedApplicationDataPlaneTestLayer)("goal launch invariants", (it) => {
+it.layer(GoalApprovalInspectionLayer)("goal launch invariants", (it) => {
+  it.effect("routes a root-owned approval response to its active goal worker", () =>
+    Effect.gen(function* () {
+      const applicationEngine = yield* OrchestrationEngineService;
+      const orchestrator = yield* OrchestratorV2;
+      const goals = yield* GoalProjectionStore;
+      const eventSink = yield* EventSinkV2;
+      const outbox = yield* EffectOutboxV2;
+      const projectId = ProjectId.make("runtime-layer-goal-approval-project");
+      const sourceThreadId = ThreadId.make("runtime-layer-goal-approval-source");
+      const rootThreadId = ThreadId.make("runtime-layer-goal-approval-root");
+      const workerThreadId = ThreadId.make("runtime-layer-goal-approval-worker");
+      const goalId = GoalId.make("goal:runtime-layer-approval");
+      const graphVersionId = GoalGraphVersionId.make("graph:runtime-layer-approval");
+      const workerNodeId = GoalNodeId.make("goal-node:runtime-layer-approval-worker");
+      const verifierNodeId = GoalNodeId.make("goal-node:runtime-layer-approval-verifier");
+      const attemptId = GoalAttemptId.make("goal-attempt:runtime-layer-approval");
+      const requestId = RuntimeRequestId.make("runtime-request:goal-worker-approval");
+      const requestNodeId = NodeId.make("node:goal-worker-approval");
+      const providerSessionId = ProviderSessionId.make("provider-session:goal-worker-approval");
+      const now = yield* DateTime.now;
+      const timestamp = DateTime.formatIso(now);
+      const policy = {
+        sandboxMode: "workspace-write" as const,
+        approvalPolicy: "on-request" as const,
+        writableRoots: [process.cwd()],
+        providerAllowlist: ["codex"],
+        toolAllowlist: ["*"],
+      };
+      const readOnlyPolicy = { ...policy, sandboxMode: "read-only" as const, writableRoots: [] };
+
+      yield* applicationEngine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("runtime-layer-goal-approval-project-create"),
+        projectId,
+        title: "Goal approval project",
+        workspaceRoot: process.cwd(),
+        defaultModelSelection: modelSelection,
+        scripts: [],
+        createdAt: timestamp,
+      });
+      for (const [threadId, title, parentThreadId] of [
+        [sourceThreadId, "Source", null],
+        [rootThreadId, "Goal root", sourceThreadId],
+        [workerThreadId, "Goal worker", rootThreadId],
+      ] as const) {
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: parentThreadId === null ? "user" : "system",
+          creationSource: parentThreadId === null ? "web" : "server",
+          commandId: CommandId.make(`runtime-layer-goal-approval-thread-create:${threadId}`),
+          threadId,
+          projectId,
+          title,
+          modelSelection,
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          branch: "main",
+          worktreePath: process.cwd(),
+          ...(parentThreadId === null ? {} : { parentThreadId }),
+        });
+      }
+
+      yield* goals.create({
+        id: goalId,
+        projectId,
+        objective: "Route worker approval through the source-owned facade",
+        status: "planning",
+        sourceThreadId,
+        rootThreadId,
+        policy,
+        currentGraphVersionId: null,
+        currentRevision: 0,
+        integrationBranch: "main",
+        integrationWorktreePath: process.cwd(),
+        integrationSha: "sha:base",
+        verifiedSha: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+      const workerNode = {
+        id: workerNodeId,
+        role: "worker",
+        persona: "implementer",
+        objective: "Request approval",
+        successCriteria: ["approval is answerable"],
+        contextPacket: {
+          schemaVersion: 1,
+          digest: null,
+          objective: "Request approval",
+          artifacts: [],
+          dependencyOutputs: [],
+          notes: [],
+        },
+        outputContract: { kind: "commit" as const, description: "commit", requiredFields: [] },
+        requiredCapabilities: [],
+        workspaceMode: "writer" as const,
+        routingRequest: {
+          type: "exact" as const,
+          providerInstanceId: modelSelection.instanceId,
+          model: modelSelection.model,
+        },
+        evidenceRequirements: [],
+        policy,
+      };
+      const verifierNode = {
+        ...workerNode,
+        id: verifierNodeId,
+        role: "verifier",
+        objective: "Verify approval routing",
+        outputContract: {
+          kind: "verification" as const,
+          description: "verification",
+          requiredFields: ["verdict"],
+        },
+        workspaceMode: "read_only" as const,
+        evidenceRequirements: [
+          { kind: "command" as const, description: "approval routing proof", required: true },
+        ],
+        policy: readOnlyPolicy,
+      };
+      yield* goals.activateGraph({
+        goalId,
+        expectedRevision: 0,
+        graph: {
+          id: graphVersionId,
+          goalId,
+          revision: 1,
+          publishedByNodeId: canonicalGoalLeadPublisherId(rootThreadId),
+          nodes: [workerNode, verifierNode],
+          edges: [
+            {
+              id: GoalEdgeId.make("goal-edge:runtime-layer-approval"),
+              fromNodeId: workerNodeId,
+              toNodeId: verifierNodeId,
+            },
+          ],
+          createdAt: timestamp,
+        },
+      });
+      yield* goals.apply({
+        type: "goal.attempt-created",
+        payload: {
+          id: attemptId,
+          goalId,
+          graphVersionId,
+          nodeId: workerNodeId,
+          ordinal: 1,
+          status: "running",
+          requestedRoute: workerNode.routingRequest,
+          resolvedRoute: null,
+          providerSessionId,
+          executionThreadId: workerThreadId,
+          runId: null,
+          rootExecutionNodeId: null,
+          baseIntegrationSha: "sha:base",
+          workspacePath: process.cwd(),
+          leaseOwner: "test",
+          leaseExpiresAt: null,
+          usage: {
+            inputTokens: null,
+            outputTokens: null,
+            cachedTokens: null,
+            costMicros: null,
+            nativeDescendantCount: 0,
+          },
+          failureReason: null,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        },
+      });
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("event:goal-worker-approval:provider-session"),
+            type: "provider-session.attached",
+            threadId: workerThreadId,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: providerSessionId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              status: "waiting",
+              cwd: process.cwd(),
+              model: modelSelection.model,
+              capabilities: CodexProviderCapabilitiesV2,
+              createdAt: now,
+              updatedAt: now,
+              lastError: null,
+            },
+          },
+          {
+            id: EventId.make("event:goal-worker-approval:node"),
+            type: "node.updated",
+            threadId: workerThreadId,
+            nodeId: requestNodeId,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: requestNodeId,
+              threadId: workerThreadId,
+              runId: null,
+              parentNodeId: null,
+              rootNodeId: requestNodeId,
+              kind: "approval_request",
+              status: "waiting",
+              countsForRun: false,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              runtimeRequestId: requestId,
+              checkpointScopeId: null,
+              startedAt: now,
+              completedAt: null,
+            },
+          },
+          {
+            id: EventId.make("event:goal-worker-approval:request"),
+            type: "runtime-request.updated",
+            threadId: workerThreadId,
+            nodeId: requestNodeId,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: requestId,
+              nodeId: requestNodeId,
+              providerTurnId: null,
+              nativeRequestRef: null,
+              kind: "command",
+              status: "pending",
+              responseCapability: { type: "live", providerSessionId },
+              createdAt: now,
+              resolvedAt: null,
+            },
+          },
+          {
+            id: EventId.make("event:goal-worker-approval:item"),
+            type: "turn-item.updated",
+            threadId: workerThreadId,
+            nodeId: requestNodeId,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make("turn-item:goal-worker-approval"),
+              threadId: workerThreadId,
+              runId: null,
+              nodeId: requestNodeId,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 1,
+              status: "waiting",
+              title: null,
+              startedAt: now,
+              completedAt: null,
+              updatedAt: now,
+              type: "approval_request",
+              requestId,
+              requestKind: "command",
+              prompt: "Allow the worker command?",
+            },
+          },
+        ],
+      });
+
+      const commandId = CommandId.make("runtime-layer-goal-worker-approval-response");
+      const result = yield* orchestrator.dispatch({
+        type: "runtime-request.respond",
+        commandId,
+        threadId: rootThreadId,
+        requestId,
+        decision: "accept",
+      });
+
+      assert.deepEqual(
+        result.storedEvents.map((stored) => stored.event.threadId),
+        [workerThreadId, workerThreadId, workerThreadId],
+      );
+      const worker = yield* orchestrator.getThreadProjection(workerThreadId);
+      assert.equal(
+        worker.runtimeRequests.find((request) => request.id === requestId)?.status,
+        "resolved",
+      );
+      const effects = yield* outbox.listByCommandId(commandId);
+      assert.lengthOf(effects, 1);
+      assert.equal(effects[0]?.threadId, workerThreadId);
+      assert.equal(effects[0]?.request.type, "runtime-request.respond");
+    }),
+  );
+
   it.effect("persists server-owned goal-root trusted instructions outside the user message", () =>
     Effect.gen(function* () {
       const applicationEngine = yield* OrchestrationEngineService;

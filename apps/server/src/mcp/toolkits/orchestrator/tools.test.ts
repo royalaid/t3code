@@ -22,7 +22,7 @@ const readTools = [
   {
     tool: GoalCapabilitiesTool,
     title: "Read goal capabilities",
-    descriptionFragments: ["authenticated role", "node scope", "route candidates"],
+    descriptionFragments: ["authenticated role", "node scope", "route groups"],
   },
   {
     tool: GoalNodeReadTool,
