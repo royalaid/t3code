@@ -29,6 +29,7 @@ import { EffectOutboxV2 } from "./EffectOutbox.ts";
 import { goalRootLaunchClaimId } from "./GoalLaunchService.ts";
 import { GoalProjectionStore } from "./GoalProjectionStore.ts";
 import { GoalScheduler } from "./GoalScheduler.ts";
+import { buildGoalSourceTerminalResult, goalSourceResultCommandId } from "./GoalSourceResult.ts";
 import {
   planGoalRecovery,
   shouldRefreshExpiredGoalLease,
@@ -584,7 +585,56 @@ export const layer = Layer.effect(
         { concurrency: 1 },
       );
     });
-    const reconcile = recover.pipe(Effect.andThen(recoverFailures), Effect.andThen(schedule));
+
+    const transferTerminalGoalResult = Effect.fn("GoalWorkflowService.transferTerminalGoalResult")(
+      function* (detail: GoalDetail) {
+        const result = buildGoalSourceTerminalResult(detail);
+        if (result === null) return;
+        const now = yield* DateTime.now;
+        const timestamp = DateTime.formatIso(now);
+        const commandId = goalSourceResultCommandId(detail);
+        yield* eventSink
+          .commitCommand({
+            commandId,
+            threadId: detail.goal.sourceThreadId,
+            commandType: "goal.source-result.transfer",
+            acceptedAt: now,
+            events: [
+              {
+                id: EventId.make(`event:${commandId}`),
+                threadId: detail.goal.sourceThreadId,
+                type: "goal.source-result-transferred",
+                payload: {
+                  goalId: detail.goal.id,
+                  sourceThreadId: detail.goal.sourceThreadId,
+                  rootThreadId: detail.goal.rootThreadId,
+                  result,
+                  transferredAt: timestamp,
+                },
+                occurredAt: now,
+              },
+            ],
+            effects: [],
+          })
+          .pipe(Effect.mapError(workflowError("transfer-terminal-source-result")));
+      },
+    );
+
+    const transferTerminalGoalResults = Effect.gen(function* () {
+      const details = yield* goals.listTerminalPendingSourceResult.pipe(
+        Effect.mapError(workflowError("list-terminal-source-result-goals")),
+      );
+      yield* Effect.forEach(details, transferTerminalGoalResult, {
+        concurrency: 1,
+        discard: true,
+      });
+    });
+
+    const reconcile = recover.pipe(
+      Effect.andThen(recoverFailures),
+      Effect.andThen(transferTerminalGoalResults),
+      Effect.andThen(schedule),
+    );
 
     const persistRootLeadNoGraph = Effect.fn("GoalWorkflowService.persistRootLeadNoGraph")(
       function* (input: {

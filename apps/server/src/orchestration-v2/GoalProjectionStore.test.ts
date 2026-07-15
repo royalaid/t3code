@@ -15,12 +15,14 @@ import {
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { canonicalGoalLeadPublisherId, goalGraphPublisherIssue } from "./GoalGraphSemantics.ts";
 import {
   GoalProjectionStore,
   GoalProjectionValidationError,
+  readGoalSurfaceBySourceThread,
   validateGoalGraph,
   layer as goalProjectionStoreLayer,
 } from "./GoalProjectionStore.ts";
@@ -228,6 +230,100 @@ it.layer(TestLayer)("GoalProjectionStore", (it) => {
         createdAt: "2026-07-11T00:00:02.000Z",
         updatedAt: "2026-07-11T00:00:02.000Z",
       });
+    }),
+  );
+
+  it.effect("projects terminal source results once while preserving source/root boundaries", () =>
+    Effect.gen(function* () {
+      const store = yield* GoalProjectionStore;
+      const sql = yield* SqlClient.SqlClient;
+      const makeGoal = (status: "completed" | "failed" | "cancelled", index: number) => ({
+        id: GoalId.make(`goal:source-result:${status}`),
+        objective: `terminal ${status}`,
+        status,
+        sourceThreadId: ThreadId.make(`thread:source-result:${index}:source`),
+        rootThreadId: ThreadId.make(`thread:source-result:${index}:root`),
+        policy,
+        currentGraphVersionId: null,
+        currentRevision: index,
+        integrationBranch: null,
+        integrationWorktreePath: null,
+        integrationSha: `sha:${status}:integration`,
+        verifiedSha: status === "completed" ? `sha:${status}:integration` : null,
+        createdAt: `2026-07-11T00:00:0${index}.000Z`,
+        updatedAt: `2026-07-11T00:01:0${index}.000Z`,
+      });
+      const makeResult = (goal: ReturnType<typeof makeGoal>) => ({
+        schemaVersion: 1 as const,
+        goalId: goal.id,
+        terminalStatus: goal.status,
+        terminalAt: goal.updatedAt,
+        objective: goal.objective,
+        currentRevision: goal.currentRevision,
+        integrationSha: goal.integrationSha,
+        verifiedSha: goal.verifiedSha,
+        summary: `Goal ${goal.status}.`,
+        failureSummaries: [],
+        artifactSummaries: [],
+      });
+      const transfer = (goal: ReturnType<typeof makeGoal>, result = makeResult(goal)) =>
+        ({
+          type: "goal.source-result-transferred" as const,
+          payload: {
+            goalId: goal.id,
+            sourceThreadId: goal.sourceThreadId,
+            rootThreadId: goal.rootThreadId,
+            result,
+            transferredAt: "2026-07-11T00:02:00.000Z",
+          },
+        }) as const;
+
+      for (const [index, status] of (["completed", "failed", "cancelled"] as const).entries()) {
+        const goal = makeGoal(status, index + 1);
+        yield* store.create(goal);
+        assert.isTrue(
+          (yield* store.listTerminalPendingSourceResult).some(
+            (detail) => detail.goal.id === goal.id,
+          ),
+          `${status} goal should be pending source result transfer`,
+        );
+
+        const event = transfer(goal);
+        yield* store.apply(event);
+        yield* store.applyTrustedReplay(event);
+
+        const detail = yield* store.getDetail(goal.id);
+        assert.deepEqual(detail.goal.sourceResult, event.payload.result);
+        assert.isFalse(
+          (yield* store.listTerminalPendingSourceResult).some(
+            (candidate) => candidate.goal.id === goal.id,
+          ),
+          `${status} goal should no longer be pending source result transfer`,
+        );
+        const surface = yield* readGoalSurfaceBySourceThread(sql, goal.sourceThreadId);
+        assert.deepEqual(surface?.episodes[0]?.sourceResult, event.payload.result);
+
+        const conflicting = yield* Effect.flip(
+          store.apply(
+            transfer(goal, {
+              ...event.payload.result,
+              summary: `Conflicting ${status} result.`,
+            }),
+          ),
+        );
+        assert.equal(conflicting.reason, "referential_integrity");
+
+        const boundaryError = yield* Effect.flip(
+          store.apply({
+            ...event,
+            payload: {
+              ...event.payload,
+              sourceThreadId: ThreadId.make(`thread:source-result:${status}:other-source`),
+            },
+          }),
+        );
+        assert.equal(boundaryError.reason, "referential_integrity");
+      }
     }),
   );
 

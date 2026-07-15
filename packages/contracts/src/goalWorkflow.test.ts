@@ -6,6 +6,7 @@ import {
   GoalEvidence,
   GoalGraphVersion,
   GoalSourceHandoff,
+  GoalSourceTerminalResult,
   GoalWorkflowCommand,
   GoalWorkflowEvent,
   GoalWorkflowPolicy,
@@ -18,6 +19,7 @@ const decodeGoalWorkflowCommand = Schema.decodeUnknownSync(GoalWorkflowCommand);
 const decodeGoalWorkflowEvent = Schema.decodeUnknownSync(GoalWorkflowEvent);
 const decodeGoalWorkflowPolicy = Schema.decodeUnknownSync(GoalWorkflowPolicy);
 const decodeGoalSourceHandoff = Schema.decodeUnknownSync(GoalSourceHandoff);
+const decodeGoalSourceTerminalResult = Schema.decodeUnknownSync(GoalSourceTerminalResult);
 
 const policy = {
   sandboxMode: "workspace-write",
@@ -272,6 +274,60 @@ describe("goal workflow contracts", () => {
     ).toThrow();
     expect(() =>
       decodeGoalSourceHandoff({ ...valid, relevantCheckpoints: Array(33).fill("checkpoint") }),
+    ).toThrow();
+  });
+
+  it("bounds terminal source results and decodes their transfer event", () => {
+    const result = {
+      schemaVersion: 1,
+      goalId: "goal:source-result",
+      terminalStatus: "failed",
+      terminalAt: "2026-07-11T00:00:05.000Z",
+      objective: "ship the source result",
+      currentRevision: 1,
+      integrationSha: "sha:integration",
+      verifiedSha: null,
+      summary: "Goal failed: provider run failed.",
+      failureSummaries: [
+        {
+          id: "failure:source-result",
+          reasonType: "worker_failure",
+          detail: "provider run failed",
+          recoveryState: "terminal",
+          blocker: "provider run failed",
+          occurredAt: "2026-07-11T00:00:04.000Z",
+        },
+      ],
+      artifactSummaries: [
+        {
+          id: "artifact:source-result-log",
+          kind: "log",
+          digest: "digest:source-result-log",
+          createdAt: "2026-07-11T00:00:03.000Z",
+        },
+      ],
+    } as const;
+    expect(decodeGoalSourceTerminalResult(result).terminalStatus).toBe("failed");
+    expect(
+      decodeGoalWorkflowEvent({
+        type: "goal.source-result-transferred",
+        payload: {
+          goalId: "goal:source-result",
+          sourceThreadId: "thread:source-result:source",
+          rootThreadId: "thread:source-result:root",
+          result,
+          transferredAt: "2026-07-11T00:00:06.000Z",
+        },
+      }).type,
+    ).toBe("goal.source-result-transferred");
+    expect(() =>
+      decodeGoalSourceTerminalResult({ ...result, summary: "x".repeat(4_001) }),
+    ).toThrow();
+    expect(() =>
+      decodeGoalSourceTerminalResult({
+        ...result,
+        artifactSummaries: Array(11).fill(result.artifactSummaries[0]),
+      }),
     ).toThrow();
   });
 

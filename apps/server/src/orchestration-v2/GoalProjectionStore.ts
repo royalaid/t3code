@@ -19,6 +19,7 @@ import {
   GoalAttemptId,
   GoalSummary,
   type GoalSurface,
+  GoalSourceTerminalResult,
   GoalWriterCommit,
   ThreadId,
   type GoalWorkflowEvent,
@@ -217,6 +218,7 @@ const encodeArtifact = Schema.encodeEffect(Schema.fromJsonString(GoalArtifact));
 const encodeEvidence = Schema.encodeEffect(Schema.fromJsonString(GoalEvidence));
 const encodeWriterCommit = Schema.encodeEffect(Schema.fromJsonString(GoalWriterCommit));
 const encodeFailure = Schema.encodeEffect(Schema.fromJsonString(GoalFailureRecord));
+const encodeSourceResult = Schema.encodeEffect(Schema.fromJsonString(GoalSourceTerminalResult));
 const decodeGoal = Schema.decodeUnknownEffect(Schema.fromJsonString(Goal));
 const decodeGraph = Schema.decodeUnknownEffect(Schema.fromJsonString(GoalGraphVersionSchema));
 const decodeNode = Schema.decodeUnknownEffect(Schema.fromJsonString(GoalNodeProjection));
@@ -297,6 +299,7 @@ export function goalSummaryFromDetail(detail: GoalDetailType): GoalSummaryType {
       detail.goal.status === "paused",
     verified:
       detail.goal.integrationSha !== null && detail.goal.verifiedSha === detail.goal.integrationSha,
+    ...(detail.goal.sourceResult === undefined ? {} : { sourceResult: detail.goal.sourceResult }),
   };
 }
 
@@ -336,6 +339,7 @@ export const readGoalSummariesByRootThread = Effect.fn("readGoalSummariesByRootT
             goal.status === "failed" ||
             goal.status === "paused",
           verified: goal.integrationSha !== null && goal.verifiedSha === goal.integrationSha,
+          ...(goal.sourceResult === undefined ? {} : { sourceResult: goal.sourceResult }),
         };
         return [ThreadId.make(row.root_thread_id), summary] as const;
       }),
@@ -369,6 +373,7 @@ const goalSurfacesFromRows = Effect.fn("GoalProjectionStore.goalSurfacesFromRows
         goal.status === "failed" ||
         goal.status === "paused",
       verified: goal.integrationSha !== null && goal.verifiedSha === goal.integrationSha,
+      ...(goal.sourceResult === undefined ? {} : { sourceResult: goal.sourceResult }),
       createdAt: goal.createdAt,
       updatedAt: goal.updatedAt,
     };
@@ -448,6 +453,10 @@ export interface GoalProjectionStoreShape {
     GoalProjectionValidationError
   >;
   readonly listNonterminal: Effect.Effect<
+    ReadonlyArray<GoalDetailType>,
+    GoalProjectionValidationError
+  >;
+  readonly listTerminalPendingSourceResult: Effect.Effect<
     ReadonlyArray<GoalDetailType>,
     GoalProjectionValidationError
   >;
@@ -569,12 +578,55 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
                 event.payload.verifiedSha === existing.integrationSha
               ? event.payload.verifiedSha
               : existing.verifiedSha,
+        sourceResult: event.type === "goal.reopened" ? null : existing.sourceResult,
         updatedAt: event.payload.updatedAt,
       } satisfies GoalType;
       const payload = yield* encodeGoal(next);
       yield* sql`UPDATE goals SET status=${next.status}, current_graph_version_id=${next.currentGraphVersionId},
         integration_sha=${next.integrationSha}, verified_sha=${next.verifiedSha}, payload_json=${payload}, updated_at=${next.updatedAt}
         WHERE goal_id=${next.id}`;
+    });
+
+    const persistSourceResult = Effect.fn("GoalProjectionStore.persistSourceResult")(function* (
+      event: Extract<GoalWorkflowEvent, { readonly type: "goal.source-result-transferred" }>,
+    ) {
+      const goal = yield* readGoal(event.payload.goalId);
+      if (
+        goal.sourceThreadId !== event.payload.sourceThreadId ||
+        goal.rootThreadId !== event.payload.rootThreadId
+      ) {
+        return yield* new GoalProjectionValidationError({
+          reason: "referential_integrity",
+          detail: `Source result transfer for ${goal.id} does not match the goal source/root boundary.`,
+        });
+      }
+      if (!TERMINAL_GOAL_STATUSES.has(goal.status)) {
+        return yield* new GoalProjectionValidationError({
+          reason: "referential_integrity",
+          detail: `Source result transfer for ${goal.id} requires a terminal goal status.`,
+        });
+      }
+      if (
+        event.payload.result.goalId !== goal.id ||
+        event.payload.result.terminalStatus !== goal.status ||
+        event.payload.result.terminalAt !== goal.updatedAt
+      ) {
+        return yield* new GoalProjectionValidationError({
+          reason: "referential_integrity",
+          detail: `Source result transfer for ${goal.id} does not match the terminal goal projection.`,
+        });
+      }
+      if (goal.sourceResult !== undefined && goal.sourceResult !== null) {
+        const [existing, incoming] = yield* Effect.all([
+          encodeSourceResult(goal.sourceResult),
+          encodeSourceResult(event.payload.result),
+        ]);
+        if (existing === incoming) return;
+        return yield* identityConflict("Source result transfer", event.payload.goalId);
+      }
+      const next = { ...goal, sourceResult: event.payload.result } satisfies GoalType;
+      const payload = yield* encodeGoal(next);
+      yield* sql`UPDATE goals SET payload_json=${payload} WHERE goal_id=${goal.id}`;
     });
 
     const requireNode = Effect.fn("GoalProjectionStore.requireNode")(function* (
@@ -860,6 +912,8 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         case "goal.integration-updated":
         case "goal.integration-conflicted":
           return yield* persistLifecycle(event);
+        case "goal.source-result-transferred":
+          return yield* persistSourceResult(event);
         case "goal.graph-version-activated":
           return yield* activateGraph(
             {
@@ -1305,6 +1359,18 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
         decodeGoal(row.payload_json).pipe(Effect.flatMap((goal) => getDetail(goal.id))),
       );
     });
+    const listTerminalPendingSourceResult = Effect.gen(function* () {
+      const rows = yield* sql<PayloadRow>`SELECT payload_json FROM goals
+        WHERE status IN ('completed', 'failed', 'cancelled')
+          AND (
+            json_type(payload_json, '$.sourceResult') IS NULL
+            OR json_type(payload_json, '$.sourceResult') = 'null'
+          )
+        ORDER BY updated_at, goal_id`;
+      return yield* Effect.forEach(rows, (row) =>
+        decodeGoal(row.payload_json).pipe(Effect.flatMap((goal) => getDetail(goal.id))),
+      );
+    });
     const resolveMcpBinding = Effect.fn("GoalProjectionStore.resolveMcpBinding")(function* (
       threadId: ThreadId,
     ) {
@@ -1339,6 +1405,7 @@ export const layer: Layer.Layer<GoalProjectionStore, never, SqlClient.SqlClient>
       listPendingLaunches: mapStoreError(listPendingLaunches),
       listSchedulable: mapStoreError(listSchedulable),
       listNonterminal: mapStoreError(listNonterminal),
+      listTerminalPendingSourceResult: mapStoreError(listTerminalPendingSourceResult),
       resolveMcpBinding: (threadId) => mapStoreError(resolveMcpBinding(threadId)),
     });
   }),

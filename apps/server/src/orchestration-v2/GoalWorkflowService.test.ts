@@ -1,10 +1,12 @@
 import {
+  GoalArtifactId,
   GoalAttemptId,
   GoalEvidenceId,
   GoalGraphVersionId,
   GoalId,
   GoalNodeId,
   ProviderInstanceId,
+  ProviderSessionId,
   RunId,
   ThreadId,
   type GoalDetail,
@@ -112,6 +114,7 @@ it.effect("queues one replay-safe corrective root run and persists its recovery 
       Layer.mock(GoalProjectionStore)({
         listSchedulable: Effect.succeed([]),
         listNonterminal: Effect.succeed([detail]),
+        listTerminalPendingSourceResult: Effect.succeed([]),
       }),
       Layer.mock(EventSinkV2)({
         latestSequence: () => Effect.succeed(0),
@@ -231,6 +234,7 @@ it.effect("terminalizes the fourth identical blocker without waking another root
       Layer.mock(GoalProjectionStore)({
         listSchedulable: Effect.succeed([]),
         listNonterminal: Effect.succeed([detail]),
+        listTerminalPendingSourceResult: Effect.succeed([]),
       }),
       Layer.mock(EventSinkV2)({
         latestSequence: () => Effect.succeed(0),
@@ -318,6 +322,7 @@ it.effect("does not duplicate an audited corrective run during restart reconcili
       Layer.mock(GoalProjectionStore)({
         listSchedulable: Effect.succeed([]),
         listNonterminal: Effect.succeed([detail]),
+        listTerminalPendingSourceResult: Effect.succeed([]),
       }),
       Layer.mock(EventSinkV2)({
         latestSequence: () => Effect.succeed(0),
@@ -350,6 +355,172 @@ it.effect("does not duplicate an audited corrective run during restart reconcili
 
     expect(yield* Ref.get(commands)).toEqual([]);
     expect(yield* Ref.get(commits)).toEqual([]);
+  }),
+);
+
+it.effect("transfers one bounded source result for each terminal goal status", () =>
+  Effect.gen(function* () {
+    const makeDetail = (status: "completed" | "failed" | "cancelled", index: number): GoalDetail =>
+      ({
+        goal: {
+          id: GoalId.make(`goal:source-result:${status}`),
+          rootThreadId: ThreadId.make(`thread:source-result:${status}:root`),
+          sourceThreadId: ThreadId.make(`thread:source-result:${status}:source`),
+          objective: `finish ${status} handback`,
+          status,
+          currentRevision: index,
+          integrationSha: `sha:${status}:integration`,
+          verifiedSha: status === "completed" ? `sha:${status}:integration` : null,
+          updatedAt: `2026-07-14T00:01:0${index}.000Z`,
+        },
+        failures:
+          status === "failed"
+            ? [
+                {
+                  id: GoalEvidenceId.make(`failure:source-result:${status}`),
+                  goalId: GoalId.make(`goal:source-result:${status}`),
+                  graphVersionId: null,
+                  nodeId: null,
+                  attemptId: null,
+                  reason: {
+                    type: "worker_failure",
+                    detail: "provider run failed with a bounded diagnostic",
+                  },
+                  recoveryState: "terminal",
+                  blocker: "provider run failed",
+                  occurredAt: `2026-07-14T00:00:0${index}.000Z`,
+                },
+              ]
+            : [],
+        artifacts: [
+          {
+            id: GoalArtifactId.make(`artifact:source-result:${status}:log`),
+            goalId: GoalId.make(`goal:source-result:${status}`),
+            nodeId: GoalNodeId.make(`node:source-result:${status}`),
+            attemptId: GoalAttemptId.make(`attempt:source-result:${status}`),
+            kind: "log",
+            uri: `provider-session-secret://${status}`,
+            digest: `digest:${status}`,
+            metadata: { providerSessionId: `provider-session:${status}:secret` },
+            createdAt: `2026-07-14T00:00:1${index}.000Z`,
+          },
+        ],
+        evidence:
+          status === "completed"
+            ? [
+                {
+                  id: GoalEvidenceId.make(`evidence:source-result:${status}`),
+                  goalId: GoalId.make(`goal:source-result:${status}`),
+                  nodeId: GoalNodeId.make(`node:source-result:${status}`),
+                  attemptId: GoalAttemptId.make(`attempt:source-result:${status}`),
+                  integrationSha: `sha:${status}:integration`,
+                  producerAttemptId: GoalAttemptId.make(`attempt:source-result:${status}:producer`),
+                  commands: [
+                    {
+                      command: "vp check",
+                      exitCode: 0,
+                      logArtifactId: GoalArtifactId.make(`artifact:source-result:${status}:log`),
+                    },
+                  ],
+                  artifacts: [GoalArtifactId.make(`artifact:source-result:${status}:log`)],
+                  verdict: "accepted",
+                  summary: "accepted",
+                  createdAt: `2026-07-14T00:00:2${index}.000Z`,
+                },
+              ]
+            : [],
+        attempts: [
+          {
+            id: GoalAttemptId.make(`attempt:source-result:${status}`),
+            providerSessionId: ProviderSessionId.make(`provider-session:${status}:secret`),
+            executionThreadId: ThreadId.make(`thread:source-result:${status}:worker`),
+            runId: RunId.make(`run:source-result:${status}:worker`),
+          },
+        ],
+        nodes: [],
+      }) as unknown as GoalDetail;
+
+    const details = (["completed", "failed", "cancelled"] as const).map((status, index) =>
+      makeDetail(status, index + 1),
+    );
+    const commits = yield* Ref.make<ReadonlyArray<unknown>>([]);
+    const dependencies = Layer.mergeAll(
+      Layer.mock(GoalProjectionStore)({
+        listSchedulable: Effect.succeed([]),
+        listNonterminal: Effect.succeed([]),
+        listTerminalPendingSourceResult: Effect.succeed(details),
+      }),
+      Layer.mock(EventSinkV2)({
+        latestSequence: () => Effect.succeed(0),
+        stream: () => Stream.empty,
+        commitCommand: (input) =>
+          Ref.update(commits, (current) => [...current, input]).pipe(
+            Effect.as({ committed: true } as never),
+          ),
+      }),
+      Layer.mock(EffectOutboxV2)({}),
+      Layer.succeed(
+        GoalScheduler,
+        GoalScheduler.of({
+          tick: Effect.succeed({
+            plan: { launches: [], transitions: [], warnings: [] },
+            leasedAttempts: [],
+          }),
+        }),
+      ),
+      Layer.mock(ThreadManagementService)({}),
+      idAllocatorLayer,
+    );
+
+    yield* GoalWorkflowService.pipe(Effect.provide(layer.pipe(Layer.provide(dependencies))));
+
+    const persisted = (yield* Ref.get(commits)) as ReadonlyArray<{
+      readonly commandId: string;
+      readonly threadId: string;
+      readonly events: ReadonlyArray<{
+        readonly threadId: string;
+        readonly type: string;
+        readonly payload: {
+          readonly sourceThreadId: string;
+          readonly rootThreadId: string;
+          readonly result: Record<string, unknown>;
+        };
+      }>;
+    }>;
+    expect(persisted).toHaveLength(3);
+    for (const detail of details) {
+      const command = persisted.find(
+        (candidate) => candidate.threadId === detail.goal.sourceThreadId,
+      );
+      expect(command?.commandId).toBe(
+        `goal-source-result:${detail.goal.id}:${detail.goal.status}:${detail.goal.updatedAt}`,
+      );
+      expect(command?.events[0]).toMatchObject({
+        threadId: detail.goal.sourceThreadId,
+        type: "goal.source-result-transferred",
+        payload: {
+          sourceThreadId: detail.goal.sourceThreadId,
+          rootThreadId: detail.goal.rootThreadId,
+          result: {
+            goalId: detail.goal.id,
+            terminalStatus: detail.goal.status,
+            terminalAt: detail.goal.updatedAt,
+            artifactSummaries: [
+              {
+                id: `artifact:source-result:${detail.goal.status}:log`,
+                kind: "log",
+                digest: `digest:${detail.goal.status}`,
+              },
+            ],
+          },
+        },
+      });
+      const serialized = JSON.stringify(command?.events[0]?.payload.result);
+      expect(serialized).not.toContain("provider-session");
+      expect(serialized).not.toContain("thread:source-result");
+      expect(serialized).not.toContain("run:source-result");
+      expect(serialized).not.toContain("provider-session-secret://");
+    }
   }),
 );
 
@@ -400,6 +571,7 @@ it.effect("resolves the recovery audit when a replacement graph activates", () =
       Layer.mock(GoalProjectionStore)({
         listSchedulable: Effect.succeed([]),
         listNonterminal: Effect.succeed([]),
+        listTerminalPendingSourceResult: Effect.succeed([]),
         getDetail: () => Effect.succeed(detail),
       }),
       Layer.mock(EventSinkV2)({
@@ -583,6 +755,7 @@ it.effect("blocks the exact initial root run from the live boundary after it ter
       Layer.mock(GoalProjectionStore)({
         listSchedulable: Effect.succeed([]),
         listNonterminal: Effect.succeed([]),
+        listTerminalPendingSourceResult: Effect.succeed([]),
         getDetail: () => Effect.succeed(detail),
         resolveMcpBinding: () => Effect.succeed({ kind: "lead" as const, goalId, rootThreadId }),
       }),
@@ -715,6 +888,7 @@ it.effect("retries terminal-before-planning and tracks a blocked root retry unti
       Layer.mock(GoalProjectionStore)({
         listSchedulable: Effect.succeed([]),
         listNonterminal: Effect.succeed([]),
+        listTerminalPendingSourceResult: Effect.succeed([]),
         getDetail: () => Ref.get(currentDetail),
         resolveMcpBinding: () => Effect.succeed({ kind: "lead" as const, goalId, rootThreadId }),
       }),
@@ -837,6 +1011,7 @@ it.effect(
         Layer.mock(GoalProjectionStore)({
           listSchedulable: Effect.succeed([]),
           listNonterminal: Effect.succeed([]),
+          listTerminalPendingSourceResult: Effect.succeed([]),
           getDetail: () => Effect.succeed(detail),
         }),
         Layer.mock(EventSinkV2)({
@@ -940,6 +1115,7 @@ it.effect("persists and interrupts a recovered native-descendant budget overage"
       Layer.mock(GoalProjectionStore)({
         listSchedulable: Effect.succeed([detail]),
         listNonterminal: Effect.succeed([]),
+        listTerminalPendingSourceResult: Effect.succeed([]),
       }),
       Layer.mock(EventSinkV2)({
         latestSequence: () => Effect.succeed(0),
@@ -1062,6 +1238,7 @@ it.effect(
         Layer.mock(GoalProjectionStore)({
           listSchedulable: Effect.succeed([]),
           listNonterminal: Effect.succeed([]),
+          listTerminalPendingSourceResult: Effect.succeed([]),
           getDetail: () => Effect.succeed(detail),
           resolveMcpBinding: (threadId) =>
             Effect.succeed(
@@ -1209,6 +1386,7 @@ it.effect("terminalizes an unbound leased attempt without creating or interrupti
       Layer.mock(GoalProjectionStore)({
         listSchedulable: Effect.succeed([]),
         listNonterminal: Effect.succeed([]),
+        listTerminalPendingSourceResult: Effect.succeed([]),
         getDetail: () => Effect.succeed(detail),
       }),
       Layer.mock(EventSinkV2)({

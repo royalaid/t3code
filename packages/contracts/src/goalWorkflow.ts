@@ -305,6 +305,43 @@ export const GoalSourceHandoff = Schema.Struct({
   relevantCheckpoints: GoalHandoffTextList(32),
 });
 
+export const GoalSourceTerminalStatus = Schema.Literals(["completed", "failed", "cancelled"]);
+export type GoalSourceTerminalStatus = typeof GoalSourceTerminalStatus.Type;
+const GoalSourceResultText = Schema.String.check(Schema.isMaxLength(4_000));
+const GoalSourceResultObjective = Schema.String.check(Schema.isMaxLength(20_000));
+const GoalSourceResultDigest = Schema.String.check(Schema.isMaxLength(512));
+const GoalSourceResultReasonType = Schema.String.check(Schema.isMaxLength(128));
+export const GoalSourceResultFailureSummary = Schema.Struct({
+  id: GoalEvidenceId,
+  reasonType: GoalSourceResultReasonType,
+  detail: GoalSourceResultText,
+  recoveryState: Schema.Literals(["unresolved", "retryable", "resolved", "terminal"]),
+  blocker: Schema.NullOr(GoalSourceResultText),
+  occurredAt: GoalTimestamp,
+});
+export type GoalSourceResultFailureSummary = typeof GoalSourceResultFailureSummary.Type;
+export const GoalSourceResultArtifactSummary = Schema.Struct({
+  id: GoalArtifactId,
+  kind: GoalArtifact.fields.kind,
+  digest: Schema.NullOr(GoalSourceResultDigest),
+  createdAt: GoalTimestamp,
+});
+export type GoalSourceResultArtifactSummary = typeof GoalSourceResultArtifactSummary.Type;
+export const GoalSourceTerminalResult = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  goalId: GoalId,
+  terminalStatus: GoalSourceTerminalStatus,
+  terminalAt: GoalTimestamp,
+  objective: GoalSourceResultObjective,
+  currentRevision: NonNegativeInt,
+  integrationSha: Schema.NullOr(GoalSourceResultDigest),
+  verifiedSha: Schema.NullOr(GoalSourceResultDigest),
+  summary: GoalSourceResultText,
+  failureSummaries: Schema.Array(GoalSourceResultFailureSummary).check(Schema.isMaxLength(5)),
+  artifactSummaries: Schema.Array(GoalSourceResultArtifactSummary).check(Schema.isMaxLength(10)),
+});
+export type GoalSourceTerminalResult = typeof GoalSourceTerminalResult.Type;
+
 export const Goal = Schema.Struct({
   id: GoalId,
   projectId: Schema.optional(ProjectId),
@@ -329,6 +366,8 @@ export const Goal = Schema.Struct({
   ),
   /** Bounded portable handoff finalized only after sourceActiveRunId settles. */
   sourceHandoff: Schema.optional(Schema.NullOr(GoalSourceHandoff)),
+  /** Bounded terminal result transferred back to the source thread exactly once. */
+  sourceResult: Schema.optional(Schema.NullOr(GoalSourceTerminalResult)),
   rootModelSelection: Schema.optional(ModelSelection),
   rootRuntimeMode: Schema.optional(RuntimeMode),
   rootInteractionMode: Schema.optional(ProviderInteractionMode),
@@ -374,6 +413,7 @@ export const GoalEpisodeSummary = Schema.Struct({
   blockedCount: NonNegativeInt,
   attentionRequired: Schema.Boolean,
   verified: Schema.Boolean,
+  sourceResult: Schema.optional(Schema.NullOr(GoalSourceTerminalResult)),
   createdAt: GoalTimestamp,
   updatedAt: GoalTimestamp,
 });
@@ -568,6 +608,13 @@ export const GoalFailureRecoveryUpdatedPayload = Schema.Struct({
   blocker: Schema.NullOr(Schema.String),
   updatedAt: GoalTimestamp,
 });
+export const GoalSourceResultTransferredPayload = Schema.Struct({
+  goalId: GoalId,
+  sourceThreadId: ThreadId,
+  rootThreadId: ThreadId,
+  result: GoalSourceTerminalResult,
+  transferredAt: GoalTimestamp,
+});
 export const GoalWorkflowEvent = Schema.Union([
   Schema.Struct({ type: Schema.Literal("goal.created"), payload: Goal }),
   Schema.Struct({
@@ -607,6 +654,10 @@ export const GoalWorkflowEvent = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("goal.failure-recovery-updated"),
     payload: GoalFailureRecoveryUpdatedPayload,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("goal.source-result-transferred"),
+    payload: GoalSourceResultTransferredPayload,
   }),
 ]);
 export type GoalWorkflowEvent = typeof GoalWorkflowEvent.Type;
