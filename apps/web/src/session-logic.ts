@@ -1,5 +1,6 @@
 import {
   ProviderDriverKind,
+  type GoalEpisodeSummary,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2PlanArtifact,
   type OrchestrationV2ProjectedTurnItem,
@@ -124,6 +125,17 @@ export type TimelineEntry = (
       readonly kind: "event";
       readonly createdAt: string;
       readonly projectedItem: OrchestrationV2ProjectedTurnItem;
+    }
+  | {
+      /**
+       * A completed goal episode owned by this source thread, rendered as a
+       * collapsed summary. The root transcript is not carried here — it loads
+       * only when the reader expands the summary.
+       */
+      readonly id: string;
+      readonly kind: "goal-episode";
+      readonly createdAt: string;
+      readonly episode: GoalEpisodeSummary;
     }
 ) & {
   /** V2 identity resolved from the item's execution node, when locally available. */

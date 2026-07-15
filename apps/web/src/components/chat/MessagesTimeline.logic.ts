@@ -7,6 +7,8 @@ import {
 } from "../../session-logic";
 import { type ChatMessage, type ProposedPlan, type TurnDiffSummary } from "../../types";
 import {
+  type GoalEpisodeSummary,
+  type GoalId,
   type MessageId,
   type OrchestrationV2ProjectedTurnItem,
   type RunAttemptId,
@@ -147,6 +149,13 @@ export type MessagesTimelineRow =
       id: string;
       createdAt: string;
       proposedPlan: ProposedPlan;
+    }
+  | {
+      kind: "goal-episode";
+      id: string;
+      createdAt: string;
+      episode: GoalEpisodeSummary;
+      expanded: boolean;
     }
   | { kind: "working"; id: string; createdAt: string | null };
 
@@ -441,6 +450,7 @@ export function deriveMessagesTimelineRows(input: {
   latestRun?: TimelineLatestRun | null;
   expandedRunIds?: ReadonlySet<RunId>;
   expandedAttemptIds?: ReadonlySet<RunAttemptId>;
+  expandedGoalIds?: ReadonlySet<GoalId>;
   isWorking: boolean;
   activeTurnStartedAt: string | null;
   turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
@@ -554,6 +564,17 @@ export function deriveMessagesTimelineRows(input: {
       continue;
     }
 
+    if (timelineEntry.kind === "goal-episode") {
+      nextRows.push({
+        kind: "goal-episode",
+        id: timelineEntry.id,
+        createdAt: timelineEntry.createdAt,
+        episode: timelineEntry.episode,
+        expanded: input.expandedGoalIds?.has(timelineEntry.episode.goalId) ?? false,
+      });
+      continue;
+    }
+
     if (timelineEntry.kind === "event") {
       nextRows.push({
         kind: "event",
@@ -654,6 +675,11 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
 
     case "proposed-plan":
       return a.proposedPlan === (b as typeof a).proposedPlan;
+
+    case "goal-episode": {
+      const be = b as typeof a;
+      return a.episode === be.episode && a.expanded === be.expanded;
+    }
 
     case "event":
       return a.projectedItem === (b as typeof a).projectedItem;

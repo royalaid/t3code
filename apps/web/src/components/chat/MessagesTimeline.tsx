@@ -1,5 +1,6 @@
 import {
   type EnvironmentId,
+  type GoalId,
   type MessageId,
   type OrchestrationV2TurnItem,
   type RunAttemptId,
@@ -43,6 +44,7 @@ import {
   resolveFileDiffPath,
 } from "../../lib/diffRendering";
 import ChatMarkdown from "../ChatMarkdown";
+import { GoalEpisodeSummaryRow } from "../goal/GoalEpisodeSummaryRow";
 import {
   BotIcon,
   CheckIcon,
@@ -154,6 +156,7 @@ interface TimelineRowSharedState {
   }) => void;
   onToggleTurnFold: (runId: RunId) => void;
   onToggleAttemptFold: (attemptId: RunAttemptId) => void;
+  onToggleGoalEpisode: (goalId: GoalId) => void;
 }
 
 interface TimelineRowActivityState {
@@ -252,8 +255,20 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const [expandedAttemptIds, setExpandedAttemptIds] = useState<ReadonlySet<RunAttemptId>>(
     new Set(),
   );
+  const [expandedGoalIds, setExpandedGoalIds] = useState<ReadonlySet<GoalId>>(new Set());
   const [minimapStripMap] = useState(() => new Map<string, HTMLSpanElement>());
 
+  const onToggleGoalEpisode = useCallback((goalId: GoalId) => {
+    setExpandedGoalIds((existing) => {
+      const next = new Set(existing);
+      if (next.has(goalId)) {
+        next.delete(goalId);
+      } else {
+        next.add(goalId);
+      }
+      return next;
+    });
+  }, []);
   const onToggleTurnFold = useCallback((runId: RunId) => {
     setExpandedRunIds((existing) => {
       const next = new Set(existing);
@@ -313,6 +328,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         latestRun,
         expandedRunIds,
         expandedAttemptIds,
+        expandedGoalIds,
         isWorking,
         activeTurnStartedAt,
         turnDiffSummaryByAssistantMessageId,
@@ -323,6 +339,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       latestRun,
       expandedRunIds,
       expandedAttemptIds,
+      expandedGoalIds,
       isWorking,
       activeTurnStartedAt,
       turnDiffSummaryByAssistantMessageId,
@@ -444,6 +461,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onRollbackCheckpoint,
       onToggleTurnFold,
       onToggleAttemptFold,
+      onToggleGoalEpisode,
     }),
     [
       timestampFormat,
@@ -461,6 +479,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onRollbackCheckpoint,
       onToggleTurnFold,
       onToggleAttemptFold,
+      onToggleGoalEpisode,
     ],
   );
   const activityState = useMemo<TimelineRowActivityState>(
@@ -864,6 +883,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
         <AssistantTimelineRow row={row} />
       ) : null}
       {row.kind === "proposed-plan" ? <ProposedPlanTimelineRow row={row} /> : null}
+      {row.kind === "goal-episode" ? <GoalEpisodeTimelineRow row={row} /> : null}
       {row.kind === "event" ? <V2EventTimelineRow row={row} /> : null}
       {row.kind === "working" ? <WorkingTimelineRow row={row} /> : null}
     </div>
@@ -1076,6 +1096,18 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
         <Icon className="size-3.5" />
       </button>
     </div>
+  );
+}
+
+function GoalEpisodeTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "goal-episode" }> }) {
+  const ctx = use(TimelineRowCtx);
+  return (
+    <GoalEpisodeSummaryRow
+      episode={row.episode}
+      expanded={row.expanded}
+      environmentId={ctx.activeThreadEnvironmentId}
+      onToggle={() => ctx.onToggleGoalEpisode(row.episode.goalId)}
+    />
   );
 }
 
