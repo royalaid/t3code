@@ -9,21 +9,24 @@ import { Button } from "../ui/button";
 
 export function GoalRootControl(props: {
   readonly environmentId: EnvironmentId;
-  readonly threadId: ThreadId;
+  readonly panelThreadId: ThreadId;
+  readonly goalThreadId: ThreadId;
   readonly detail: GoalDetail;
 }) {
   const cancelGoal = useAtomCommand(threadEnvironment.cancelGoal, "cancel goal");
   const reopenGoal = useAtomCommand(threadEnvironment.reopenGoal, "reopen goal");
   const terminal = ["completed", "failed", "cancelled"].includes(props.detail.goal.status);
   const openWorkflow = () =>
-    useRightPanelStore.getState().open(scopeThreadRef(props.environmentId, props.threadId), "goal");
+    useRightPanelStore
+      .getState()
+      .open(scopeThreadRef(props.environmentId, props.panelThreadId), "goal");
   const cancel = async () => {
     if (!window.confirm("Cancel this goal and request cancellation of its running workers?"))
       return;
     await cancelGoal({
       environmentId: props.environmentId,
       input: {
-        threadId: props.threadId,
+        threadId: props.goalThreadId,
         goalId: props.detail.goal.id,
         reason: "Cancelled from the goal root controls.",
       },
@@ -39,7 +42,7 @@ export function GoalRootControl(props: {
     await reopenGoal({
       environmentId: props.environmentId,
       input: {
-        threadId: props.threadId,
+        threadId: props.goalThreadId,
         goalId: props.detail.goal.id,
       },
     });

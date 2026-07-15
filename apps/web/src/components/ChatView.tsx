@@ -66,6 +66,7 @@ import {
   squashAtomCommandFailure,
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
+import { interactiveGoalWorkerThreadIds } from "@t3tools/shared/goalAttempts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { isElectron } from "../env";
@@ -76,6 +77,13 @@ import {
   parseStandaloneComposerSlashCommand,
   resolveGoalComposerSubmission,
 } from "../composer-logic";
+import {
+  composeSourceGoalTimeline,
+  deriveGoalFacadePendingRequests,
+  resolveGoalFacadeRouting,
+  resolveSourceGoalFacade,
+  selectGoalFacadeRootItems,
+} from "../goalFacade";
 import {
   derivePendingApprovals,
   derivePendingUserInputs,
@@ -208,6 +216,7 @@ import {
   useProject,
   useProjects,
   useThreadProjection,
+  useThreadProjections,
   useThreadShell,
   useThreadRefs,
   useThreadVisibleTurnItems,
@@ -276,6 +285,7 @@ const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
 const EMPTY_ATTACHMENT_IDS: string[] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
+type OptimisticChatMessage = ChatMessage & { readonly targetThreadId: ThreadId };
 const PreviewPanel = lazy(() =>
   import("./preview/PreviewPanel").then((module) => ({ default: module.PreviewPanel })),
 );
@@ -1073,9 +1083,59 @@ function ChatViewContent(props: ChatViewProps) {
   const serverVisibleTurnItems = useThreadVisibleTurnItems(
     routeKind === "server" ? routeThreadRef : null,
   );
+  const sourceGoalFacade = useMemo(
+    () => resolveSourceGoalFacade(serverProjection?.goalSurface),
+    [serverProjection?.goalSurface],
+  );
+  const activeGoalRootThreadRef = useMemo(
+    () =>
+      routeKind === "server" && sourceGoalFacade.activeRootThreadId !== null
+        ? scopeThreadRef(environmentId, sourceGoalFacade.activeRootThreadId)
+        : null,
+    [environmentId, routeKind, sourceGoalFacade.activeRootThreadId],
+  );
+  const activeGoalRootThreadProjection = useThreadProjection(activeGoalRootThreadRef);
+  const activeGoalRootProjection = activeGoalRootThreadProjection?.projection ?? null;
+  const activeGoalWorkerThreadRefs = useMemo(() => {
+    const rootGoal = activeGoalRootProjection?.goal;
+    if (sourceGoalFacade.activeEpisode === null || rootGoal === null || rootGoal === undefined)
+      return [];
+    return interactiveGoalWorkerThreadIds(rootGoal.attempts).map((workerThreadId) =>
+      scopeThreadRef(environmentId, workerThreadId),
+    );
+  }, [activeGoalRootProjection?.goal, environmentId, sourceGoalFacade.activeEpisode]);
+  const activeGoalWorkerThreadProjections = useThreadProjections(activeGoalWorkerThreadRefs);
+  const activeGoalRootVisibleTurnItems = useThreadVisibleTurnItems(activeGoalRootThreadRef);
+  const goalFacadeRootVisibleTurnItems = useMemo(
+    () =>
+      sourceGoalFacade.activeEpisode === null
+        ? []
+        : selectGoalFacadeRootItems({
+            items: activeGoalRootVisibleTurnItems,
+            goalId: sourceGoalFacade.activeEpisode.goalId,
+          }),
+    [activeGoalRootVisibleTurnItems, sourceGoalFacade.activeEpisode],
+  );
+  const conversationalProjection =
+    sourceGoalFacade.activeEpisode === null ? serverProjection : activeGoalRootProjection;
+  const conversationalVisibleTurnItems =
+    sourceGoalFacade.activeEpisode === null
+      ? serverVisibleTurnItems
+      : goalFacadeRootVisibleTurnItems;
+  const visibleTurnItemsForAssets = useMemo(
+    () =>
+      sourceGoalFacade.activeEpisode === null
+        ? serverVisibleTurnItems
+        : [...serverVisibleTurnItems, ...goalFacadeRootVisibleTurnItems],
+    [goalFacadeRootVisibleTurnItems, serverVisibleTurnItems, sourceGoalFacade.activeEpisode],
+  );
   const committedServerMessageIds = useMemo(
-    () => new Set(serverProjection?.messages.map((message) => message.id) ?? []),
-    [serverProjection],
+    () =>
+      new Set([
+        ...(serverProjection?.messages.map((message) => message.id) ?? []),
+        ...(activeGoalRootProjection?.messages.map((message) => message.id) ?? []),
+      ]),
+    [activeGoalRootProjection, serverProjection],
   );
   const markThreadVisited = useUiStateStore((store) => store.markThreadVisited);
   const activeThreadLastVisitedAt = useUiStateStore((store) =>
@@ -1140,7 +1200,7 @@ function ChatViewContent(props: ChatViewProps) {
   const composerRef = useComposerHandleContext() ?? localComposerRef;
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [expandedImage, setExpandedImage] = useState<ExpandedImagePreview | null>(null);
-  const [optimisticUserMessages, setOptimisticUserMessages] = useState<ChatMessage[]>([]);
+  const [optimisticUserMessages, setOptimisticUserMessages] = useState<OptimisticChatMessage[]>([]);
   const optimisticUserMessagesRef = useRef(optimisticUserMessages);
   optimisticUserMessagesRef.current = optimisticUserMessages;
   const [localDraftErrorsByDraftId, setLocalDraftErrorsByDraftId] = useState<
@@ -1285,16 +1345,21 @@ function ChatViewContent(props: ChatViewProps) {
   const isServerThread = routeKind === "server" && serverThread !== null;
   const activeThread = isServerThread ? serverThread : localDraftThread;
   const serverLatestRun = useMemo(
-    () => (serverProjection === null ? null : deriveLatestThreadRun(serverProjection)),
-    [serverProjection],
+    () =>
+      conversationalProjection === null ? null : deriveLatestThreadRun(conversationalProjection),
+    [conversationalProjection],
   );
   const serverRuntime = useMemo(
-    () => (serverProjection === null ? null : deriveThreadRuntime(serverProjection)),
-    [serverProjection],
+    () =>
+      conversationalProjection === null ? null : deriveThreadRuntime(conversationalProjection),
+    [conversationalProjection],
   );
   const activeProviderSession = useMemo(
-    () => (serverProjection === null ? null : resolveThreadProviderSession(serverProjection)),
-    [serverProjection],
+    () =>
+      conversationalProjection === null
+        ? null
+        : resolveThreadProviderSession(conversationalProjection),
+    [conversationalProjection],
   );
   const supportsProviderSwitchingViaHandoff =
     activeProviderSession?.capabilities.sessions.supportsProviderSwitchingViaHandoff === true;
@@ -1323,14 +1388,29 @@ function ChatViewContent(props: ChatViewProps) {
     [parentSubagentThread?.title, parentSubagentThreadRef],
   );
   const threadError = isServerThread
-    ? (localServerError ?? serverRuntime?.lastError ?? null)
+    ? (localServerError ?? activeRuntime?.lastError ?? null)
     : localDraftError;
-  const runtimeMode = composerRuntimeMode ?? activeThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE;
+  const runtimeMode =
+    composerRuntimeMode ??
+    conversationalProjection?.thread.runtimeMode ??
+    activeThread?.runtimeMode ??
+    DEFAULT_RUNTIME_MODE;
   const interactionMode =
-    composerInteractionMode ?? activeThread?.interactionMode ?? DEFAULT_INTERACTION_MODE;
+    composerInteractionMode ??
+    conversationalProjection?.thread.interactionMode ??
+    activeThread?.interactionMode ??
+    DEFAULT_INTERACTION_MODE;
   const isLocalDraftThread = !isServerThread && localDraftThread !== undefined;
   const canCheckoutPullRequestIntoThread = isLocalDraftThread;
   const activeThreadId = activeThread?.id ?? null;
+  const conversationalThreadId =
+    isServerThread && activeThreadId !== null
+      ? resolveGoalFacadeRouting({
+          sourceThreadId: activeThreadId,
+          activeEpisode: sourceGoalFacade.activeEpisode,
+        }).targetThreadId
+      : activeThreadId;
+  const goalDetailForView = serverProjection?.goal ?? activeGoalRootProjection?.goal ?? null;
   const activeMessageCount = isServerThread ? committedServerMessageIds.size : 0;
   const runningTerminalIds = useThreadRunningTerminalIds({
     environmentId: activeThread?.environmentId ?? null,
@@ -1404,11 +1484,11 @@ function ChatViewContent(props: ChatViewProps) {
   const previewPanelOpen = activeRightPanelKind === "preview" && isPreviewSupportedInRuntime();
   const rightPanelOpen = rightPanelState.isOpen;
   useEffect(() => {
-    const goal = serverProjection?.goal;
+    const goal = goalDetailForView;
     if (!activeThreadRef || !goal || autoOpenedGoalIdsRef.current.has(goal.goal.id)) return;
     autoOpenedGoalIdsRef.current.add(goal.goal.id);
     useRightPanelStore.getState().open(activeThreadRef, "goal");
-  }, [activeThreadRef, serverProjection?.goal]);
+  }, [activeThreadRef, goalDetailForView]);
   const canMaximizeRightPanel = rightPanelOpen && !shouldUsePlanSidebarSheet;
   const rightPanelMaximized =
     canMaximizeRightPanel && maximizedRightPanelThreadKey === routeThreadKey;
@@ -1720,6 +1800,7 @@ function ChatViewContent(props: ChatViewProps) {
 
   const selectedProviderByThreadId = composerActiveProvider ?? null;
   const threadProvider =
+    conversationalProjection?.thread.modelSelection.instanceId ??
     activeThread?.modelSelection.instanceId ??
     activeProject?.defaultModelSelection?.instanceId ??
     null;
@@ -1772,13 +1853,22 @@ function ChatViewContent(props: ChatViewProps) {
   const selectedProvider: ProviderDriverKind =
     modelPickerLockedProvider ?? unlockedSelectedProvider;
   const phase = derivePhase(activeRuntime);
-  const pendingRequests = useMemo(
-    () =>
-      serverProjection === null
+  const pendingRequests = useMemo(() => {
+    if (sourceGoalFacade.activeEpisode === null) {
+      return conversationalProjection === null
         ? { approvals: [], userInputs: [] }
-        : derivePendingThreadRequests(serverProjection),
-    [serverProjection],
-  );
+        : derivePendingThreadRequests(conversationalProjection);
+    }
+    return deriveGoalFacadePendingRequests([
+      ...(activeGoalRootProjection === null ? [] : [activeGoalRootProjection]),
+      ...activeGoalWorkerThreadProjections.map((thread) => thread.projection),
+    ]);
+  }, [
+    activeGoalRootProjection,
+    activeGoalWorkerThreadProjections,
+    conversationalProjection,
+    sourceGoalFacade.activeEpisode,
+  ]);
   const pendingApprovals = useMemo(
     () => derivePendingApprovals(pendingRequests.approvals),
     [pendingRequests.approvals],
@@ -1930,14 +2020,14 @@ function ChatViewContent(props: ChatViewProps) {
   }, []);
   const committedServerAttachmentIds = useMemo(() => {
     const attachmentIds = new Set<string>();
-    for (const row of serverVisibleTurnItems) {
+    for (const row of visibleTurnItemsForAssets) {
       if (row.item.type !== "user_message") continue;
       for (const attachment of row.item.attachments) {
         attachmentIds.add(attachment.id);
       }
     }
     return [...attachmentIds];
-  }, [serverVisibleTurnItems]);
+  }, [visibleTurnItemsForAssets]);
   const serverAttachmentIds = isServerThread ? committedServerAttachmentIds : EMPTY_ATTACHMENT_IDS;
   const serverAttachmentResources = useMemo(
     () =>
@@ -1959,13 +2049,13 @@ function ChatViewContent(props: ChatViewProps) {
     [serverAttachmentIds, serverAttachmentUrls],
   );
   useEffect(() => {
-    if (typeof Image === "undefined" || serverVisibleTurnItems.length === 0) {
+    if (typeof Image === "undefined" || visibleTurnItemsForAssets.length === 0) {
       return;
     }
 
     const cleanups: Array<() => void> = [];
     const userMessagesById = new Map(
-      serverVisibleTurnItems.flatMap((row) =>
+      visibleTurnItemsForAssets.flatMap((row) =>
         row.item.type === "user_message" ? [[String(row.item.messageId), row.item] as const] : [],
       ),
     );
@@ -2049,11 +2139,11 @@ function ChatViewContent(props: ChatViewProps) {
     attachmentPreviewHandoffByMessageId,
     clearAttachmentPreviewHandoff,
     serverAttachmentUrlById,
-    serverVisibleTurnItems,
+    visibleTurnItemsForAssets,
   ]);
   const timelineAttachmentUrlById = useMemo(() => {
     const urls = new Map(serverAttachmentUrlById);
-    for (const row of serverVisibleTurnItems) {
+    for (const row of visibleTurnItemsForAssets) {
       if (row.item.type !== "user_message") continue;
       const handoffUrls = attachmentPreviewHandoffByMessageId[row.item.messageId];
       if (handoffUrls === undefined) continue;
@@ -2066,12 +2156,14 @@ function ChatViewContent(props: ChatViewProps) {
       }
     }
     return urls;
-  }, [attachmentPreviewHandoffByMessageId, serverAttachmentUrlById, serverVisibleTurnItems]);
-  const serverTimelineEntries = useMemo(
+  }, [attachmentPreviewHandoffByMessageId, serverAttachmentUrlById, visibleTurnItemsForAssets]);
+  const sourceTimelineEntries = useMemo(
     () =>
       deriveTimelineEntriesFromVisibleTurnItems({
         visibleTurnItems: serverVisibleTurnItems,
-        optimisticMessages: optimisticUserMessages,
+        optimisticMessages: optimisticUserMessages.filter(
+          (message) => message.targetThreadId === activeThreadId,
+        ),
         attachmentUrlById: timelineAttachmentUrlById,
         ...(serverProjection === null
           ? {}
@@ -2080,7 +2172,50 @@ function ChatViewContent(props: ChatViewProps) {
               nodes: serverProjection.nodes,
             }),
       }),
-    [optimisticUserMessages, serverVisibleTurnItems, serverProjection, timelineAttachmentUrlById],
+    [
+      activeThreadId,
+      optimisticUserMessages,
+      serverVisibleTurnItems,
+      serverProjection,
+      sourceGoalFacade.activeEpisode,
+      timelineAttachmentUrlById,
+    ],
+  );
+  const activeGoalRootTimelineEntries = useMemo(
+    () =>
+      deriveTimelineEntriesFromVisibleTurnItems({
+        visibleTurnItems: goalFacadeRootVisibleTurnItems,
+        optimisticMessages:
+          sourceGoalFacade.activeRootThreadId === null
+            ? []
+            : optimisticUserMessages.filter(
+                (message) => message.targetThreadId === sourceGoalFacade.activeRootThreadId,
+              ),
+        attachmentUrlById: timelineAttachmentUrlById,
+        ...(activeGoalRootProjection === null
+          ? {}
+          : {
+              attempts: activeGoalRootProjection.attempts,
+              nodes: activeGoalRootProjection.nodes,
+            }),
+      }),
+    [
+      activeGoalRootProjection,
+      goalFacadeRootVisibleTurnItems,
+      optimisticUserMessages,
+      sourceGoalFacade.activeEpisode,
+      sourceGoalFacade.activeRootThreadId,
+      timelineAttachmentUrlById,
+    ],
+  );
+  const serverTimelineEntries = useMemo(
+    () =>
+      composeSourceGoalTimeline({
+        sourceEntries: sourceTimelineEntries,
+        facade: sourceGoalFacade,
+        activeRootEntries: activeGoalRootTimelineEntries,
+      }),
+    [activeGoalRootTimelineEntries, sourceGoalFacade, sourceTimelineEntries],
   );
   const draftTimelineEntries = useMemo(
     () =>
@@ -2096,7 +2231,7 @@ function ChatViewContent(props: ChatViewProps) {
     [optimisticUserMessages],
   );
   const timelineEntries = isServerThread ? serverTimelineEntries : draftTimelineEntries;
-  const { turnDiffSummaries } = useTurnDiffSummaries(serverProjection);
+  const { turnDiffSummaries } = useTurnDiffSummaries(conversationalProjection);
   const turnDiffSummaryByAssistantMessageId = useMemo(() => {
     const byMessageId = new Map<MessageId, TurnDiffSummary>();
     for (const summary of turnDiffSummaries) {
@@ -3592,6 +3727,13 @@ function ChatViewContent(props: ChatViewProps) {
     setExpandedImage(null);
   }, [draftId, resetLocalDispatch, threadId]);
 
+  useEffect(() => {
+    if (sourceGoalFacade.activeEpisode !== null || activeThreadId === null) return;
+    setOptimisticUserMessages((existing) =>
+      existing.filter((message) => message.targetThreadId === activeThreadId),
+    );
+  }, [activeThreadId, sourceGoalFacade.activeEpisode]);
+
   const closeExpandedImage = useCallback(() => {
     setExpandedImage(null);
   }, []);
@@ -4122,7 +4264,7 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     if (!activeProject) return;
-    const threadIdForSend = activeThread.id;
+    const sourceThreadIdForSend = activeThread.id;
     const isFirstMessage = !isServerThread || activeMessageCount === 0;
     const baseBranchForWorktree =
       isFirstMessage && sendEnvMode === "worktree" && !activeThread.worktreePath
@@ -4134,7 +4276,10 @@ function ChatViewContent(props: ChatViewProps) {
     const shouldCreateWorktree =
       isFirstMessage && sendEnvMode === "worktree" && !activeThread.worktreePath;
     if (shouldCreateWorktree && !activeThreadBranch) {
-      setThreadError(threadIdForSend, "Select a base branch before sending in New worktree mode.");
+      setThreadError(
+        sourceThreadIdForSend,
+        "Select a base branch before sending in New worktree mode.",
+      );
       return;
     }
 
@@ -4159,6 +4304,10 @@ function ChatViewContent(props: ChatViewProps) {
       composerReviewCommentsSnapshot,
     );
     const goalCommand = resolveGoalComposerSubmission(promptForSend, messageTextForSend);
+    const threadIdForSend =
+      goalCommand === null
+        ? (conversationalThreadId ?? sourceThreadIdForSend)
+        : sourceThreadIdForSend;
     const messageIdForSend = newMessageId();
     const messageCreatedAt = new Date().toISOString();
     const outgoingMessageText = formatOutgoingPrompt({
@@ -4197,7 +4346,7 @@ function ChatViewContent(props: ChatViewProps) {
     showScrollDebouncer.current.cancel();
     setShowScrollToBottom(false);
     setTimelineAnchor({
-      threadKey: scopedThreadKey(scopeThreadRef(activeThread.environmentId, threadIdForSend)),
+      threadKey: scopedThreadKey(scopeThreadRef(activeThread.environmentId, sourceThreadIdForSend)),
       messageId: messageIdForSend,
     });
     if (goalCommand === null) {
@@ -4205,6 +4354,7 @@ function ChatViewContent(props: ChatViewProps) {
         ...existing,
         {
           id: messageIdForSend,
+          targetThreadId: threadIdForSend,
           role: "user",
           text: outgoingMessageText,
           ...(optimisticAttachments.length > 0 ? { attachments: optimisticAttachments } : {}),
@@ -4220,7 +4370,7 @@ function ChatViewContent(props: ChatViewProps) {
         },
       ]);
     }
-    setThreadError(threadIdForSend, null);
+    setThreadError(sourceThreadIdForSend, null);
     if (expiredTerminalContextCount > 0) {
       const toastCopy = buildExpiredTerminalContextToastCopy(
         expiredTerminalContextCount,
@@ -4407,12 +4557,6 @@ function ChatViewContent(props: ChatViewProps) {
         failure = startResult;
       } else {
         turnStartSucceeded = true;
-        if (goalRootThreadId !== null) {
-          await navigate({
-            to: "/$environmentId/$threadId",
-            params: buildThreadRouteParams(scopeThreadRef(environmentId, goalRootThreadId)),
-          });
-        }
       }
     }
 
@@ -4455,7 +4599,7 @@ function ChatViewContent(props: ChatViewProps) {
       if (!isAtomCommandInterrupted(failure)) {
         const error = squashAtomCommandFailure(failure);
         setThreadError(
-          threadIdForSend,
+          sourceThreadIdForSend,
           error instanceof Error ? error.message : "Failed to send message.",
         );
       }
@@ -4467,11 +4611,11 @@ function ChatViewContent(props: ChatViewProps) {
   };
 
   const onInterrupt = async () => {
-    if (!activeThread) return;
+    if (!activeThread || conversationalThreadId === null) return;
     const result = await interruptThreadTurn({
       environmentId,
       input: {
-        threadId: activeThread.id,
+        threadId: conversationalThreadId,
       },
     });
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
@@ -4485,7 +4629,7 @@ function ChatViewContent(props: ChatViewProps) {
 
   const onRespondToApproval = useCallback(
     async (requestId: RuntimeRequestId, decision: ProviderApprovalDecision) => {
-      if (!activeThreadId) return;
+      if (!activeThreadId || conversationalThreadId === null) return;
       if (
         pendingApprovals.find((approval) => approval.requestId === requestId)
           ?.responseCapability !== "live"
@@ -4498,7 +4642,7 @@ function ChatViewContent(props: ChatViewProps) {
       const result = await respondToThreadApproval({
         environmentId,
         input: {
-          threadId: activeThreadId,
+          threadId: conversationalThreadId,
           requestId,
           decision,
         },
@@ -4513,12 +4657,19 @@ function ChatViewContent(props: ChatViewProps) {
       setRespondingRequestIds((existing) => existing.filter((id) => id !== requestId));
       return result;
     },
-    [activeThreadId, environmentId, pendingApprovals, respondToThreadApproval, setThreadError],
+    [
+      activeThreadId,
+      conversationalThreadId,
+      environmentId,
+      pendingApprovals,
+      respondToThreadApproval,
+      setThreadError,
+    ],
   );
 
   const onRespondToUserInput = useCallback(
     async (requestId: RuntimeRequestId, answers: Record<string, unknown>) => {
-      if (!activeThreadId) return;
+      if (!activeThreadId || conversationalThreadId === null) return;
       if (
         pendingUserInputs.find((input) => input.requestId === requestId)?.responseCapability !==
         "live"
@@ -4531,7 +4682,7 @@ function ChatViewContent(props: ChatViewProps) {
       const result = await respondToThreadUserInput({
         environmentId,
         input: {
-          threadId: activeThreadId,
+          threadId: conversationalThreadId,
           requestId,
           answers,
         },
@@ -4546,7 +4697,14 @@ function ChatViewContent(props: ChatViewProps) {
       setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
       return result;
     },
-    [activeThreadId, environmentId, pendingUserInputs, respondToThreadUserInput, setThreadError],
+    [
+      activeThreadId,
+      conversationalThreadId,
+      environmentId,
+      pendingUserInputs,
+      respondToThreadUserInput,
+      setThreadError,
+    ],
   );
 
   const setActivePendingUserInputQuestionIndex = useCallback(
@@ -4719,6 +4877,7 @@ function ChatViewContent(props: ChatViewProps) {
       ...existing,
       {
         id: messageIdForSend,
+        targetThreadId: threadIdForSend,
         role: "user",
         text: outgoingMessageText,
         runId: null,
@@ -5143,8 +5302,8 @@ function ChatViewContent(props: ChatViewProps) {
   }
 
   const rightPanelContent = activeThreadRef ? (
-    activeRightPanelSurface?.kind === "goal" && serverProjection?.goal ? (
-      <GoalWorkflowPanel detail={serverProjection.goal} />
+    activeRightPanelSurface?.kind === "goal" && goalDetailForView ? (
+      <GoalWorkflowPanel detail={goalDetailForView} />
     ) : activeRightPanelSurface?.kind === "preview" ? (
       <Suspense fallback={null}>
         <PreviewPanel
@@ -5443,17 +5602,21 @@ function ChatViewContent(props: ChatViewProps) {
               </div>
               <div className="chat-composer-horizontal-inset">
                 <div className="pointer-events-auto relative z-10 isolate">
-                  {isServerThread && activeThread && serverProjection?.goal ? (
+                  {isServerThread &&
+                  activeThread &&
+                  conversationalThreadId !== null &&
+                  goalDetailForView ? (
                     <GoalRootControl
                       environmentId={activeThread.environmentId}
-                      threadId={activeThread.id}
-                      detail={serverProjection.goal}
+                      panelThreadId={activeThread.id}
+                      goalThreadId={conversationalThreadId}
+                      detail={goalDetailForView}
                     />
                   ) : null}
-                  {isServerThread && activeThread ? (
+                  {isServerThread && activeThread && conversationalThreadId !== null ? (
                     <QueuedRunsControl
                       environmentId={activeThread.environmentId}
-                      threadId={activeThread.id}
+                      threadId={conversationalThreadId}
                     />
                   ) : null}
                   <div className="relative z-10">
@@ -5494,8 +5657,11 @@ function ChatViewContent(props: ChatViewProps) {
                       lockedProvider={modelPickerLockedProvider}
                       providerStatuses={providerStatuses as ServerProvider[]}
                       activeProjectDefaultModelSelection={activeProject?.defaultModelSelection}
-                      activeThreadModelSelection={activeThread?.modelSelection}
-                      activeThreadVisibleTurnItems={serverVisibleTurnItems}
+                      activeThreadModelSelection={
+                        conversationalProjection?.thread.modelSelection ??
+                        activeThread?.modelSelection
+                      }
+                      activeThreadVisibleTurnItems={conversationalVisibleTurnItems}
                       resolvedTheme={resolvedTheme}
                       settings={settings}
                       keybindings={keybindings}

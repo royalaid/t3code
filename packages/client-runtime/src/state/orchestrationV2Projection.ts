@@ -182,6 +182,8 @@ export function applyOrchestrationV2ProjectionEvent(
     case "goal.evidence-submitted":
     case "goal.verdict-recorded":
     case "goal.failure-recorded":
+    case "goal.failure-recovery-updated":
+    case "goal.source-result-transferred":
       return base;
   }
 }

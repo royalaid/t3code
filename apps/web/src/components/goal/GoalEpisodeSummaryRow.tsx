@@ -1,6 +1,12 @@
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentId, GoalEpisodeSummary } from "@t3tools/contracts";
-import { CheckCircle2, ChevronDownIcon, ChevronRightIcon, CircleSlash, XCircle } from "lucide-react";
+import {
+  CheckCircle2,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  CircleSlash,
+  XCircle,
+} from "lucide-react";
 
 import { selectGoalFacadeRootItems } from "../../goalFacade";
 import { useThreadVisibleTurnItems } from "../../state/entities";
@@ -40,7 +46,10 @@ function GoalEpisodeTranscript(props: {
   }
 
   return (
-    <div className="flex flex-col gap-2 px-2.5 py-2" data-goal-episode-transcript={props.episode.goalId}>
+    <div
+      className="flex flex-col gap-2 px-2.5 py-2"
+      data-goal-episode-transcript={props.episode.goalId}
+    >
       {conversation.map((row) => {
         const { item } = row;
         const text =
@@ -99,6 +108,11 @@ export function GoalEpisodeSummaryRow(props: {
           {props.episode.verified ? "verified · " : ""}revision {props.episode.currentRevision}
         </span>
       </button>
+      {props.episode.sourceResult?.summary ? (
+        <p className="px-8 pb-2 text-[11px] leading-relaxed text-muted-foreground">
+          {props.episode.sourceResult.summary}
+        </p>
+      ) : null}
       {props.expanded ? (
         <div className="border-t border-border/60">
           <GoalEpisodeTranscript environmentId={props.environmentId} episode={props.episode} />

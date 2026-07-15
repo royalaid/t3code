@@ -91,6 +91,10 @@
       "types": "./src/orchestrationV2Timeline.ts",
       "import": "./src/orchestrationV2Timeline.ts"
     },
+    "./goalAttempts": {
+      "types": "./src/goalAttempts.ts",
+      "import": "./src/goalAttempts.ts"
+    },
     "./remote": {
       "types": "./src/remote.ts",
       "import": "./src/remote.ts"

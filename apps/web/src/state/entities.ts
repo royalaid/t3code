@@ -6,6 +6,8 @@ import type {
 } from "@t3tools/client-runtime/state/shell";
 import type { ScopedProjectRef, ScopedThreadRef, ServerConfig } from "@t3tools/contracts";
 import type { EnvironmentId, OrchestrationV2ProjectedTurnItem, ThreadId } from "@t3tools/contracts";
+import { parseScopedThreadKey, scopedThreadKey } from "@t3tools/client-runtime/environment";
+import { arrayElementsEqual } from "@t3tools/client-runtime/state/entities";
 import { Atom } from "effect/unstable/reactivity";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentProjects } from "./projects";
@@ -32,6 +34,26 @@ const EMPTY_THREAD_SHELL_ATOM = Atom.make<EnvironmentThreadShell | null>(null).p
 const EMPTY_THREAD_PROJECTION_ATOM = Atom.make<EnvironmentThread | null>(null).pipe(
   Atom.withLabel("web-thread-projection:empty"),
 );
+const EMPTY_THREAD_PROJECTIONS: ReadonlyArray<EnvironmentThread> = Object.freeze([]);
+const THREAD_PROJECTION_COLLECTION_ATOM = Atom.family((key: string) => {
+  const refs = key
+    .split("\n")
+    .map(parseScopedThreadKey)
+    .filter((ref): ref is ScopedThreadRef => ref !== null);
+  if (refs.length === 0) {
+    return Atom.make(EMPTY_THREAD_PROJECTIONS).pipe(Atom.withLabel("web-thread-projections:empty"));
+  }
+  let previous: ReadonlyArray<EnvironmentThread> = EMPTY_THREAD_PROJECTIONS;
+  return Atom.make((get) => {
+    const next = refs.flatMap((ref) => {
+      const thread = get(environmentThreadDetails.threadAtom(ref));
+      return thread === null ? [] : [thread];
+    });
+    if (arrayElementsEqual(previous, next)) return previous;
+    previous = next;
+    return previous;
+  }).pipe(Atom.withLabel(`web-thread-projections:${key}`));
+});
 const EMPTY_VISIBLE_TURN_ITEMS_ATOM = Atom.make(EMPTY_VISIBLE_TURN_ITEMS).pipe(
   Atom.withLabel("web-thread-visible-turn-items:empty"),
 );
@@ -113,6 +135,12 @@ export function useThreadProjection(ref: ScopedThreadRef | null): EnvironmentThr
   return useAtomValue(
     ref === null ? EMPTY_THREAD_PROJECTION_ATOM : environmentThreadDetails.threadAtom(ref),
   );
+}
+
+export function useThreadProjections(
+  refs: ReadonlyArray<ScopedThreadRef>,
+): ReadonlyArray<EnvironmentThread> {
+  return useAtomValue(THREAD_PROJECTION_COLLECTION_ATOM(refs.map(scopedThreadKey).join("\n")));
 }
 
 export function useThreadVisibleTurnItems(

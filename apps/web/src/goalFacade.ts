@@ -5,9 +5,14 @@ import {
   type GoalSurface,
   MessageId,
   type OrchestrationV2ProjectedTurnItem,
+  type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
   type ThreadId,
 } from "@t3tools/contracts";
+import {
+  derivePendingThreadRequests,
+  type PendingThreadRequests,
+} from "@t3tools/client-runtime/state/thread-requests";
 
 import type { TimelineEntry } from "./session-logic";
 
@@ -90,6 +95,24 @@ export function selectGoalFacadeRootItems(input: {
   );
 }
 
+/**
+ * Presents pending requests from the root and its active workers as one facade.
+ * Responses still target the root thread; the server resolves the request id
+ * to exactly one owning worker inside the active goal boundary.
+ */
+export function deriveGoalFacadePendingRequests(
+  projections: ReadonlyArray<OrchestrationV2ThreadProjection>,
+): PendingThreadRequests {
+  const approvals = new Map<string, PendingThreadRequests["approvals"][number]>();
+  const userInputs = new Map<string, PendingThreadRequests["userInputs"][number]>();
+  for (const projection of projections) {
+    const pending = derivePendingThreadRequests(projection);
+    for (const approval of pending.approvals) approvals.set(approval.requestId, approval);
+    for (const userInput of pending.userInputs) userInputs.set(userInput.requestId, userInput);
+  }
+  return { approvals: [...approvals.values()], userInputs: [...userInputs.values()] };
+}
+
 export interface SourceGoalFacade {
   /** The episode currently driving the source view, or null when none is live. */
   readonly activeEpisode: GoalEpisodeSummary | null;
@@ -102,7 +125,11 @@ export interface SourceGoalFacade {
 }
 
 const byCreatedAt = (a: GoalEpisodeSummary, b: GoalEpisodeSummary): number =>
-  a.createdAt === b.createdAt ? a.goalId.localeCompare(b.goalId) : a.createdAt < b.createdAt ? -1 : 1;
+  a.createdAt === b.createdAt
+    ? a.goalId.localeCompare(b.goalId)
+    : a.createdAt < b.createdAt
+      ? -1
+      : 1;
 
 /**
  * Resolves the facade state from the source thread's server-owned goal surface.
@@ -119,7 +146,8 @@ export function resolveSourceGoalFacade(
     goalSurface?.activeGoalId == null
       ? null
       : (episodes.find((episode) => episode.goalId === goalSurface.activeGoalId) ?? null);
-  const activeEpisode = candidate !== null && !isTerminalGoalStatus(candidate.status) ? candidate : null;
+  const activeEpisode =
+    candidate !== null && !isTerminalGoalStatus(candidate.status) ? candidate : null;
   return {
     activeEpisode,
     completedEpisodes: episodes.filter((episode) => isTerminalGoalStatus(episode.status)),
@@ -168,7 +196,7 @@ export function goalObjectiveEntry(episode: GoalEpisodeSummary): TimelineEntry {
     message: {
       id: goalObjectiveMessageId(episode.goalId),
       role: "user",
-      text: episode.objective,
+      text: `/goal ${episode.objective}`,
       runId: null,
       streaming: false,
       createdAt: episode.createdAt,
