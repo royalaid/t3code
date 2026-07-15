@@ -8,6 +8,52 @@ import { runMigrations } from "../Migrations.ts";
 import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()))("042_SourceOwnedGoals", (it) => {
+  it.effect("preserves legacy episodes while retiring older nonterminal duplicates", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 41 });
+      const insert = (goalId: string, status: string, updatedAt: string) =>
+        sql`INSERT INTO goals (
+          goal_id, root_thread_id, source_thread_id, status, current_revision,
+          payload_json, created_at, updated_at
+        ) VALUES (
+          ${goalId}, ${`root:${goalId}`}, 'source:legacy', ${status}, 0,
+          ${JSON.stringify({ id: goalId, status, updatedAt })},
+          '2026-07-13T00:00:00.000Z', ${updatedAt}
+        )`;
+
+      yield* insert("goal:legacy-older", "planning", "2026-07-13T01:00:00.000Z");
+      yield* insert("goal:legacy-newer", "running", "2026-07-13T02:00:00.000Z");
+      yield* runMigrations({ toMigrationInclusive: 42 });
+
+      const rows = yield* sql<{
+        readonly goal_id: string;
+        readonly status: string;
+        readonly payload_status: string;
+      }>`SELECT goal_id, status, json_extract(payload_json, '$.status') AS payload_status
+        FROM goals WHERE source_thread_id='source:legacy' ORDER BY goal_id`;
+      assert.deepEqual(rows, [
+        {
+          goal_id: "goal:legacy-newer",
+          status: "running",
+          payload_status: "running",
+        },
+        {
+          goal_id: "goal:legacy-older",
+          status: "failed",
+          payload_status: "failed",
+        },
+      ]);
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            insert("goal:legacy-concurrent", "planning", "2026-07-13T03:00:00.000Z"),
+          ),
+        ),
+      );
+    }),
+  );
+
   it.effect("enforces at most one nonterminal goal per source thread", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
