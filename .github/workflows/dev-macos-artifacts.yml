@@ -1,0 +1,54 @@
+name: Dev macOS artifacts
+
+on:
+  push:
+    branches:
+      - feat/resilient-connections-outbox
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned macOS ${{ matrix.arch }} DMG
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - arm64
+          - x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Build unsigned DMG
+        run: |
+          vp run dist:desktop:artifact \
+            --platform mac \
+            --target dmg \
+            --arch "${{ matrix.arch }}" \
+            --build-version 0.0.29-nightly.20260716.823 \
+            --verbose
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: t3-code-macos-${{ matrix.arch }}-unsigned
+          path: |
+            release/*.dmg
+            release/*.blockmap
+          if-no-files-found: error
+          retention-days: 3
