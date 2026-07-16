@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "name": "Royal's Scriptorium",
+  "upstreamRevision": "untracked",
+  "scriptoriumRevision": "local",
+  "changes": [
+    {
+      "id": "scriptorium-identity",
+      "title": "Separate Royal's Scriptorium installation identity",
+      "status": "included"
+    },
+    {
+      "id": "scriptorium-migration",
+      "title": "Bidirectional local T3 Code profile migration",
+      "status": "included"
+    }
+  ]
+}
