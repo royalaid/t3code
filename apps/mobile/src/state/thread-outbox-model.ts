@@ -1,4 +1,7 @@
-import { isTransportConnectionErrorMessage } from "@t3tools/client-runtime/errors";
+import {
+  classifyThreadOutboxFailure,
+  threadOutboxRetryDelayMs as sharedThreadOutboxRetryDelayMs,
+} from "@t3tools/client-runtime/outbox";
 import type { EnvironmentShellStatus } from "@t3tools/client-runtime/state/shell";
 import {
   CommandId,
@@ -22,7 +25,6 @@ import type { DraftComposerImageAttachment } from "../lib/composerImages";
 import { scopedThreadKey } from "../lib/scopedEntities";
 
 const THREAD_OUTBOX_SCHEMA_VERSION = 3;
-const THREAD_OUTBOX_MAX_RETRY_DELAY_MS = 16_000;
 
 const QueuedThreadCreationSchema = Schema.Struct({
   projectId: ProjectId,
@@ -143,7 +145,7 @@ export function flattenQueuedThreadMessages(
 }
 
 export function threadOutboxRetryDelayMs(attempt: number): number {
-  return Math.min(1_000 * 2 ** Math.max(0, attempt - 1), THREAD_OUTBOX_MAX_RETRY_DELAY_MS);
+  return sharedThreadOutboxRetryDelayMs(attempt);
 }
 
 export type ThreadOutboxDeliveryAction = "wait" | "remove" | "send";
@@ -186,26 +188,8 @@ export function isQueuedThreadCreationSendable(message: QueuedThreadMessage): bo
   return message.creation.workspaceMode !== "worktree" || Boolean(message.creation.branch);
 }
 
-function errorMessage(error: unknown): string | null {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  if (typeof error === "object" && error !== null && "message" in error) {
-    return typeof error.message === "string" ? error.message : null;
-  }
-  return typeof error === "string" ? error : null;
-}
-
 export function shouldRetryThreadOutboxDelivery(error: unknown): boolean {
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    "_tag" in error &&
-    error._tag === "ConnectionTransientError"
-  ) {
-    return true;
-  }
-  return isTransportConnectionErrorMessage(errorMessage(error));
+  return classifyThreadOutboxFailure({ error }) === "transient";
 }
 
 export type ThreadOutboxCommandStage = "settings-sync" | "start-turn";

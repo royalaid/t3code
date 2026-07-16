@@ -52,7 +52,6 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
     client,
     initialConfig: Effect.never,
     ready: Effect.void,
-    probe: Effect.void,
     closed: Effect.never,
   };
   return EnvironmentSupervisor.EnvironmentSupervisor.of({

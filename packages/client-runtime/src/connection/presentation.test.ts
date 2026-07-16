@@ -118,8 +118,8 @@ describe("connection presentation", () => {
     });
   });
 
-  it("gives offline status precedence in global messaging", () => {
-    expect(connectionPhaseMessage("connected", TARGET.label, "offline")).toBe("You are offline");
+  it("gives a proven connected session precedence over a stale offline hint", () => {
+    expect(connectionPhaseMessage("connected", TARGET.label, "offline")).toBe("Connected");
   });
 
   it("combines reconnect progress with the latest failure", () => {

@@ -250,6 +250,53 @@ describe("RpcSessionFactory", () => {
     }),
   );
 
+  it.effect("requires three consecutive missed heartbeat responses before disconnecting", () =>
+    Effect.gen(function* () {
+      const { factory, sockets } = yield* makeFactory();
+      const session = yield* factory.connect(PREPARED);
+      const readyFiber = yield* Effect.forkChild(session.ready);
+      const closedFiber = yield* Effect.forkChild(Effect.flip(session.closed));
+      const socket = yield* awaitSocket(sockets);
+      socket.open();
+      yield* completeInitialConfig(socket);
+      yield* Fiber.join(readyFiber);
+
+      yield* TestClock.adjust("15 seconds");
+      expect(socket.readyState).toBe(TestWebSocket.OPEN);
+      yield* TestClock.adjust("15 seconds");
+      expect(socket.readyState).toBe(TestWebSocket.OPEN);
+      yield* TestClock.adjust("15 seconds");
+      expect(socket.readyState).toBe(TestWebSocket.OPEN);
+
+      yield* TestClock.adjust("15 seconds");
+      const error = yield* Fiber.join(closedFiber);
+      expect(error).toMatchObject({
+        reason: "heartbeat-timeout",
+        message: "Test environment missed three consecutive heartbeat responses.",
+      });
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("resets consecutive heartbeat misses when a delayed Pong arrives", () =>
+    Effect.gen(function* () {
+      const { factory, sockets } = yield* makeFactory();
+      const session = yield* factory.connect(PREPARED);
+      const readyFiber = yield* Effect.forkChild(session.ready);
+      const socket = yield* awaitSocket(sockets);
+      socket.open();
+      yield* completeInitialConfig(socket);
+      yield* Fiber.join(readyFiber);
+
+      yield* TestClock.adjust("45 seconds");
+      expect(socket.readyState).toBe(TestWebSocket.OPEN);
+      socket.serverMessage(encodeJson({ _tag: "Pong" }));
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("45 seconds");
+
+      expect(socket.readyState).toBe(TestWebSocket.OPEN);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
   it.effect("fails readiness when the websocket never opens", () =>
     Effect.gen(function* () {
       const { factory, sockets } = yield* makeFactory();

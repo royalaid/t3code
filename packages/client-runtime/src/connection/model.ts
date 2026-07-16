@@ -59,6 +59,7 @@ export type NetworkStatus = "unknown" | "offline" | "online";
 
 export const ConnectionTransientReason = Schema.Literals([
   "network",
+  "heartbeat-timeout",
   "timeout",
   "transport",
   "endpoint-unavailable",

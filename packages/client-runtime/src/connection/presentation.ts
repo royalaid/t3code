@@ -104,6 +104,9 @@ export function connectionPhaseMessage(
   label: string,
   networkStatus: NetworkStatus,
 ): string {
+  if (phase === "connected") {
+    return "Connected";
+  }
   if (networkStatus === "offline" || phase === "offline") {
     return "You are offline";
   }
@@ -114,8 +117,6 @@ export function connectionPhaseMessage(
       return `Connecting to ${label}...`;
     case "reconnecting":
       return `Reconnecting to ${label}...`;
-    case "connected":
-      return "Connected";
     case "error":
       return "Connection failed";
   }

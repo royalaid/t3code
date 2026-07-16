@@ -351,7 +351,6 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
             client: {} as RpcSession.RpcSession["client"],
             initialConfig: Effect.die(new Error("Config is not used by registry tests.")),
             ready: Effect.void,
-            probe: Effect.void,
             closed: Deferred.await(closed),
           } satisfies RpcSession.RpcSession),
           () => Ref.update(releasedSessions, (count) => count + 1),

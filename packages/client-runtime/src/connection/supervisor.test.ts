@@ -114,7 +114,6 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
     target: ConnectionTarget,
   ) => Effect.Effect<PreparedConnection, ConnectionAttemptError>;
   readonly ready?: (attempt: number) => Effect.Effect<void, ConnectionAttemptError>;
-  readonly probe?: (attempt: number) => Effect.Effect<void, ConnectionAttemptError>;
 }) {
   const networkStatus = yield* SubscriptionRef.make<NetworkStatus>(
     options?.networkStatus ?? "online",
@@ -164,7 +163,6 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
         client: TEST_RPC_CLIENT,
         initialConfig: Effect.die(new Error("Initial config is not used by supervisor tests.")),
         ready: options?.ready?.(attempt) ?? Effect.void,
-        probe: options?.probe?.(attempt) ?? Effect.void,
         closed: Deferred.await(closed),
       } satisfies RpcSession.RpcSession),
       () => Ref.update(releaseCount, (count) => count + 1),
@@ -286,22 +284,18 @@ describe("EnvironmentSupervisor", () => {
     }),
   );
 
-  it.effect("waits while offline and connects immediately when the network returns", () =>
+  it.effect("keeps attempting while the platform reports offline", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ networkStatus: "offline" });
       const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
-      yield* awaitState(supervisor.state, (state) => state.phase === "offline");
-      expect(yield* Ref.get(harness.prepareCount)).toBe(0);
-
-      yield* harness.setNetworkStatus("online");
       const ready = yield* awaitState(supervisor.state, (state) => state.phase === "connected");
 
       expect(ready).toMatchObject({
         desired: true,
-        network: "online",
+        network: "offline",
         phase: "connected",
         attempt: 1,
         generation: 1,
@@ -501,7 +495,7 @@ describe("EnvironmentSupervisor", () => {
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
-  it.effect("releases a live session while offline and starts a new generation when online", () =>
+  it.effect("keeps a proven live session when the platform reports offline", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
       const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
@@ -513,17 +507,20 @@ describe("EnvironmentSupervisor", () => {
         (state) => state.phase === "connected" && state.generation === 1,
       );
       yield* harness.setNetworkStatus("offline");
-      yield* awaitState(supervisor.state, (state) => state.phase === "offline");
+      yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "connected" && state.network === "offline",
+      );
 
-      expect(yield* Ref.get(harness.releaseCount)).toBe(1);
-      expect(Option.isNone(yield* SubscriptionRef.get(supervisor.session))).toBe(true);
+      expect(yield* Ref.get(harness.releaseCount)).toBe(0);
+      expect(Option.isSome(yield* SubscriptionRef.get(supervisor.session))).toBe(true);
 
       yield* harness.setNetworkStatus("online");
       yield* awaitState(
         supervisor.state,
-        (state) => state.phase === "connected" && state.generation === 2,
+        (state) => state.phase === "connected" && state.network === "online",
       );
-      expect(yield* Ref.get(harness.sessionCount)).toBe(2);
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
     }),
   );
 
@@ -652,97 +649,44 @@ describe("EnvironmentSupervisor", () => {
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
-  it.effect("keeps a healthy session when the application becomes active", () =>
+  it.effect("keeps a healthy session without probing when the application becomes active", () =>
     Effect.gen(function* () {
-      const probeCount = yield* Ref.make(0);
-      const probeCalled = yield* Deferred.make<void>();
-      const harness = yield* makeHarness({
-        probe: () =>
-          Ref.update(probeCount, (count) => count + 1).pipe(
-            Effect.andThen(Deferred.succeed(probeCalled, undefined)),
-          ),
-      });
+      const harness = yield* makeHarness();
       const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
       yield* awaitState(supervisor.state, (state) => state.phase === "connected");
       yield* harness.wake("application-active");
-      yield* Deferred.await(probeCalled);
+      yield* Effect.yieldNow;
 
-      expect(yield* Ref.get(probeCount)).toBe(1);
       expect(yield* Ref.get(harness.sessionCount)).toBe(1);
       expect(yield* Ref.get(harness.releaseCount)).toBe(0);
       expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("connected");
     }),
   );
 
-  it.effect("reconnects when the foreground liveness probe fails", () =>
+  it.effect("application activation interrupts disconnected backoff", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
-        probe: (attempt) =>
-          attempt === 1 ? Effect.fail(transient("The live session is stale.")) : Effect.void,
+        prepare: (attempt) =>
+          attempt === 1
+            ? Effect.fail(transient("Temporarily unavailable."))
+            : Effect.succeed(PREPARED_CONNECTION),
       });
       const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
         initiallyDesired: true,
       }).pipe(Effect.provide(harness.dependencies));
 
-      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
-      yield* harness.wake("application-active");
       yield* awaitState(supervisor.state, (state) => state.phase === "backoff");
-      yield* TestClock.adjust("1 second");
+      yield* harness.wake("application-active");
       yield* eventuallyState(
         supervisor.state,
-        (state) => state.phase === "connected" && state.generation === 2,
+        (state) => state.phase === "connected" && state.generation === 1,
       );
 
-      expect(yield* Ref.get(harness.sessionCount)).toBe(2);
-      expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
     }).pipe(Effect.provide(TestClock.layer())),
-  );
-
-  it.effect("times out a stalled foreground liveness probe and reconnects", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeHarness({
-        probe: (attempt) => (attempt === 1 ? Effect.never : Effect.void),
-      });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
-        initiallyDesired: true,
-      }).pipe(Effect.provide(harness.dependencies));
-
-      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
-      yield* harness.wake("application-active");
-      yield* TestClock.adjust("15 seconds");
-      yield* awaitState(
-        supervisor.state,
-        (state) => state.phase === "backoff" && state.lastFailure?.reason === "timeout",
-      );
-      yield* TestClock.adjust("1 second");
-      yield* eventuallyState(
-        supervisor.state,
-        (state) => state.phase === "connected" && state.generation === 2,
-      );
-    }).pipe(Effect.provide(TestClock.layer())),
-  );
-
-  it.effect("honors an explicit disconnect while a foreground probe is stalled", () =>
-    Effect.gen(function* () {
-      const probeStarted = yield* Deferred.make<void>();
-      const harness = yield* makeHarness({
-        probe: () => Deferred.succeed(probeStarted, undefined).pipe(Effect.andThen(Effect.never)),
-      });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
-        initiallyDesired: true,
-      }).pipe(Effect.provide(harness.dependencies));
-
-      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
-      yield* harness.wake("application-active");
-      yield* Deferred.await(probeStarted);
-      yield* supervisor.disconnect;
-      yield* awaitState(supervisor.state, (state) => state.phase === "available");
-
-      expect(yield* Ref.get(harness.releaseCount)).toBe(1);
-    }),
   );
 
   it.effect("does not churn a healthy session when credentials change", () =>

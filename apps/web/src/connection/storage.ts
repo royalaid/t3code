@@ -13,12 +13,19 @@ import {
 } from "@t3tools/client-runtime/platform";
 import { TokenStore } from "@t3tools/client-runtime/authorization";
 import {
+  QueuedThreadTurnRecord,
+  THREAD_OUTBOX_MAX_MESSAGES,
+  ThreadOutboxCapacityError,
+  type ThreadOutboxStore,
+} from "@t3tools/client-runtime/outbox";
+import {
   ConnectionTransientError,
   CredentialStore,
   ProfileStore,
 } from "@t3tools/client-runtime/connection";
 import {
   EnvironmentId,
+  MessageId,
   OrchestrationShellSnapshot,
   OrchestrationThreadDetailSnapshot,
   ServerConfig,
@@ -34,12 +41,14 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 const DATABASE_NAME = "t3code:connection-runtime";
-const DATABASE_VERSION = 4;
+export const WEB_CONNECTION_DATABASE_VERSION = 5;
+const DATABASE_VERSION = WEB_CONNECTION_DATABASE_VERSION;
 const CATALOG_STORE_NAME = "catalog";
 const SHELL_STORE_NAME = "shell";
 const THREAD_STORE_NAME = "thread";
 const SERVER_CONFIG_STORE_NAME = "server-config";
 const VCS_REFS_STORE_NAME = "vcs-refs";
+const THREAD_OUTBOX_STORE_NAME = "thread-outbox";
 const CATALOG_KEY = "document";
 const SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION = 1;
 
@@ -139,6 +148,9 @@ const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
       if (!request.result.objectStoreNames.contains(VCS_REFS_STORE_NAME)) {
         request.result.createObjectStore(VCS_REFS_STORE_NAME);
       }
+      if (!request.result.objectStoreNames.contains(THREAD_OUTBOX_STORE_NAME)) {
+        request.result.createObjectStore(THREAD_OUTBOX_STORE_NAME);
+      }
     });
     request.addEventListener("error", () => {
       resume(Effect.fail(catalogError("open", request.error ?? "Unknown IndexedDB error")));
@@ -222,6 +234,164 @@ function removeDatabaseValuesInRange(database: IDBDatabase, storeName: string, r
       cursor.continue();
     });
   }).pipe(Effect.withSpan("web.connectionStorage.removeDatabaseValuesInRange"));
+}
+
+const decodeQueuedThreadTurnRecord = Schema.decodeUnknownSync(QueuedThreadTurnRecord);
+const OUTBOX_BROADCAST_NAME = "t3code:thread-outbox";
+const OUTBOX_STORAGE_EVENT_KEY = "t3code:thread-outbox:changed";
+
+export function decodeWebThreadOutboxRecords(
+  values: ReadonlyArray<unknown>,
+  onCorrupt?: (error: unknown) => void,
+): ReadonlyArray<QueuedThreadTurnRecord> {
+  const valid: QueuedThreadTurnRecord[] = [];
+  for (const raw of values) {
+    try {
+      valid.push(decodeQueuedThreadTurnRecord(raw));
+    } catch (error) {
+      onCorrupt?.(error);
+    }
+  }
+  return valid;
+}
+
+export function makeWebThreadOutboxStore(database: IDBDatabase): ThreadOutboxStore {
+  const listeners = new Set<() => void>();
+  const channel =
+    typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(OUTBOX_BROADCAST_NAME);
+  const postBroadcastMessage = channel?.postMessage.bind(channel);
+  const notifyLocal = () => listeners.forEach((listener) => listener());
+  const notifyOtherTabs = () => {
+    try {
+      postBroadcastMessage?.({ type: "changed" });
+      if (channel === null && typeof localStorage !== "undefined") {
+        localStorage.setItem(OUTBOX_STORAGE_EVENT_KEY, `${Date.now()}:${Math.random()}`);
+      }
+    } catch (error) {
+      console.warn("[thread-outbox] could not notify other tabs", { error });
+    }
+  };
+  channel?.addEventListener("message", notifyLocal);
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === OUTBOX_STORAGE_EVENT_KEY) notifyLocal();
+  };
+  if (typeof window !== "undefined") window.addEventListener("storage", onStorage);
+
+  const load = () =>
+    new Promise<ReadonlyArray<QueuedThreadTurnRecord>>((resolve, reject) => {
+      const request = database
+        .transaction(THREAD_OUTBOX_STORE_NAME, "readonly")
+        .objectStore(THREAD_OUTBOX_STORE_NAME)
+        .getAll();
+      request.addEventListener("error", () =>
+        reject(request.error ?? new Error("Could not load queued messages.")),
+      );
+      request.addEventListener("success", () => {
+        resolve(
+          decodeWebThreadOutboxRecords(request.result, (error) =>
+            console.warn("[thread-outbox] ignored corrupt IndexedDB record", { error }),
+          ),
+        );
+      });
+    });
+
+  const persist = (record: QueuedThreadTurnRecord, enforceLimit: boolean) =>
+    new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(THREAD_OUTBOX_STORE_NAME, "readwrite");
+      const objectStore = transaction.objectStore(THREAD_OUTBOX_STORE_NAME);
+      let rejected = false;
+      transaction.addEventListener("error", () =>
+        reject(transaction.error ?? new Error("Could not persist queued message.")),
+      );
+      transaction.addEventListener("abort", () => {
+        if (!rejected) reject(transaction.error ?? new Error("Could not persist queued message."));
+      });
+      transaction.addEventListener("complete", () => {
+        notifyOtherTabs();
+        resolve();
+      });
+      const write = () => objectStore.put(record, record.command.message.messageId);
+      if (!enforceLimit) {
+        write();
+        return;
+      }
+      const existing = objectStore.getKey(record.command.message.messageId);
+      existing.addEventListener("success", () => {
+        if (existing.result !== undefined) {
+          write();
+          return;
+        }
+        const count = objectStore.count();
+        count.addEventListener("success", () => {
+          if (count.result >= THREAD_OUTBOX_MAX_MESSAGES) {
+            rejected = true;
+            transaction.abort();
+            reject(new ThreadOutboxCapacityError());
+            return;
+          }
+          write();
+        });
+      });
+    });
+
+  const remove = (messageId: MessageId) =>
+    new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(THREAD_OUTBOX_STORE_NAME, "readwrite");
+      transaction.addEventListener("error", () =>
+        reject(transaction.error ?? new Error("Could not remove queued message.")),
+      );
+      transaction.addEventListener("complete", () => {
+        notifyOtherTabs();
+        resolve();
+      });
+      transaction.objectStore(THREAD_OUTBOX_STORE_NAME).delete(messageId);
+    });
+
+  const clearEnvironment = (environmentId: EnvironmentId) =>
+    clearThreadOutboxEnvironment(database, environmentId).then(notifyOtherTabs);
+
+  return {
+    load,
+    write: (record) => persist(record, true),
+    update: (record) => persist(record, false),
+    remove,
+    clearEnvironment,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+}
+
+function clearThreadOutboxEnvironment(
+  database: IDBDatabase,
+  environmentId: EnvironmentId,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(THREAD_OUTBOX_STORE_NAME, "readwrite");
+    const request = transaction.objectStore(THREAD_OUTBOX_STORE_NAME).openCursor();
+    transaction.addEventListener("error", () =>
+      reject(transaction.error ?? new Error("Could not clear queued messages.")),
+    );
+    transaction.addEventListener("complete", () => resolve());
+    request.addEventListener("success", () => {
+      const cursor = request.result;
+      if (cursor === null) return;
+      try {
+        if (decodeQueuedThreadTurnRecord(cursor.value).environmentId === environmentId)
+          cursor.delete();
+      } catch {
+        // Corrupt records are ignored here and quarantined by omission on load.
+      }
+      cursor.continue();
+    });
+  });
+}
+
+let outboxDatabasePromise: Promise<IDBDatabase> | null = null;
+export async function openWebThreadOutboxStore(): Promise<ThreadOutboxStore> {
+  outboxDatabasePromise ??= Effect.runPromise(openDatabase());
+  return makeWebThreadOutboxStore(await outboxDatabasePromise);
 }
 
 function threadCacheKey(environmentId: EnvironmentId, threadId: ThreadId) {
@@ -634,6 +804,10 @@ export const connectionStorageLayer = Layer.effectContext(
               THREAD_STORE_NAME,
               IDBKeyRange.bound(`${environmentId}:`, `${environmentId}:\uffff`),
             ),
+            Effect.tryPromise({
+              try: () => clearThreadOutboxEnvironment(database, environmentId),
+              catch: (cause) => catalogError("clear thread outbox", cause),
+            }),
             removeDatabaseValue(database, SERVER_CONFIG_STORE_NAME, environmentId),
             removeDatabaseValuesInRange(
               database,

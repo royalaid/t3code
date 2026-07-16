@@ -1,8 +1,10 @@
 import { type ServerConfig, WS_METHODS } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as RpcClient from "effect/unstable/rpc/RpcClient";
@@ -26,7 +28,6 @@ export interface RpcSession {
   readonly client: WsRpcProtocolClient;
   readonly initialConfig: Effect.Effect<ServerConfig, ConnectionAttemptError>;
   readonly ready: Effect.Effect<void, ConnectionAttemptError>;
-  readonly probe: Effect.Effect<void, ConnectionAttemptError>;
   readonly closed: Effect.Effect<never, ConnectionTransientError>;
 }
 
@@ -74,22 +75,42 @@ export const make = Effect.gen(function* () {
 
     const connected = yield* Deferred.make<void>();
     const disconnected = yield* Deferred.make<never, ConnectionTransientError>();
+    const heartbeatTimedOut = yield* Ref.make(false);
+    const lastPongAt = yield* Ref.make(yield* Clock.currentTimeMillis);
     const hooks = RpcClient.ConnectionHooks.of({
       onConnect: Deferred.succeed(connected, undefined).pipe(Effect.asVoid),
-      onDisconnect: Deferred.isDone(connected).pipe(
-        Effect.flatMap((wasConnected) =>
-          Deferred.fail(
-            disconnected,
-            new ConnectionTransientErrorClass({
-              reason: "transport",
-              detail: wasConnected
+      onDisconnect: Effect.gen(function* () {
+        const wasConnected = yield* Deferred.isDone(connected);
+        const wasHeartbeatTimeout = yield* Ref.get(heartbeatTimedOut);
+        yield* Deferred.fail(
+          disconnected,
+          new ConnectionTransientErrorClass({
+            reason: wasHeartbeatTimeout ? "heartbeat-timeout" : "transport",
+            detail: wasHeartbeatTimeout
+              ? `${connection.label} missed three consecutive heartbeat responses.`
+              : wasConnected
                 ? `${connection.label} disconnected.`
                 : `${connection.label} could not establish a WebSocket connection.`,
-            }),
-          ),
-        ),
-        Effect.asVoid,
+          }),
+        );
+      }).pipe(Effect.asVoid),
+      onPong: Clock.currentTimeMillis.pipe(
+        Effect.flatMap((now) => Ref.set(lastPongAt, now)),
+        Effect.andThen(Ref.set(heartbeatTimedOut, false)),
       ),
+      onPingTimeout: Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        const lastPong = yield* Ref.get(lastPongAt);
+        yield* Ref.set(heartbeatTimedOut, true);
+        yield* Effect.logWarning("WebSocket heartbeat timed out.").pipe(
+          Effect.annotateLogs({
+            "connection.environment.id": connection.environmentId,
+            "connection.reconnect.reason": "heartbeat-timeout",
+            "connection.heartbeat.consecutive_misses": 3,
+            "connection.heartbeat.last_pong_age_ms": Math.max(0, now - lastPong),
+          }),
+        );
+      }),
     });
     const socketLayer = Socket.layerWebSocket(connection.socketUrl, {
       openTimeout: SOCKET_OPEN_TIMEOUT,
@@ -119,12 +140,6 @@ export const make = Effect.gen(function* () {
         Effect.withSpan("environment.initialSync"),
       ),
     );
-    const probe = client[WS_METHODS.serverGetConfig]({}).pipe(
-      Effect.mapError(mapInitialConfigError),
-      Effect.asVoid,
-      Effect.withSpan("clientRuntime.connection.rpcSession.probe"),
-    );
-
     return {
       client,
       initialConfig,
@@ -133,7 +148,6 @@ export const make = Effect.gen(function* () {
         Effect.asVoid,
         Effect.raceFirst(Deferred.await(disconnected)),
       ),
-      probe,
       closed: Deferred.await(disconnected),
     } satisfies RpcSession;
   });

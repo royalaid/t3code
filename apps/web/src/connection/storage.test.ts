@@ -1,11 +1,17 @@
 import { ConnectionTransientError } from "@t3tools/client-runtime/connection";
 import { ConnectionCatalogDocument } from "@t3tools/client-runtime/platform";
+import { CommandId, EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { afterEach, vi } from "vite-plus/test";
 
-import { makeCatalogBackend, makeCatalogStore } from "./storage";
+import {
+  decodeWebThreadOutboxRecords,
+  makeCatalogBackend,
+  makeCatalogStore,
+  WEB_CONNECTION_DATABASE_VERSION,
+} from "./storage";
 
 const emptyCatalog = {
   schemaVersion: 1,
@@ -74,4 +80,37 @@ describe("makeCatalogBackend", () => {
       expect(setConnectionCatalog).toHaveBeenCalledWith("{}");
     }),
   );
+});
+
+describe("web thread outbox persistence", () => {
+  it("uses the next database migration version without replacing existing stores", () => {
+    expect(WEB_CONNECTION_DATABASE_VERSION).toBe(5);
+  });
+
+  it("ignores corrupt records without blocking valid queued turns", () => {
+    const valid = {
+      schemaVersion: 1,
+      environmentId: EnvironmentId.make("environment-1"),
+      deliveryState: "queued",
+      command: {
+        type: "thread.turn.start",
+        commandId: CommandId.make("command-1"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: MessageId.make("message-1"),
+          role: "user",
+          text: "hello",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: "2026-07-14T00:00:00.000Z",
+      },
+    } as const;
+    const corrupt: unknown[] = [];
+    expect(
+      decodeWebThreadOutboxRecords([{ broken: true }, valid], (error) => corrupt.push(error)),
+    ).toEqual([valid]);
+    expect(corrupt).toHaveLength(1);
+  });
 });

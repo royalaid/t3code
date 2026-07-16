@@ -56,7 +56,6 @@ function session(client: WsRpcProtocolClient): RpcSession {
     client,
     initialConfig: Effect.succeed(CONFIG),
     ready: Effect.void,
-    probe: Effect.void,
     closed: Effect.never,
   };
 }

@@ -130,6 +130,8 @@ interface TimelineRowSharedState {
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertUserMessage: (messageId: MessageId) => void;
+  onRetryQueuedMessage: (messageId: MessageId) => void;
+  onCancelQueuedMessage: (messageId: MessageId) => void;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   onToggleTurnFold: (turnId: TurnId) => void;
@@ -147,6 +149,7 @@ const TimelineRowActivityCtx = createContext<TimelineRowActivityState>(null!);
 const TIMELINE_LIST_HEADER = <div className="h-3 sm:h-4" />;
 const TIMELINE_LIST_FOOTER = <div className="h-3 sm:h-4" />;
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
+const NOOP_QUEUED_MESSAGE_ACTION = (_messageId: MessageId): void => undefined;
 
 // ---------------------------------------------------------------------------
 // Props (public API)
@@ -165,6 +168,8 @@ interface MessagesTimelineProps {
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   revertTurnCountByUserMessageId: Map<MessageId, number>;
   onRevertUserMessage: (messageId: MessageId) => void;
+  onRetryQueuedMessage?: (messageId: MessageId) => void;
+  onCancelQueuedMessage?: (messageId: MessageId) => void;
   isRevertingCheckpoint: boolean;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   activeThreadEnvironmentId: EnvironmentId;
@@ -198,6 +203,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onOpenTurnDiff,
   revertTurnCountByUserMessageId,
   onRevertUserMessage,
+  onRetryQueuedMessage = NOOP_QUEUED_MESSAGE_ACTION,
+  onCancelQueuedMessage = NOOP_QUEUED_MESSAGE_ACTION,
   isRevertingCheckpoint,
   onImageExpand,
   activeThreadEnvironmentId,
@@ -417,6 +424,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertUserMessage,
+      onRetryQueuedMessage,
+      onCancelQueuedMessage,
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -431,6 +440,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertUserMessage,
+      onRetryQueuedMessage,
+      onCancelQueuedMessage,
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -918,6 +929,43 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             </TooltipPopup>
           </Tooltip>
           <div className="flex items-center gap-0.5">
+            {row.message.outboxState ? (
+              <span
+                className={cn(
+                  "mr-1 text-xs",
+                  row.message.outboxState === "failed"
+                    ? "text-destructive"
+                    : "text-muted-foreground",
+                )}
+                title={row.message.outboxFailureMessage}
+              >
+                {row.message.outboxState === "queued"
+                  ? "Queued"
+                  : row.message.outboxState === "sending"
+                    ? "Sending"
+                    : `Failed${row.message.outboxFailureMessage ? `: ${row.message.outboxFailureMessage}` : ""}`}
+              </span>
+            ) : null}
+            {row.message.outboxState === "failed" ? (
+              <Button
+                type="button"
+                size="xs"
+                variant="ghost"
+                onClick={() => ctx.onRetryQueuedMessage(row.message.id)}
+              >
+                Retry
+              </Button>
+            ) : null}
+            {row.message.outboxState && row.message.outboxState !== "sending" ? (
+              <Button
+                type="button"
+                size="xs"
+                variant="ghost"
+                onClick={() => ctx.onCancelQueuedMessage(row.message.id)}
+              >
+                Cancel
+              </Button>
+            ) : null}
             {canRevertAgentWork && <RevertUserMessageButton messageId={row.message.id} />}
             {displayedUserMessage.copyText && (
               <MessageCopyButton text={displayedUserMessage.copyText} variant="ghost" />

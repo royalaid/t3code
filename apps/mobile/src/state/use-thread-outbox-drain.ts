@@ -3,6 +3,7 @@ import type {
   EnvironmentProject,
   EnvironmentThreadShell,
 } from "@t3tools/client-runtime/state/shell";
+import { deriveOutboxSettingsCommandId } from "@t3tools/client-runtime/outbox";
 import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
 import {
   CommandId,
@@ -77,7 +78,10 @@ function findCreationProject(
 }
 
 function settingsCommandId(message: QueuedThreadMessage, setting: string): CommandId {
-  return CommandId.make(`${message.commandId}:${setting}`);
+  return deriveOutboxSettingsCommandId(
+    message.commandId,
+    setting as "model-selection" | "runtime-mode" | "interaction-mode",
+  );
 }
 
 export function useThreadOutboxDrain(): void {

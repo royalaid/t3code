@@ -1135,8 +1135,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [activePendingIsResponding, activePendingProgress, activePendingResolvedAnswers],
   );
   const collapsedComposerPrimaryActionDisabled =
-    phase === "running" || isSendBusy || isConnecting || !composerSendState.hasSendableContent;
-  const collapsedComposerPrimaryActionLabel = "Send message";
+    phase === "running" || isSendBusy || !composerSendState.hasSendableContent;
+  const collapsedComposerPrimaryActionLabel =
+    isConnecting || environmentUnavailable ? "Queue message" : "Send message";
   const showMobilePendingAnswerActions =
     isMobileViewport && !isComposerCollapsedMobile && pendingPrimaryAction !== null;
 
@@ -1673,7 +1674,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const shouldBlurMobileComposerOnSubmit = useCallback(() => {
     if (!isMobileViewport) return false;
-    if (isSendBusy || isConnecting || phase === "running") return false;
+    if (isSendBusy || phase === "running") return false;
     if (activePendingProgress) {
       return activePendingProgress.isLastQuestion && Boolean(activePendingResolvedAnswers);
     }
@@ -1919,13 +1920,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         composerEditorRef.current?.focusAt(cursor);
       },
       insertTextAtEnd: (text: string) => {
-        if (
-          text.length === 0 ||
-          isConnecting ||
-          isComposerApprovalState ||
-          pendingUserInputs.length > 0 ||
-          (environmentUnavailable !== null && activePendingProgress === null)
-        ) {
+        if (text.length === 0 || isComposerApprovalState || pendingUserInputs.length > 0) {
           return false;
         }
         const rangeEnd = promptRef.current.length;
@@ -2417,11 +2412,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                             ? "Ask for follow-up changes or attach images"
                             : "Ask anything, @tag files/folders, $use skills, or / for commands"
                 }
-                disabled={
-                  isConnecting ||
-                  isComposerApprovalState ||
-                  (environmentUnavailable !== null && activePendingProgress === null)
-                }
+                disabled={isComposerApprovalState}
               />
               {showMobilePendingAnswerActions ? (
                 <div
