@@ -13,6 +13,7 @@ import * as Path from "effect/Path";
 
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopConfig from "./DesktopConfig.ts";
+import { SCRIPTORIUM, SCRIPTORIUM_PROVENANCE } from "./Scriptorium.ts";
 import { isNightlyDesktopVersion } from "../updates/updateChannels.ts";
 
 export interface MakeDesktopEnvironmentInput {
@@ -76,8 +77,6 @@ export class DesktopEnvironment extends Context.Service<
   }
 >()("@t3tools/desktop/app/DesktopEnvironment") {}
 
-const APP_BASE_NAME = "T3 Code";
-
 function resolveDesktopAppStageLabel(input: {
   readonly isDevelopment: boolean;
   readonly appVersion: string;
@@ -95,9 +94,13 @@ function resolveDesktopAppBranding(input: {
 }): DesktopAppBranding {
   const stageLabel = resolveDesktopAppStageLabel(input);
   return {
-    baseName: APP_BASE_NAME,
+    baseName: SCRIPTORIUM.baseName,
     stageLabel,
-    displayName: `${APP_BASE_NAME} (${stageLabel})`,
+    displayName: `${SCRIPTORIUM.baseName} (${stageLabel})`,
+    installationId: SCRIPTORIUM.appId,
+    upstreamRevision: SCRIPTORIUM_PROVENANCE.upstreamRevision,
+    scriptoriumRevision: SCRIPTORIUM_PROVENANCE.scriptoriumRevision,
+    changes: SCRIPTORIUM_PROVENANCE.changes,
   };
 }
 
@@ -147,7 +150,9 @@ const make = Effect.fn("desktop.environment.make")(function* (
       : input.platform === "darwin"
         ? path.join(homeDirectory, "Library", "Application Support")
         : Option.getOrElse(config.xdgConfigHome, () => path.join(homeDirectory, ".config"));
-  const baseDir = Option.getOrElse(config.t3Home, () => path.join(homeDirectory, ".t3"));
+  const baseDir = Option.getOrElse(config.t3Home, () =>
+    path.join(homeDirectory, SCRIPTORIUM.baseDirName),
+  );
   const rootDir = path.resolve(input.dirname, "../../..");
   const appRoot = input.isPackaged ? input.appPath : rootDir;
   const branding = resolveDesktopAppBranding({
@@ -156,8 +161,12 @@ const make = Effect.fn("desktop.environment.make")(function* (
   });
   const displayName = branding.displayName;
   const stateDir = path.join(baseDir, isDevelopment ? "dev" : "userdata");
-  const userDataDirName = isDevelopment ? "t3code-dev" : "t3code";
-  const legacyUserDataDirName = isDevelopment ? "T3 Code (Dev)" : "T3 Code (Alpha)";
+  const userDataDirName = isDevelopment
+    ? `${SCRIPTORIUM.userDataDirName}-dev`
+    : SCRIPTORIUM.userDataDirName;
+  const legacyUserDataDirName = isDevelopment
+    ? `${SCRIPTORIUM.legacyUserDataDirName} (Dev)`
+    : `${SCRIPTORIUM.legacyUserDataDirName} (Alpha)`;
   const resourcesPath = input.resourcesPath;
 
   return DesktopEnvironment.of({
@@ -197,10 +206,14 @@ const make = Effect.fn("desktop.environment.make")(function* (
     branding,
     displayName,
     appUserModelId: Option.getOrElse(config.appUserModelIdOverride, () =>
-      isDevelopment ? "com.t3tools.t3code.dev" : "com.t3tools.t3code",
+      isDevelopment ? `${SCRIPTORIUM.appId}.dev` : SCRIPTORIUM.appId,
     ),
-    linuxDesktopEntryName: isDevelopment ? "t3code-dev.desktop" : "t3code.desktop",
-    linuxWmClass: isDevelopment ? "t3code-dev" : "t3code",
+    linuxDesktopEntryName: isDevelopment
+      ? `${SCRIPTORIUM.userDataDirName}-dev.desktop`
+      : `${SCRIPTORIUM.userDataDirName}.desktop`,
+    linuxWmClass: isDevelopment
+      ? `${SCRIPTORIUM.userDataDirName}-dev`
+      : SCRIPTORIUM.userDataDirName,
     userDataDirName,
     legacyUserDataDirName,
     defaultDesktopSettings: DesktopAppSettings.resolveDefaultDesktopSettings(input.appVersion),

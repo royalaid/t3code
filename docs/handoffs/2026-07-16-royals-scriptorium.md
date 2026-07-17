@@ -8,34 +8,33 @@ Deliver Royal's Scriptorium as a co-installable T3 Code fork. It must expose its
 build provenance and migrate a local profile in either direction without sharing
 live state with T3 Code.
 
-## Work already started
+## Implemented foundation
 
 - `customizations/manifest.json` is the source-controlled ledger for the
   Scriptorium identity and migration changes.
-- `apps/desktop/src/app/Scriptorium.ts` defines the intended distinct app name,
-  identifier, protocol, state-directory names, artifact prefix, and provenance
-  model.
+- `apps/desktop/src/app/Scriptorium.ts` drives the distinct app name, identifier,
+  protocol, state-directory names, artifact prefix, and provenance model through
+  the desktop environment, renderer, package metadata, and desktop build.
 - `apps/desktop/src/migration/InstallationMigration.ts` has the first migration
   engine. It stages a source profile, creates a destination restore point, then
   swaps the staged profile into place. It covers the app state directory and
   Electron user-data directory in both directions.
+- `apps/desktop/src/migration/cli.ts` is the explicit local sidecar. Run it
+  only after closing both apps: `vp run --filter @t3tools/desktop migrate-profile
+t3code-to-scriptorium --apply` (reverse the direction to return to T3 Code).
 
 ## Remaining implementation
 
-1. Wire `Scriptorium.ts` into desktop environment, renderer branding, package
-   identity, protocol registration, artifact naming, documentation, and release
-   wording. Preserve upstream compatibility only where a dependency requires it.
-2. Replace the migration engine's direct filesystem-only surface with a typed
-   desktop IPC/API contract. Add the General/About UI: provenance, included
-   customizations, migration direction chooser, preflight warnings, progress,
-   result, and restore-point path.
-3. Validate and embed the customization manifest during desktop packaging; the
-   About panel and staged package metadata must agree on revision and version.
-4. Add focused tests for identity isolation, manifest validation, both migration
-   directions, restore points, invalid/missing profiles, interrupted staging,
-   and credential reauthentication notices. Do not promise that external CLI or
-   OS-keychain credentials can be moved.
-5. Run `vp check` and `vp run typecheck`; then run a desktop build smoke test.
+1. Package the migration CLI as a standalone desktop artifact resource if a
+   double-clickable sidecar is required; it currently runs through the workspace
+   package script so it cannot copy a live Electron profile.
+2. Add a copy action, progress UI, and post-migration restart flow if migration
+   needs to be initiated entirely from the app. Keep the actual transfer in an
+   external process.
+3. Validate the customization manifest during staging and add build timestamp
+   metadata to the packaged manifest.
+4. Add reverse-copy and injected-failure rollback coverage for the migration
+   engine, then run a desktop artifact smoke test.
 
 ## Important constraints
 

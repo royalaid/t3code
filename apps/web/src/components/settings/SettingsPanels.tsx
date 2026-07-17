@@ -24,7 +24,15 @@ import * as Arr from "effect/Array";
 import * as Duration from "effect/Duration";
 import * as Equal from "effect/Equal";
 import * as Result from "effect/Result";
-import { APP_VERSION, HOSTED_APP_CHANNEL, HOSTED_APP_CHANNEL_LABEL } from "../../branding";
+import {
+  APP_INCLUDED_CHANGES,
+  APP_INSTALLATION_ID,
+  APP_SCRIPTORIUM_REVISION,
+  APP_UPSTREAM_REVISION,
+  APP_VERSION,
+  HOSTED_APP_CHANNEL,
+  HOSTED_APP_CHANNEL_LABEL,
+} from "../../branding";
 import {
   canCheckForUpdate,
   getDesktopUpdateButtonTooltip,
@@ -306,6 +314,41 @@ function AboutVersionSection() {
             />
             {buttonTooltip ? <TooltipPopup>{buttonTooltip}</TooltipPopup> : null}
           </Tooltip>
+        }
+      />
+      <SettingsRow
+        title="Installation"
+        description={
+          <code className="text-[11px] text-muted-foreground">{APP_INSTALLATION_ID}</code>
+        }
+      />
+      <SettingsRow
+        title="Scriptorium provenance"
+        description={
+          <span>
+            Upstream: <code>{APP_UPSTREAM_REVISION}</code> · Scriptorium:{" "}
+            <code>{APP_SCRIPTORIUM_REVISION}</code>
+          </span>
+        }
+      />
+      <SettingsRow
+        title="Included customizations"
+        description={
+          APP_INCLUDED_CHANGES.length === 0
+            ? "No customization manifest is available in this build."
+            : APP_INCLUDED_CHANGES.map((change) => change.title).join(" · ")
+        }
+      />
+      <SettingsRow
+        title="Profile migration"
+        description={
+          <span>
+            Close both installations, then run{" "}
+            <code>
+              vp run --filter @t3tools/desktop migrate-profile t3code-to-scriptorium --apply
+            </code>
+            . Use <code>scriptorium-to-t3code</code> to migrate back.
+          </span>
         }
       />
       {hasDesktopBridge ? (

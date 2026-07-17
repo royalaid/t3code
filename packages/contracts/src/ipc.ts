@@ -183,12 +183,32 @@ export interface DesktopAppBranding {
   baseName: string;
   stageLabel: DesktopAppStageLabel;
   displayName: string;
+  installationId?: string;
+  upstreamRevision?: string;
+  scriptoriumRevision?: string;
+  changes?: readonly {
+    id: string;
+    title: string;
+    status: "included";
+  }[];
 }
 
 export const DesktopAppBrandingSchema = Schema.Struct({
   baseName: Schema.String,
   stageLabel: DesktopAppStageLabelSchema,
   displayName: Schema.String,
+  installationId: Schema.optionalKey(Schema.String),
+  upstreamRevision: Schema.optionalKey(Schema.String),
+  scriptoriumRevision: Schema.optionalKey(Schema.String),
+  changes: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        id: Schema.String,
+        title: Schema.String,
+        status: Schema.Literal("included"),
+      }),
+    ),
+  ),
 });
 
 export interface DesktopRuntimeInfo {

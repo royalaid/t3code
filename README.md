@@ -1,6 +1,6 @@
-# T3 Code
+# Royal's Scriptorium
 
-T3 Code is a minimal web GUI for coding agents (currently Codex, Claude, Cursor, and OpenCode, more coming soon).
+Royal's Scriptorium is a personal, co-installable T3 Code fork for coding agents (currently Codex, Claude, Cursor, and OpenCode, more coming soon).
 
 ## Installation
 

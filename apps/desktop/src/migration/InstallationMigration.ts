@@ -24,6 +24,16 @@ export interface InstallationMigrationResult {
   readonly credentialNotice: string;
 }
 
+export interface InstallationMigrationPreflight {
+  readonly formatVersion: number;
+  readonly direction: InstallationMigrationDirection;
+  readonly source: InstallationProfile;
+  readonly destination: InstallationProfile;
+  readonly sourceAvailable: boolean;
+  readonly destinationExists: boolean;
+  readonly warning: string;
+}
+
 export class InstallationMigrationError extends Error {
   constructor(message: string) {
     super(message);
@@ -79,6 +89,29 @@ async function moveToRestorePoint(path: string, restoreRoot: string): Promise<st
   return target;
 }
 
+export async function preflightInstallationMigration(input: {
+  readonly direction: InstallationMigrationDirection;
+  readonly homeDirectory: string;
+}): Promise<InstallationMigrationPreflight> {
+  const [sourceKind, destinationKind] = profilesForDirection(input.direction);
+  const source = resolveInstallationProfile(sourceKind, input.homeDirectory);
+  const destination = resolveInstallationProfile(destinationKind, input.homeDirectory);
+  const sourceAvailable = (await exists(source.baseDir)) || (await exists(source.userDataDir));
+  const destinationExists =
+    (await exists(destination.baseDir)) || (await exists(destination.userDataDir));
+
+  return {
+    formatVersion: INSTALLATION_MIGRATION_FORMAT_VERSION,
+    direction: input.direction,
+    source,
+    destination,
+    sourceAvailable,
+    destinationExists,
+    warning:
+      "Close both installations before migration. A restore point is created before destination data is replaced.",
+  };
+}
+
 export async function migrateInstallation(input: {
   readonly direction: InstallationMigrationDirection;
   readonly homeDirectory: string;
@@ -97,6 +130,8 @@ export async function migrateInstallation(input: {
   const stagedBaseDir = NodePath.join(stageRoot, "base");
   const stagedUserDataDir = NodePath.join(stageRoot, "user-data");
   const copiedPaths: string[] = [];
+  let restoredBase: string | null = null;
+  let restoredUserData: string | null = null;
   try {
     if (await exists(source.baseDir)) {
       await copyDirectory(source.baseDir, stagedBaseDir);
@@ -112,8 +147,8 @@ export async function migrateInstallation(input: {
       );
     }
 
-    const restoredBase = await moveToRestorePoint(destination.baseDir, restoreRoot);
-    const restoredUserData = await moveToRestorePoint(destination.userDataDir, restoreRoot);
+    restoredBase = await moveToRestorePoint(destination.baseDir, restoreRoot);
+    restoredUserData = await moveToRestorePoint(destination.userDataDir, restoreRoot);
     if (await exists(stagedBaseDir)) await NodeFSP.rename(stagedBaseDir, destination.baseDir);
     if (await exists(stagedUserDataDir))
       await NodeFSP.rename(stagedUserDataDir, destination.userDataDir);
@@ -131,6 +166,12 @@ export async function migrateInstallation(input: {
     };
   } catch (error) {
     await NodeFSP.rm(stageRoot, { recursive: true, force: true });
+    if (restoredBase !== null && !(await exists(destination.baseDir))) {
+      await NodeFSP.rename(restoredBase, destination.baseDir);
+    }
+    if (restoredUserData !== null && !(await exists(destination.userDataDir))) {
+      await NodeFSP.rename(restoredUserData, destination.userDataDir);
+    }
     throw error;
   }
 }
