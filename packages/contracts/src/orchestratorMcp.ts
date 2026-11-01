@@ -769,6 +769,20 @@ export const OrchestratorMcpRequestSecretResult = Schema.Union([
 ]);
 export type OrchestratorMcpRequestSecretResult = typeof OrchestratorMcpRequestSecretResult.Type;
 
+export const OrchestratorMcpRequestApiReadInput = Schema.Struct({
+  url: TrimmedNonEmptyString.check(Schema.isMaxLength(4096)),
+  reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2000)),
+  timeoutMs: Schema.optional(
+    Schema.Int.check(Schema.isBetween({ minimum: 1_000, maximum: 60 * 60 * 1_000 })),
+  ),
+});
+export type OrchestratorMcpRequestApiReadInput = typeof OrchestratorMcpRequestApiReadInput.Type;
+export const OrchestratorMcpRequestApiReadResult = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("read"), httpStatus: Schema.Int, data: Schema.Unknown }),
+  Schema.Struct({ status: Schema.Literals(["declined", "cancelled", "timed_out"]) }),
+]);
+export type OrchestratorMcpRequestApiReadResult = typeof OrchestratorMcpRequestApiReadResult.Type;
+
 export const OrchestratorMcpEnvironmentLinkInput = Schema.Struct({
   environmentId: Schema.optional(EnvironmentId).annotate({
     description:

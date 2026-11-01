@@ -1,3 +1,6 @@
+import { vi } from "vite-plus/test";
+import * as ScopedApiRead from "../secrets/ScopedApiRead.ts";
+import * as Fiber from "effect/Fiber";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import {
@@ -7,6 +10,7 @@ import {
   MessageId,
   type ModelSelection,
   OrchestratorMcpDelegateTaskResult,
+  type OrchestrationV2ThreadProjection,
   OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadSendResult,
   ProjectId,
@@ -75,6 +79,11 @@ const delegatedResult = "Delegated API boundary inspected.";
 const cancellationPrompt = "Remain active until the parent cancels this delegated task.";
 const queuedFollowupPrompt = "Complete the queued follow-up and return the final result.";
 const queuedFollowupResult = "Queued delegated follow-up completed.";
+
+vi.mock("../secrets/ScopedApiRead.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof ScopedApiRead>();
+  return { ...actual, scopedApiRead: vi.fn(async () => ({ status: 200, data: { count: 3 } })) };
+});
 
 const decodeDelegateTaskResult = Schema.decodeUnknownEffect(OrchestratorMcpDelegateTaskResult);
 const decodeThreadInterruptResult = Schema.decodeUnknownEffect(
@@ -322,6 +331,139 @@ describe("orchestrator MCP toolkit", () => {
                 Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
                 Effect.provideService(McpSchema.McpServerClient, client),
               );
+
+          const secretRequests = yield* SecretRequests.SecretRequests;
+          const waitForApiProjection = (
+            predicate: (p: OrchestrationV2ThreadProjection) => boolean,
+          ) =>
+            Effect.gen(function* () {
+              while (true) {
+                const p = yield* orchestrator.getThreadProjection(parentThreadId);
+                if (predicate(p)) return p;
+                yield* Effect.sleep("5 millis");
+              }
+            }).pipe(Effect.timeout("5 seconds"));
+          // Private API reads create a fresh card on every invocation. Existing
+          // generic secret refs cannot substitute for user approval of the URL.
+          const cardsBeforeApi = (yield* orchestrator.getThreadProjection(
+            parentThreadId,
+          )).turnItems.filter((item) => item.type === "secret_request").length;
+          const invalidApi = yield* invoke("request_api_read", {
+            url: "http://example.com/read",
+            reason: "Synthetic verification",
+          });
+          expect(invalidApi.isError).toBe(true);
+          expect(vi.mocked(ScopedApiRead.scopedApiRead)).not.toHaveBeenCalled();
+          const wrongApi = yield* server
+            .callTool({
+              name: "request_api_read",
+              arguments: {
+                url: "https://example.com/read",
+                reason: "Synthetic verification",
+              },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, {
+                ...invocation,
+                thread: {
+                  ...invocation.thread!,
+                  providerInstanceId: ProviderInstanceId.make("other-provider"),
+                },
+              }),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+          expect(wrongApi.isError).toBe(true);
+          expect(
+            (yield* orchestrator.getThreadProjection(parentThreadId)).turnItems.filter(
+              (item) => item.type === "secret_request",
+            ),
+          ).toHaveLength(cardsBeforeApi);
+          const apiCards = new Set<string>();
+          for (const answerType of ["save", "decline", "save"] as const) {
+            const apiFiber = yield* invoke("request_api_read", {
+              url: "https://example.com/read",
+              reason: "Synthetic verification",
+            }).pipe(Effect.forkChild);
+            const projection = yield* waitForApiProjection((p) =>
+              p.turnItems.some(
+                (item) =>
+                  item.type === "secret_request" &&
+                  item.secretStatus === "pending" &&
+                  item.label.startsWith("API bearer token"),
+              ),
+            );
+            const apiCard = projection.turnItems.find(
+              (item) =>
+                item.type === "secret_request" &&
+                item.secretStatus === "pending" &&
+                item.label.startsWith("API bearer token"),
+            );
+            if (apiCard?.type !== "secret_request") return yield* Effect.die("API card missing");
+            expect(apiCards.has(apiCard.id)).toBe(false);
+            apiCards.add(apiCard.id);
+            expect(apiCard.label).toBe("API bearer token for https://example.com");
+            expect(apiCard.reason).toContain("HTTPS GET to https://example.com/read.");
+            const callsBefore = vi.mocked(ScopedApiRead.scopedApiRead).mock.calls.length;
+            yield* secretRequests.answer({
+              threadId: parentThreadId,
+              turnItemId: apiCard.id,
+              answer:
+                answerType === "save"
+                  ? { type: "save", secret: "synthetic-api-token-only" }
+                  : { type: "decline" },
+            });
+            const apiCall = yield* Fiber.join(apiFiber);
+            expect(apiCall.isError).toBe(false);
+            expect(apiCall.structuredContent).toEqual(
+              answerType === "save"
+                ? { status: "read", httpStatus: 200, data: { count: 3 } }
+                : { status: "declined" },
+            );
+            expect(JSON.stringify(apiCall)).not.toContain("synthetic-api-token-only");
+            expect(JSON.stringify(apiCall)).not.toContain("secret-ref:");
+            expect(vi.mocked(ScopedApiRead.scopedApiRead).mock.calls.length).toBe(
+              callsBefore + (answerType === "save" ? 1 : 0),
+            );
+            if (answerType === "save") {
+              const call = vi.mocked(ScopedApiRead.scopedApiRead).mock.calls.at(-1)!;
+              expect(call[0].href).toBe("https://example.com/read");
+              expect(call[1]).toBe("synthetic-api-token-only");
+              expect(
+                yield* secretRequests.savedRef({
+                  threadId: parentThreadId,
+                  turnItemId: apiCard.id,
+                }),
+              ).toEqual(Option.none());
+            }
+          }
+          const callsBeforeTimeout = vi.mocked(ScopedApiRead.scopedApiRead).mock.calls.length;
+          const timeoutCall = yield* invoke("request_api_read", {
+            url: "https://example.com/read",
+            reason: "Synthetic timeout",
+            timeoutMs: 1000,
+          });
+          expect(timeoutCall.structuredContent).toEqual({ status: "timed_out" });
+          expect(vi.mocked(ScopedApiRead.scopedApiRead).mock.calls.length).toBe(callsBeforeTimeout);
+          const cancelledFiber = yield* invoke("request_api_read", {
+            url: "https://example.com/read",
+            reason: "Synthetic interruption",
+          }).pipe(Effect.forkChild);
+          yield* waitForApiProjection((p) =>
+            p.turnItems.some(
+              (item) =>
+                item.type === "secret_request" &&
+                item.secretStatus === "pending" &&
+                item.reason.includes("Synthetic interruption"),
+            ),
+          );
+          yield* Fiber.interrupt(cancelledFiber);
+          expect(
+            (yield* orchestrator.getThreadProjection(parentThreadId)).turnItems.filter(
+              (item) => item.type === "secret_request" && item.secretStatus === "pending",
+            ),
+          ).toHaveLength(0);
+          expect(vi.mocked(ScopedApiRead.scopedApiRead).mock.calls.length).toBe(callsBeforeTimeout);
+          vi.mocked(ScopedApiRead.scopedApiRead).mockClear();
 
           const delegationStartSequence =
             yield* orchestrator.getThreadEventSequence(parentThreadId);
