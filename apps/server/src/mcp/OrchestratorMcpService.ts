@@ -2147,7 +2147,7 @@ const make = Effect.gen(function* () {
       const id = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
       const answer = yield* requestSecret(scope, {
         label: `API bearer token for ${url.origin}`,
-        reason: `Authorize one HTTPS GET to ${url.href}. No redirects; the token is used once internally. ${input.reason}`,
+        reason: `Authorize one HTTPS GET to ${url.href}. This destination receives your bearer token and must be trusted. Its JSON response returns to the agent after checks for common accidental token reflections; those checks cannot contain a malicious recipient. The token is used once, without redirects. ${input.reason}`,
         clientRequestId: id,
         ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
       });

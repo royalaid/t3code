@@ -148,6 +148,12 @@ describe("scoped API read", () => {
     }
     expect(() => apiReadJson(Buffer.from('{"echo":"a%2Fb"}'), "a/b")).toThrow("response");
   });
+  it("shows why response filtering requires a trusted credential recipient", () => {
+    const split = { prefix: "synthetic-token-", suffix: "only-abcdefgh123456" };
+    expect(apiReadJson(Buffer.from(JSON.stringify(split)), TOKEN)).toEqual(split);
+    const hex = { encoded: Buffer.from(TOKEN).toString("hex") };
+    expect(apiReadJson(Buffer.from(JSON.stringify(hex)), TOKEN)).toEqual(hex);
+  });
   it("never returns invalid JSON or raw transport errors", async () => {
     expect(() => apiReadJson(Buffer.from("invalid body"), TOKEN)).toThrow("response");
     fixtures.error = true;
